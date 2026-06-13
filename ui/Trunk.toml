@@ -1,0 +1,9 @@
+[build]
+target = "index.html"
+dist = "../dist"
+
+[serve]
+# Only used with `trunk serve` + `cargo tauri dev`; the app itself loads
+# the built files from ../dist.
+addresses = ["127.0.0.1"]
+port = 1420

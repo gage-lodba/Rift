@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a branch cancels in-flight runs for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  build:
+    name: clippy, test & build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2's Linux build dependencies (note: webkit2gtk 4.1, not 4.0).
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Prebuilt trunk via cargo-binstall (building trunk from source is slow
+      # and brittle against the host toolchain).
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y trunk
+
+      # Build the WASM frontend. This also populates ../dist, which the Tauri
+      # backend embeds via generate_context! when it compiles below.
+      - name: Build frontend
+        working-directory: ui
+        run: trunk build
+
+      - name: Clippy (frontend / wasm)
+        run: cargo clippy -p rift-ui --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: Clippy (backend)
+        run: cargo clippy --workspace --exclude rift-ui --all-targets --locked -- -D warnings
+
+      - name: Test (backend)
+        run: cargo test --workspace --exclude rift-ui --locked
