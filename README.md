@@ -1,2 +1,64 @@
 # Rift
-A music player written in rust
+
+An ad-free YouTube Music desktop player, written (almost) entirely in Rust.
+
+![Preview](Previews/image.png)
+
+- **Backend:** Tauri 2, tokio, rodio (playback), rustypipe (YouTube Music API), serde, tracing
+- **Frontend:** Yew (Rust → WASM), built with Trunk
+- Search YouTube Music, play tracks with auto-generated radio queues, like songs,
+  build playlists, and pick up where you left off — no ads, no tracking, no account.
+
+## Requirements
+
+| Dependency | Why | Install (Arch) |
+|---|---|---|
+| Rust + cargo | everything | `pacman -S rustup` |
+| `wasm32-unknown-unknown` target | Yew frontend | `rustup target add wasm32-unknown-unknown` |
+| [Trunk](https://trunkrs.dev) | WASM bundler | prebuilt binary or `cargo install trunk` |
+| webkit2gtk-4.1 | Tauri webview | `pacman -S webkit2gtk-4.1` |
+| ALSA | audio output | preinstalled on most systems |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | stream fetching (see below) | `pacman -S yt-dlp` |
+
+## Build & run
+
+```sh
+# build the frontend (outputs to ./dist)
+cd ui && trunk build --release && cd ..
+
+# run the app
+cd src-tauri && cargo run --release
+```
+
+For a distributable bundle, install `tauri-cli` (`cargo install tauri-cli`) and run
+`cargo tauri build`.
+
+## How streaming works (and why yt-dlp is needed)
+
+Rift uses [rustypipe](https://crates.io/crates/rustypipe) for search, metadata and
+radio queues, and tries it first for audio streams too. However, as of mid-2026
+YouTube limits clients without a proof-of-origin token to a ~1 MB preview per
+stream URL, and rustypipe 0.11.4's signature deobfuscator (required for the
+clients that accept such tokens) no longer parses YouTube's player JavaScript —
+upstream has been dormant since mid-2025.
+
+Until that recovers, Rift transparently falls back to invoking `yt-dlp` (which is
+actively maintained against YouTube's changes) to fetch the m4a audio. Everything
+else — UI, queue, playback, library — stays in Rust. If a future rustypipe release
+fixes stream resolution, Rift will use it automatically without any changes.
+
+You can verify the streaming pipeline from the command line:
+
+```sh
+cd src-tauri && cargo run --example probe -- your search terms
+```
+
+## Data
+
+Your library (liked songs, playlists, recently played) is stored as JSON in
+`~/.local/share/dev.jerimiah.rift/library.json`. Logs follow `RUST_LOG`
+(default `rift=debug,rustypipe=info`).
+
+## License
+
+MIT
