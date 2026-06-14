@@ -145,6 +145,9 @@ pub struct Bootstrap {
     pub track: Option<Track>,
     pub progress: Progress,
     pub downloads: DownloadState,
+    /// Whether Discord Rich Presence is currently enabled.
+    #[serde(default)]
+    pub discord_rpc: bool,
 }
 
 /// Offline-download status, sent to the frontend whenever it changes.

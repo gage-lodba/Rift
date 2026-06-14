@@ -18,6 +18,14 @@ rustypipe = "0.11.4"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2.4.2"
+tauri-plugin-window-state = "2.4.1"
+# OS media-key / now-playing integration: MPRIS (Linux), SMTC (Windows),
+# MPNowPlayingInfoCenter (macOS). use_zbus keeps the Linux backend pure-Rust
+# (no libdbus); the dbus/zbus deps are Linux-gated inside souvlaki, so this is
+# harmless on Windows/macOS.
+souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+discord-rich-presence = "1.1.0"

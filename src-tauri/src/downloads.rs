@@ -94,3 +94,64 @@ impl Downloads {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_downloads() -> Downloads {
+        let dir = std::env::temp_dir().join(format!("rift-dl-{:016x}", rand::random::<u64>()));
+        Downloads::load(dir)
+    }
+
+    #[test]
+    fn begin_claims_once_so_concurrent_calls_dont_double_fetch() {
+        let d = temp_downloads();
+        assert!(d.begin("a"), "first claim succeeds");
+        assert!(!d.begin("a"), "second claim is rejected");
+        assert!(d.is_downloading("a"));
+    }
+
+    #[test]
+    fn finish_moves_from_in_flight_to_downloaded() {
+        let d = temp_downloads();
+        d.begin("a");
+        d.finish("a");
+        assert!(!d.is_downloading("a"));
+        assert!(d.is_downloaded("a"));
+        // After finishing it can be claimed again (e.g. re-download).
+        assert!(d.begin("a"));
+    }
+
+    #[test]
+    fn fail_releases_the_claim_without_marking_downloaded() {
+        let d = temp_downloads();
+        d.begin("a");
+        d.fail("a");
+        assert!(!d.is_downloading("a"));
+        assert!(!d.is_downloaded("a"));
+    }
+
+    #[test]
+    fn remove_deletes_the_file_and_clears_state() {
+        let d = temp_downloads();
+        std::fs::write(d.path("a"), b"audio").unwrap();
+        d.finish("a");
+        assert!(d.is_downloaded("a"));
+
+        assert!(d.remove("a"), "removing an existing download reports true");
+        assert!(!d.is_downloaded("a"));
+        assert!(!d.path("a").exists());
+        assert!(!d.remove("a"), "removing a missing download reports false");
+    }
+
+    #[test]
+    fn load_discovers_existing_offline_files() {
+        let d = temp_downloads();
+        std::fs::write(d.dir.join("song.m4a"), b"x").unwrap();
+        std::fs::write(d.dir.join("notes.txt"), b"x").unwrap();
+        let reloaded = Downloads::load(d.dir.clone());
+        assert!(reloaded.is_downloaded("song"));
+        assert!(!reloaded.is_downloaded("notes"));
+    }
+}

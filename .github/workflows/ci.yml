@@ -25,13 +25,19 @@ jobs:
       - run: cargo fmt --all --check
 
   build:
-    name: clippy, test & build
-    runs-on: ubuntu-22.04
+    name: clippy, test & build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
       # Tauri v2's Linux build dependencies (note: webkit2gtk 4.1, not 4.0).
+      # macOS and Windows ship the needed webview + audio backends already.
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \

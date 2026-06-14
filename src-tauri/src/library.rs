@@ -133,3 +133,96 @@ impl LibraryStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rift_types::ArtistRef;
+
+    fn track(id: &str) -> Track {
+        Track {
+            id: id.into(),
+            title: id.into(),
+            artist: String::new(),
+            album: None,
+            duration: None,
+            cover: String::new(),
+            artists: Vec::new(),
+            album_id: None,
+        }
+    }
+
+    fn temp_store() -> LibraryStore {
+        let dir = std::env::temp_dir().join(format!("rift-lib-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        LibraryStore::load(&dir)
+    }
+
+    #[test]
+    fn like_toggles_and_persists_across_reload() {
+        let mut lib = temp_store();
+        let path = lib.path.clone();
+        lib.toggle_like(track("a"));
+        assert_eq!(lib.data.liked.len(), 1);
+
+        // Reload from disk: the like survived.
+        let reloaded = LibraryStore::load(path.parent().unwrap());
+        assert_eq!(reloaded.data.liked.len(), 1);
+
+        lib.toggle_like(track("a"));
+        assert!(lib.data.liked.is_empty());
+    }
+
+    #[test]
+    fn recently_played_dedups_caps_and_orders_newest_first() {
+        let mut lib = temp_store();
+        lib.push_recent(track("a"));
+        lib.push_recent(track("b"));
+        lib.push_recent(track("a")); // re-play moves "a" to front, no duplicate
+        assert_eq!(
+            lib.data
+                .recently_played
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        for i in 0..RECENT_CAP + 5 {
+            lib.push_recent(track(&format!("x{i}")));
+        }
+        assert_eq!(lib.data.recently_played.len(), RECENT_CAP);
+    }
+
+    #[test]
+    fn playlist_add_is_idempotent_and_remove_works() {
+        let mut lib = temp_store();
+        let pl = lib.create_playlist("Mix".into());
+        lib.add_to_playlist(&pl.id, track("a"));
+        lib.add_to_playlist(&pl.id, track("a")); // duplicate ignored
+        assert_eq!(lib.data.playlists[0].tracks.len(), 1);
+
+        lib.remove_from_playlist(&pl.id, "a");
+        assert!(lib.data.playlists[0].tracks.is_empty());
+
+        lib.delete_playlist(&pl.id);
+        assert!(lib.data.playlists.is_empty());
+    }
+
+    #[test]
+    fn backfill_copies_credits_onto_creditless_copies() {
+        let mut lib = temp_store();
+        lib.toggle_like(track("a")); // stored without artist credits
+
+        let mut enriched = track("a");
+        enriched.artist = "Daft Punk".into();
+        enriched.artists = vec![ArtistRef {
+            id: Some("chan".into()),
+            name: "Daft Punk".into(),
+        }];
+        lib.backfill_track(&enriched);
+
+        assert_eq!(lib.data.liked[0].artist, "Daft Punk");
+        assert_eq!(lib.data.liked[0].artists.len(), 1);
+    }
+}

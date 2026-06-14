@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, error, info};
 
 use crate::audio::{AudioCmd, AudioEvent};
-use crate::util::LockExt;
+use crate::util::{LockExt, Persister};
 use crate::AppState;
 
 pub struct PlayerCore {
@@ -41,6 +41,10 @@ pub struct PlayerCore {
     pub generation: u64,
     /// Bumped whenever the queue is replaced; stale radio fills check it.
     pub epoch: u64,
+    /// Consecutive auto-play failures. Lets a queue of unplayable tracks stop
+    /// instead of skipping forever; reset on any successful playback or a fresh
+    /// user-initiated jump.
+    pub failures: u32,
 }
 
 impl Default for PlayerCore {
@@ -59,6 +63,7 @@ impl Default for PlayerCore {
             shuffle_cursor: 0,
             generation: 0,
             epoch: 0,
+            failures: 0,
         }
     }
 }
@@ -68,6 +73,12 @@ pub struct PlayerShared {
     pub audio: Sender<AudioCmd>,
     pub rp: RustyPipe,
     pub http: reqwest::Client,
+    /// Where the queue snapshot is persisted so the session is restored on the
+    /// next launch.
+    pub playback_path: std::path::PathBuf,
+    /// Background writer for the playback snapshot (keeps disk I/O off the
+    /// command/playback threads).
+    pub persist: Persister,
 }
 
 pub fn snapshot(core: &PlayerCore) -> QueueSnapshot {
@@ -85,11 +96,29 @@ pub fn emit_queue(app: &AppHandle, shared: &PlayerShared) {
         let core = shared.core.lock_safe();
         snapshot(&core)
     };
+    // emit_queue is the universal "queue/current/mode changed" broadcast, so
+    // it's the natural place to persist the session for the next launch.
+    // Position isn't part of the snapshot, so progress ticks don't write.
+    if let Ok(json) = serde_json::to_vec(&snap) {
+        shared.persist.write(shared.playback_path.clone(), json);
+    }
     let _ = app.emit(events::QUEUE, &snap);
+}
+
+/// Load a queue snapshot persisted by a previous session, if any.
+pub fn load_snapshot(path: &std::path::Path) -> Option<QueueSnapshot> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 pub fn emit_state(app: &AppHandle, state: PlaybackState) {
     let _ = app.emit(events::STATE, &state);
+    // Mirror playback state to the OS media session (no-op off Linux) and the
+    // Discord Rich Presence.
+    let app_state = app.state::<AppState>();
+    let position = app_state.player.core.lock_safe().position;
+    app_state.media.set_state(state, position);
+    app_state.discord.set_state(state, position);
 }
 
 /// Start playing the track at `index`, treating it as a fresh anchor for the
@@ -103,6 +132,8 @@ pub fn play_index(app: &AppHandle, index: usize) {
         if index >= core.queue.len() {
             return;
         }
+        // A deliberate jump is a fresh start: give the queue a full retry budget.
+        core.failures = 0;
         if core.shuffle {
             core.shuffle_history = vec![index];
             core.shuffle_cursor = 0;
@@ -139,6 +170,12 @@ fn start_playback(app: &AppHandle, index: usize) {
         track.title, track.artist, track.id
     );
     let _ = app.emit(events::TRACK, &track);
+    // Announce the track to Discord before the Loading state so the presence
+    // reflects the new track immediately (the accurate duration backfills via
+    // the OS media session once the stream resolves).
+    app.state::<AppState>()
+        .discord
+        .set_track(&track, track.duration.unwrap_or(0) as f64);
     emit_state(&app, PlaybackState::Loading);
     emit_queue(&app, &shared);
 
@@ -153,6 +190,7 @@ fn start_playback(app: &AppHandle, index: usize) {
                         return;
                     }
                     core.state = PlaybackState::Playing;
+                    core.failures = 0;
                     if duration > 0.0 {
                         core.duration = duration;
                     }
@@ -167,6 +205,8 @@ fn start_playback(app: &AppHandle, index: usize) {
                         duration: dur,
                     },
                 );
+                // Publish now-playing metadata to the OS media session.
+                app.state::<AppState>().media.set_track(&track, dur);
 
                 // Backfill clickable artist links for tracks saved before
                 // per-artist credits existed, and persist them so list rows
@@ -191,18 +231,32 @@ fn start_playback(app: &AppHandle, index: usize) {
             }
             Err(e) => {
                 error!("failed to play {}: {e:#}", track.id);
-                {
+                let skip = {
                     let mut core = shared.core.lock_safe();
                     if core.generation != generation {
                         return;
                     }
-                    core.state = PlaybackState::Stopped;
-                }
+                    core.failures += 1;
+                    // Skip a bad track instead of stalling the queue, but stop
+                    // once we've failed a whole queue's worth in a row so an
+                    // all-broken queue can't spin forever.
+                    if core.failures < core.queue.len().max(1) as u32 {
+                        true
+                    } else {
+                        core.state = PlaybackState::Stopped;
+                        false
+                    }
+                };
                 let _ = app.emit(
                     events::ERROR,
                     format!("Could not play \u{201c}{}\u{201d}: {e:#}", track.title),
                 );
-                emit_state(&app, PlaybackState::Stopped);
+                if skip {
+                    debug!("auto-skipping failed track {}", track.id);
+                    play_next(&app, false);
+                } else {
+                    emit_state(&app, PlaybackState::Stopped);
+                }
             }
         }
     });
@@ -302,6 +356,54 @@ fn pick_next(core: &mut PlayerCore, manual: bool) -> Option<usize> {
     }
 }
 
+/// Toggle play/pause, resume a stopped track, or cancel an in-flight load.
+/// Shared by the `toggle_play` command and the OS media keys.
+pub fn toggle_playback(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    enum Action {
+        None,
+        Emit(PlaybackState),
+        Replay(usize),
+        Cancel,
+    }
+    let action = {
+        let mut core = state.player.core.lock_safe();
+        match core.state {
+            PlaybackState::Playing => {
+                let _ = state.player.audio.send(AudioCmd::Pause);
+                core.state = PlaybackState::Paused;
+                Action::Emit(PlaybackState::Paused)
+            }
+            PlaybackState::Paused => {
+                let _ = state.player.audio.send(AudioCmd::Resume);
+                core.state = PlaybackState::Playing;
+                Action::Emit(PlaybackState::Playing)
+            }
+            PlaybackState::Stopped => match core.current {
+                Some(i) => Action::Replay(i),
+                None => Action::None,
+            },
+            // Cancel an in-flight load: bump the generation so the pending
+            // fetch is discarded when it lands, and stop.
+            PlaybackState::Loading => {
+                core.generation += 1;
+                core.state = PlaybackState::Stopped;
+                core.position = 0.0;
+                Action::Cancel
+            }
+        }
+    };
+    match action {
+        Action::Emit(s) => emit_state(app, s),
+        Action::Replay(i) => play_index(app, i),
+        Action::Cancel => {
+            let _ = state.player.audio.send(AudioCmd::Stop);
+            emit_state(app, PlaybackState::Stopped);
+        }
+        Action::None => {}
+    }
+}
+
 pub fn play_next(app: &AppHandle, manual: bool) {
     let state = app.state::<AppState>();
     let shared = state.player.clone();
@@ -348,6 +450,53 @@ pub fn play_prev(app: &AppHandle) {
     };
     if let Some(i) = prev {
         start_playback(app, i);
+    }
+}
+
+/// What the caller should do after [`remove_from_queue`] mutates the core.
+pub enum RemoveOutcome {
+    /// Index was out of range; nothing changed.
+    None,
+    /// Queue changed but playback didn't; just re-broadcast.
+    EmitOnly,
+    /// The playing track was removed; start the one that took its slot.
+    PlayIndex(usize),
+    /// The playing track was the last one; stop.
+    Stop,
+}
+
+/// Remove the track at `index`, fixing up `current` and resetting the shuffle
+/// history (queue indices shift on removal). Pure so the index math is testable.
+pub fn remove_from_queue(core: &mut PlayerCore, index: usize) -> RemoveOutcome {
+    if index >= core.queue.len() {
+        return RemoveOutcome::None;
+    }
+    core.queue.remove(index);
+    core.shuffle_history.clear();
+    core.shuffle_cursor = 0;
+    match core.current {
+        // A track before the current one went away: current shifts down by one.
+        Some(cur) if index < cur => {
+            core.current = Some(cur - 1);
+            core.shuffle_history = vec![cur - 1];
+            RemoveOutcome::EmitOnly
+        }
+        // The playing track was removed: move to whatever took its place, or
+        // stop if it was the last one.
+        Some(cur) if index == cur => {
+            if core.queue.is_empty() {
+                core.current = None;
+                RemoveOutcome::Stop
+            } else {
+                RemoveOutcome::PlayIndex(cur.min(core.queue.len() - 1))
+            }
+        }
+        // Removal was after the current track: its index is unchanged.
+        Some(cur) => {
+            core.shuffle_history = vec![cur];
+            RemoveOutcome::EmitOnly
+        }
+        None => RemoveOutcome::EmitOnly,
     }
 }
 
@@ -506,5 +655,73 @@ mod tests {
         assert_eq!(pick_next(&mut core, false), None);
         // Manual next from the end wraps.
         assert_eq!(pick_next(&mut core, true), Some(0));
+    }
+
+    fn queue_core(n: usize, current: Option<usize>) -> PlayerCore {
+        PlayerCore {
+            queue: (0..n).map(dummy_track).collect(),
+            current,
+            ..PlayerCore::default()
+        }
+    }
+
+    #[test]
+    fn remove_before_current_shifts_current_down() {
+        let mut core = queue_core(5, Some(3));
+        assert!(matches!(
+            remove_from_queue(&mut core, 1),
+            RemoveOutcome::EmitOnly
+        ));
+        assert_eq!(core.current, Some(2));
+        assert_eq!(core.queue.len(), 4);
+    }
+
+    #[test]
+    fn remove_after_current_keeps_current() {
+        let mut core = queue_core(5, Some(1));
+        assert!(matches!(
+            remove_from_queue(&mut core, 3),
+            RemoveOutcome::EmitOnly
+        ));
+        assert_eq!(core.current, Some(1));
+    }
+
+    #[test]
+    fn remove_current_plays_the_one_that_took_its_slot() {
+        let mut core = queue_core(5, Some(2));
+        assert!(matches!(
+            remove_from_queue(&mut core, 2),
+            RemoveOutcome::PlayIndex(2)
+        ));
+    }
+
+    #[test]
+    fn remove_current_at_end_clamps_to_new_last() {
+        let mut core = queue_core(3, Some(2));
+        assert!(matches!(
+            remove_from_queue(&mut core, 2),
+            RemoveOutcome::PlayIndex(1)
+        ));
+    }
+
+    #[test]
+    fn remove_last_remaining_current_stops() {
+        let mut core = queue_core(1, Some(0));
+        assert!(matches!(
+            remove_from_queue(&mut core, 0),
+            RemoveOutcome::Stop
+        ));
+        assert_eq!(core.current, None);
+        assert!(core.queue.is_empty());
+    }
+
+    #[test]
+    fn remove_out_of_range_is_a_noop() {
+        let mut core = queue_core(2, Some(0));
+        assert!(matches!(
+            remove_from_queue(&mut core, 9),
+            RemoveOutcome::None
+        ));
+        assert_eq!(core.queue.len(), 2);
     }
 }

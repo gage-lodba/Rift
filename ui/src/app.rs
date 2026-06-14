@@ -6,8 +6,10 @@ use rift_types::{
     PlaybackState, Progress, QueueSnapshot, Track,
 };
 use serde_json::json;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlInputElement;
+use web_sys::{HtmlInputElement, KeyboardEvent};
 use yew::prelude::*;
 
 use crate::api;
@@ -29,12 +31,16 @@ enum SearchTab {
 }
 
 fn format_subs(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M subscribers", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K subscribers", n as f64 / 1e3)
-    } else {
-        format!("{n} subscribers")
+    // "1.0M" -> "1M", "1.2M" -> "1.2M"
+    fn compact(x: f64, unit: &str) -> String {
+        let s = format!("{x:.1}");
+        format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))
+    }
+    match n {
+        1 => "1 subscriber".into(),
+        n if n >= 1_000_000 => format!("{} subscribers", compact(n as f64 / 1e6, "M")),
+        n if n >= 1_000 => format!("{} subscribers", compact(n as f64 / 1e3, "K")),
+        n => format!("{n} subscribers"),
     }
 }
 
@@ -81,6 +87,25 @@ fn artist_grid(artists: &[ArtistSummary], on_open: Callback<String>) -> Html {
     }
 }
 
+/// Render a lazily-loaded search tab: a loading state while `None`, an
+/// empty state for no results, otherwise the given grid.
+fn results_view<T>(results: &Option<Vec<T>>, render: impl FnOnce(&[T]) -> Html) -> Html {
+    match results {
+        None => html! { <div class="empty">{ "Searching..." }</div> },
+        Some(v) if v.is_empty() => html! { <div class="empty">{ "No results." }</div> },
+        Some(v) => render(v),
+    }
+}
+
+/// Fire the `play_tracks` command for a collection, tagged with where it came
+/// from so the UI can mark the playing collection.
+fn fire_play_tracks(tracks: &[Track], source: &Option<String>, start: usize) {
+    api::fire(
+        "play_tracks",
+        json!({ "tracks": tracks, "start": start, "source": source }),
+    );
+}
+
 #[function_component(App)]
 pub fn app() -> Html {
     let library = use_state(Library::default);
@@ -89,6 +114,7 @@ pub fn app() -> Html {
     let track = use_state(|| None::<Track>);
     let progress = use_state(Progress::default);
     let volume = use_state(|| 1.0f32);
+    let discord_rpc = use_state(|| true);
     let view = use_state(|| View::Home);
     let search = use_state(Search::default);
     let search_tab = use_state(SearchTab::default);
@@ -97,6 +123,13 @@ pub fn app() -> Html {
     let artist_page = use_state(|| None::<ArtistPage>);
     let album_page = use_state(|| None::<AlbumPage>);
     let downloads = use_state(DownloadState::default);
+    // Network reachability (from the webview); offline greys out un-downloaded
+    // tracks since they can't be streamed.
+    let online = use_state(|| {
+        web_sys::window()
+            .map(|w| w.navigator().on_line())
+            .unwrap_or(true)
+    });
     // (playlist id, draft name) while a playlist is being renamed.
     let renaming = use_state(|| None::<(String, String)>);
     let toast = use_state(|| None::<String>);
@@ -109,6 +142,7 @@ pub fn app() -> Html {
         let track = track.clone();
         let progress = progress.clone();
         let volume = volume.clone();
+        let discord_rpc = discord_rpc.clone();
         let downloads = downloads.clone();
         let toast = toast.clone();
         use_effect_with((), move |_| {
@@ -177,11 +211,69 @@ pub fn app() -> Html {
                         track.set(b.track);
                         progress.set(b.progress);
                         volume.set(b.volume);
+                        discord_rpc.set(b.discord_rpc);
                         downloads.set(b.downloads);
                     }
                     Err(e) => web_sys::console::error_1(&format!("bootstrap: {e}").into()),
                 }
             });
+            || {}
+        });
+    }
+
+    // Global keyboard shortcuts: Space = play/pause, Ctrl/Cmd+Arrows = prev/next.
+    // Ignored while typing in a text field so search/rename keep working.
+    use_effect_with((), move |_| {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let handler = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
+            let typing = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.active_element())
+                .map(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA"))
+                .unwrap_or(false);
+            if typing {
+                return;
+            }
+            let cmd = e.ctrl_key() || e.meta_key();
+            match e.key().as_str() {
+                " " => {
+                    e.prevent_default();
+                    api::fire("toggle_play", json!({}));
+                }
+                "ArrowRight" if cmd => {
+                    e.prevent_default();
+                    api::fire("next_track", json!({}));
+                }
+                "ArrowLeft" if cmd => {
+                    e.prevent_default();
+                    api::fire("prev_track", json!({}));
+                }
+                _ => {}
+            }
+        });
+        document
+            .add_event_listener_with_callback("keydown", handler.as_ref().unchecked_ref())
+            .ok();
+        // Lives for the lifetime of the app, like the event subscriptions.
+        handler.forget();
+        || {}
+    });
+
+    // Track network reachability via the webview's online/offline events.
+    {
+        let online = online.clone();
+        use_effect_with((), move |_| {
+            let window = web_sys::window().unwrap();
+            let make = |value: bool, online: UseStateHandle<bool>| {
+                Closure::<dyn FnMut()>::new(move || online.set(value))
+            };
+            let on = make(true, online.clone());
+            let off = make(false, online.clone());
+            let _ = window.add_event_listener_with_callback("online", on.as_ref().unchecked_ref());
+            let _ =
+                window.add_event_listener_with_callback("offline", off.as_ref().unchecked_ref());
+            on.forget();
+            off.forget();
             || {}
         });
     }
@@ -332,12 +424,7 @@ pub fn app() -> Html {
 
     // Play a full list starting at an index, tagged with where it came from.
     let play_list = |tracks: Vec<Track>, source: Option<String>| {
-        Callback::from(move |start: usize| {
-            api::fire(
-                "play_tracks",
-                json!({ "tracks": tracks, "start": start, "source": source }),
-            );
-        })
+        Callback::from(move |start: usize| fire_play_tracks(&tracks, &source, start))
     };
 
     let on_like = Callback::from(|t: Track| api::fire("toggle_like", json!({ "track": t })));
@@ -401,6 +488,7 @@ pub fn app() -> Html {
                 liked_ids={liked_ids.clone()}
                 playing_id={track.as_ref().map(|t| t.id.clone())}
                 downloaded_ids={downloads.downloaded.clone()}
+                online={*online}
                 playlists={playlist_opts.clone()}
                 on_play={play_list(tracks, source)}
                 on_like={on_like.clone()}
@@ -432,12 +520,7 @@ pub fn app() -> Html {
         let play = {
             let tracks = tracks.clone();
             let source = source.clone();
-            Callback::from(move |_: MouseEvent| {
-                api::fire(
-                    "play_tracks",
-                    json!({ "tracks": tracks, "start": 0usize, "source": source }),
-                );
-            })
+            Callback::from(move |_: MouseEvent| fire_play_tracks(&tracks, &source, 0))
         };
 
         let download = if n_active > 0 {
@@ -488,7 +571,8 @@ pub fn app() -> Html {
 
     let main = match &*view {
         View::Home => html! {
-            <HomeView library={(*library).clone()} on_nav={on_nav.clone()} on_play={on_play_single.clone()} />
+            <HomeView library={(*library).clone()} on_nav={on_nav.clone()} on_play={on_play_single.clone()}
+                      online={*online} downloaded_ids={downloads.downloaded.clone()} />
         },
         View::Search => {
             let tab_btn = |t: SearchTab, label: &str| {
@@ -511,16 +595,12 @@ pub fn app() -> Html {
                         list(search.results.clone(), None, None)
                     }
                 }
-                SearchTab::Artists => match &*artist_results {
-                    None => html! { <div class="empty">{ "Searching..." }</div> },
-                    Some(v) if v.is_empty() => html! { <div class="empty">{ "No results." }</div> },
-                    Some(v) => artist_grid(v, on_open_artist.clone()),
-                },
-                SearchTab::Albums => match &*album_results {
-                    None => html! { <div class="empty">{ "Searching..." }</div> },
-                    Some(v) if v.is_empty() => html! { <div class="empty">{ "No results." }</div> },
-                    Some(v) => album_grid(v, on_open_album.clone()),
-                },
+                SearchTab::Artists => {
+                    results_view(&artist_results, |v| artist_grid(v, on_open_artist.clone()))
+                }
+                SearchTab::Albums => {
+                    results_view(&album_results, |v| album_grid(v, on_open_album.clone()))
+                }
             };
             html! {
                 <>
@@ -545,6 +625,16 @@ pub fn app() -> Html {
                 }
             </>
         },
+        View::Settings => {
+            let on_discord_rpc = {
+                let discord_rpc = discord_rpc.clone();
+                Callback::from(move |enabled: bool| {
+                    discord_rpc.set(enabled);
+                    api::fire("set_discord_rpc", json!({ "enabled": enabled }));
+                })
+            };
+            html! { <SettingsView discord_rpc={*discord_rpc} on_discord_rpc={on_discord_rpc} /> }
+        }
         View::Playlist(id) => match library.playlists.iter().find(|p| &p.id == id) {
             None => html! { <div class="empty">{ "Playlist not found." }</div> },
             Some(p) => {
@@ -571,12 +661,9 @@ pub fn app() -> Html {
                     Callback::from(move |_: ()| renaming.set(Some((id.clone(), name.clone()))))
                 };
                 let delete_action = {
+                    let cb = on_delete_playlist.clone();
                     let id = p.id.clone();
-                    let view = view.clone();
-                    Callback::from(move |_: ()| {
-                        api::fire("delete_playlist", json!({ "id": id.clone() }));
-                        view.set(View::Home);
-                    })
+                    Callback::from(move |_: ()| cb.emit(id.clone()))
                 };
                 let header_menu = vec![
                     MenuAction::Item {
@@ -673,16 +760,11 @@ pub fn app() -> Html {
         View::Album(_) => match &*album_page {
             None => html! { <div class="empty">{ "Loading album..." }</div> },
             Some(p) => {
-                let play_all = {
-                    let tracks = p.tracks.clone();
-                    Callback::from(move |_: MouseEvent| {
-                        api::fire("play_tracks", json!({ "tracks": tracks, "start": 0usize }));
-                    })
-                };
                 let kind = match p.year {
                     Some(y) => format!("{} • {y}", p.album_type),
                     None => p.album_type.clone(),
                 };
+                let source = Some(format!("album:{}", p.id));
                 html! {
                     <>
                         <div class="page-head">
@@ -701,12 +783,10 @@ pub fn app() -> Html {
                                     }
                                     { format!(" • {} songs", p.tracks.len()) }
                                 </div>
-                                <button class="play-all" onclick={play_all}>
-                                    { icon("play") }<span>{ "Play" }</span>
-                                </button>
+                                { actions(p.tracks.clone(), source.clone()) }
                             </div>
                         </div>
-                        { list(p.tracks.clone(), None, None) }
+                        { list(p.tracks.clone(), source, None) }
                     </>
                 }
             }
@@ -737,10 +817,12 @@ pub fn app() -> Html {
                          playing_source={playing_source} is_playing={is_playing} />
                 <div class="content">
                     <main class="main">{ main }</main>
-                    <QueuePanel queue={(*queue).clone()}
-                                on_jump={on_queue_jump}
-                                on_remove={on_queue_remove}
-                                on_clear={on_queue_clear} />
+                    if *view != View::Settings {
+                        <QueuePanel queue={(*queue).clone()}
+                                    on_jump={on_queue_jump}
+                                    on_remove={on_queue_remove}
+                                    on_clear={on_queue_clear} />
+                    }
                 </div>
             </div>
             <PlayerBar track={(*track).clone()} state={*pstate} progress={*progress}

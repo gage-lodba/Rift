@@ -13,6 +13,7 @@ pub enum View {
     Home,
     Search,
     Liked,
+    Settings,
     Playlist(String),
     Artist(String),
     Album(String),
@@ -49,6 +50,7 @@ pub fn icon(name: &str) -> Html {
         "queue" => "M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z",
         "person" => "M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z",
         "album" => "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z",
+        "settings" => "M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z",
         _ => "",
     };
     html! {
@@ -62,6 +64,14 @@ pub fn cover(url: &str, class: &'static str) -> Html {
     } else {
         html! { <img class={class} src={url.to_string()} loading="lazy" /> }
     }
+}
+
+/// The Rift logo mark: a cosmic cracked tile (violet nebula split by a glowing
+/// rift). Rendered from `logo.svg` via `<img>` rather than inline SVG, because
+/// loading an SVG as an image renders its gradients/filters fully — `html!`
+/// doesn't reliably render inline camelCase gradient elements.
+pub fn logo_mark() -> Html {
+    html! { <img class="logo-mark" src="logo.svg" alt="" /> }
 }
 
 /// Render a track's artist credits, each one a profile link where YouTube
@@ -98,7 +108,22 @@ pub fn artist_links(artists: &[ArtistRef], fallback: &str, on_open: &Callback<St
 }
 
 pub fn fmt_secs(total: u32) -> String {
-    format!("{}:{:02}", total / 60, total % 60)
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Animated equalizer bars shown beside a playing collection. `playing` false
+/// renders them frozen (paused).
+fn eq_bars(playing: bool) -> Html {
+    html! {
+        <span class={classes!("eq", (!playing).then_some("paused"))}>
+            <span></span><span></span><span></span>
+        </span>
+    }
 }
 
 fn fmt_pos(secs: f64) -> String {
@@ -143,7 +168,10 @@ pub fn titlebar(props: &TitlebarProps) -> Html {
 
     html! {
         <header class="titlebar" data-tauri-drag-region="true">
-            <div class="logo" data-tauri-drag-region="true">{ "RIFT" }</div>
+            <div class="logo" data-tauri-drag-region="true">
+                { logo_mark() }
+                <span class="logo-text" data-tauri-drag-region="true">{ "RIFT" }</span>
+            </div>
             <div class="searchbox">
                 <input ref={input} type="text" placeholder="Search YouTube Music..." {onkeydown} />
                 <button class="search-btn" {onclick}>{ "Search" }</button>
@@ -212,18 +240,11 @@ pub fn sidebar(props: &SidebarProps) -> Html {
 
     let item_class = |active: bool| classes!("side-item", active.then_some("active"));
 
-    let eq_markup = || {
-        html! {
-            <span class={classes!("eq", (!props.is_playing).then_some("paused"))}>
-                <span></span><span></span><span></span>
-            </span>
-        }
-    };
     // Leading icon for a collection: the animated equalizer while it plays,
     // otherwise the given icon.
     let lead = |source: &str, icon_name: &str| {
         if props.playing_source.as_deref() == Some(source) {
-            eq_markup()
+            eq_bars(props.is_playing)
         } else {
             icon(icon_name)
         }
@@ -231,37 +252,45 @@ pub fn sidebar(props: &SidebarProps) -> Html {
 
     html! {
         <nav class="sidebar">
-            <div class={item_class(props.view == View::Home)} onclick={nav(View::Home)}>
-                { icon("home") }<span>{ "Home" }</span>
-            </div>
-            <div class={item_class(props.view == View::Liked)} onclick={nav(View::Liked)}>
-                { lead("liked", "heart") }<span class="side-name">{ "Liked Songs" }</span>
-            </div>
-
-            <div class="side-head">{ "PLAYLISTS" }</div>
-            { for props.playlists.iter().map(|(id, name, count)| html! {
-                <SidebarPlaylist
-                    id={id.clone()}
-                    name={name.clone()}
-                    count={*count}
-                    active={props.view == View::Playlist(id.clone())}
-                    playing={props.playing_source.as_deref() == Some(format!("playlist:{id}").as_str())}
-                    is_playing={props.is_playing}
-                    on_nav={props.on_nav.clone()}
-                    on_rename={props.on_rename_playlist.clone()}
-                    on_delete={props.on_delete_playlist.clone()}
-                />
-            }) }
-
-            if *creating {
-                <input class="side-new-input" ref={input} type="text"
-                       placeholder="Playlist name" autofocus=true {onkeydown}
-                       onblur={ let c = creating.clone(); Callback::from(move |_| c.set(false)) } />
-            } else {
-                <div class="side-item side-new" onclick={start_create}>
-                    { icon("plus") }<span>{ "New playlist" }</span>
+            <div class="side-scroll">
+                <div class={item_class(props.view == View::Home)} onclick={nav(View::Home)}>
+                    { icon("home") }<span>{ "Home" }</span>
                 </div>
-            }
+                <div class={item_class(props.view == View::Liked)} onclick={nav(View::Liked)}>
+                    { lead("liked", "heart") }<span class="side-name">{ "Liked Songs" }</span>
+                </div>
+
+                <div class="side-head">{ "PLAYLISTS" }</div>
+                { for props.playlists.iter().map(|(id, name, count)| html! {
+                    <SidebarPlaylist
+                        id={id.clone()}
+                        name={name.clone()}
+                        count={*count}
+                        active={props.view == View::Playlist(id.clone())}
+                        playing={props.playing_source.as_deref() == Some(format!("playlist:{id}").as_str())}
+                        is_playing={props.is_playing}
+                        on_nav={props.on_nav.clone()}
+                        on_rename={props.on_rename_playlist.clone()}
+                        on_delete={props.on_delete_playlist.clone()}
+                    />
+                }) }
+
+                if *creating {
+                    <input class="side-new-input" ref={input} type="text"
+                           placeholder="Playlist name" autofocus=true {onkeydown}
+                           onblur={ let c = creating.clone(); Callback::from(move |_| c.set(false)) } />
+                } else {
+                    <div class="side-item side-new" onclick={start_create}>
+                        { icon("plus") }<span>{ "New playlist" }</span>
+                    </div>
+                }
+            </div>
+
+            <div class="side-divider" />
+            <div class={classes!("side-item", "side-settings", (props.view == View::Settings).then_some("active"))}
+                 onclick={nav(View::Settings)}>
+                { icon("settings") }<span>{ "Settings" }</span>
+            </div>
         </nav>
     }
 }
@@ -310,11 +339,7 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
     };
 
     let lead = if props.playing {
-        html! {
-            <span class={classes!("eq", (!props.is_playing).then_some("paused"))}>
-                <span></span><span></span><span></span>
-            </span>
-        }
+        eq_bars(props.is_playing)
     } else {
         icon("music")
     };
@@ -356,6 +381,45 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
     }
 }
 
+// ---------------------------------------------------------- settings view
+
+#[derive(Properties, PartialEq)]
+pub struct SettingsProps {
+    pub discord_rpc: bool,
+    /// Called with the new value when the Discord toggle is flipped.
+    pub on_discord_rpc: Callback<bool>,
+}
+
+#[function_component(SettingsView)]
+pub fn settings_view(props: &SettingsProps) -> Html {
+    let on_discord = {
+        let current = props.discord_rpc;
+        let cb = props.on_discord_rpc.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(!current))
+    };
+
+    html! {
+        <>
+            <h2>{ "Settings" }</h2>
+            <div class="settings-row">
+                <div class="settings-text">
+                    <div class="settings-label">{ "Discord Rich Presence" }</div>
+                    <div class="settings-desc">
+                        { "Show the track you're listening to on your Discord profile." }
+                    </div>
+                </div>
+                <button
+                    class={classes!("switch", props.discord_rpc.then_some("on"))}
+                    role="switch"
+                    aria-checked={props.discord_rpc.to_string()}
+                    onclick={on_discord}>
+                    <span class="switch-knob" />
+                </button>
+            </div>
+        </>
+    }
+}
+
 // -------------------------------------------------------------- home view
 
 #[derive(Properties, PartialEq)]
@@ -364,6 +428,10 @@ pub struct HomeProps {
     pub on_nav: Callback<View>,
     /// Play a single track (starts radio).
     pub on_play: Callback<Track>,
+    #[prop_or(true)]
+    pub online: bool,
+    #[prop_or_default]
+    pub downloaded_ids: Vec<String>,
 }
 
 #[function_component(HomeView)]
@@ -402,8 +470,12 @@ pub fn home_view(props: &HomeProps) -> Html {
                     { for lib.recently_played.iter().take(12).map(|t| {
                         let on_play = props.on_play.clone();
                         let track = t.clone();
+                        let available = props.online || props.downloaded_ids.contains(&t.id);
+                        let onclick = Callback::from(move |_| if available { on_play.emit(track.clone()) });
                         html! {
-                            <div class="card" onclick={Callback::from(move |_| on_play.emit(track.clone()))}>
+                            <div class={classes!("card", (!available).then_some("unavailable"))}
+                                 title={(!available).then_some("Unavailable offline — not downloaded")}
+                                 onclick={onclick}>
                                 { cover(&t.cover, "card-cover") }
                                 <div class="card-name">{ &t.title }</div>
                                 <div class="card-sub">{ &t.artist }</div>
@@ -576,6 +648,10 @@ pub struct TrackListProps {
     /// IDs available offline, marked with an indicator.
     #[prop_or_default]
     pub downloaded_ids: Vec<String>,
+    /// Whether the network is reachable. When false, un-downloaded tracks are
+    /// greyed out and can't be played.
+    #[prop_or(true)]
+    pub online: bool,
     /// (id, name) of user playlists, for the add-to-playlist dropdown.
     pub playlists: Vec<(String, String)>,
     /// Play the track at this index (within this list).
@@ -600,6 +676,7 @@ pub fn track_list(props: &TrackListProps) -> Html {
                     index={i}
                     liked={props.liked_ids.contains(&t.id)}
                     downloaded={props.downloaded_ids.contains(&t.id)}
+                    online={props.online}
                     playing={props.playing_id.as_deref() == Some(t.id.as_str())}
                     playlists={props.playlists.clone()}
                     on_play={props.on_play.clone()}
@@ -621,6 +698,8 @@ struct TrackRowProps {
     index: usize,
     liked: bool,
     downloaded: bool,
+    #[prop_or(true)]
+    online: bool,
     playing: bool,
     playlists: Vec<(String, String)>,
     on_play: Callback<usize>,
@@ -637,10 +716,17 @@ fn track_row(props: &TrackRowProps) -> Html {
     let menu_open = use_state(|| false);
     let t = &props.track;
     let i = props.index;
+    // Offline, a track that isn't downloaded can't be streamed: grey it out and
+    // make the row inert for playback.
+    let available = props.online || props.downloaded;
 
     let play = {
         let cb = props.on_play.clone();
-        Callback::from(move |_: MouseEvent| cb.emit(i))
+        Callback::from(move |_: MouseEvent| {
+            if available {
+                cb.emit(i);
+            }
+        })
     };
     let context = {
         let menu_open = menu_open.clone();
@@ -736,7 +822,8 @@ fn track_row(props: &TrackRowProps) -> Html {
     }
 
     html! {
-        <div class={classes!("trow", props.playing.then_some("playing"), (*menu_open).then_some("menu-open"))}
+        <div class={classes!("trow", props.playing.then_some("playing"), (*menu_open).then_some("menu-open"), (!available).then_some("unavailable"))}
+             title={(!available).then_some("Unavailable offline — not downloaded")}
              onclick={play} oncontextmenu={context}>
             { cover(&t.cover, "trow-cover") }
             <div class="trow-meta">

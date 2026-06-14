@@ -3,8 +3,10 @@
 
 mod audio;
 mod commands;
+mod discord;
 mod downloads;
 mod library;
+mod media;
 mod player;
 mod settings;
 mod util;
@@ -26,6 +28,8 @@ pub struct AppState {
     pub library: Arc<Mutex<LibraryStore>>,
     pub downloads: Arc<Downloads>,
     pub settings: Arc<Mutex<SettingsStore>>,
+    pub media: media::MediaHandle,
+    pub discord: discord::DiscordHandle,
 }
 
 fn main() {
@@ -37,6 +41,17 @@ fn main() {
         .init();
 
     tauri::Builder::default()
+        // Must be the first plugin: on a second launch it focuses the running
+        // window instead of starting a rival instance (and a second audio
+        // thread fighting over the output device).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        // Remember window size/position across restarts.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -47,6 +62,7 @@ fn main() {
             let downloads = Arc::new(Downloads::load(data_dir.join("downloads")));
             let settings = SettingsStore::load(&data_dir);
             let volume = settings.data.volume;
+            let discord_rpc = settings.data.discord_rpc;
             tracing::info!("restored volume {volume}");
             let settings = Arc::new(Mutex::new(settings));
 
@@ -55,21 +71,46 @@ fn main() {
             // Apply the persisted volume to the fresh audio thread.
             let _ = audio_tx.send(AudioCmd::Volume(volume));
 
+            // Restore the previous session's queue (stopped, not auto-playing).
+            let playback_path = data_dir.join("playback.json");
+            let mut core = PlayerCore {
+                volume,
+                ..PlayerCore::default()
+            };
+            if let Some(snap) = player::load_snapshot(&playback_path) {
+                tracing::info!("restored queue of {} tracks", snap.tracks.len());
+                core.shuffle = snap.shuffle;
+                core.repeat = snap.repeat;
+                core.source = snap.source;
+                core.current = snap.current.filter(|&i| i < snap.tracks.len());
+                core.queue = snap.tracks;
+                if let Some(t) = core.current.and_then(|i| core.queue.get(i)) {
+                    core.duration = t.duration.unwrap_or(0) as f64;
+                }
+                if core.shuffle {
+                    core.shuffle_history = core.current.into_iter().collect();
+                }
+            }
+
             let player = Arc::new(PlayerShared {
-                core: Mutex::new(PlayerCore {
-                    volume,
-                    ..PlayerCore::default()
-                }),
+                core: Mutex::new(core),
                 audio: audio_tx,
                 rp,
                 http: reqwest::Client::new(),
+                playback_path,
+                persist: util::Persister::spawn(),
             });
+
+            let media = media::spawn(app.handle().clone());
+            let discord = discord::spawn(discord_rpc);
 
             app.manage(AppState {
                 player,
                 library,
                 downloads,
                 settings,
+                media,
+                discord,
             });
             tauri::async_runtime::spawn(player::event_loop(app.handle().clone(), event_rx));
             Ok(())
@@ -88,6 +129,7 @@ fn main() {
             commands::seek,
             commands::set_volume,
             commands::save_volume,
+            commands::set_discord_rpc,
             commands::toggle_shuffle,
             commands::cycle_repeat,
             commands::queue_add,

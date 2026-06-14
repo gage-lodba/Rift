@@ -17,9 +17,15 @@ use crate::util::LockExt;
 use crate::AppState;
 
 fn thumb(thumbs: &[Thumbnail]) -> String {
+    // Prefer the smallest thumbnail at least TARGET wide — crisp for headers
+    // without pulling the full-resolution original for tiny list rows/cards.
+    // Fall back to the largest available when nothing meets the target.
+    const TARGET: u32 = 512;
     thumbs
         .iter()
-        .max_by_key(|t| t.width)
+        .filter(|t| t.width >= TARGET)
+        .min_by_key(|t| t.width)
+        .or_else(|| thumbs.iter().max_by_key(|t| t.width))
         .map(|t| t.url.clone())
         .unwrap_or_default()
 }
@@ -95,7 +101,15 @@ pub async fn search(query: String, state: State<'_, AppState>) -> Result<Vec<Tra
         .music_search_tracks(&query)
         .await
         .map_err(|e| format!("search failed: {e}"))?;
-    Ok(result.items.items.into_iter().map(convert).collect())
+    // Keep official YouTube Music audio tracks only — drop music videos and
+    // podcast episodes so results are songs, not video versions.
+    Ok(result
+        .items
+        .items
+        .into_iter()
+        .filter(|t| t.track_type.is_track())
+        .map(convert)
+        .collect())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -290,49 +304,8 @@ pub async fn play_track(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn toggle_play(app: AppHandle, state: State<'_, AppState>) {
-    enum Action {
-        None,
-        Emit(PlaybackState),
-        Replay(usize),
-        Cancel,
-    }
-    let action = {
-        let mut core = state.player.core.lock_safe();
-        match core.state {
-            PlaybackState::Playing => {
-                let _ = state.player.audio.send(AudioCmd::Pause);
-                core.state = PlaybackState::Paused;
-                Action::Emit(PlaybackState::Paused)
-            }
-            PlaybackState::Paused => {
-                let _ = state.player.audio.send(AudioCmd::Resume);
-                core.state = PlaybackState::Playing;
-                Action::Emit(PlaybackState::Playing)
-            }
-            PlaybackState::Stopped => match core.current {
-                Some(i) => Action::Replay(i),
-                None => Action::None,
-            },
-            // Cancel an in-flight load: bump the generation so the pending
-            // fetch is discarded when it lands, and stop.
-            PlaybackState::Loading => {
-                core.generation += 1;
-                core.state = PlaybackState::Stopped;
-                core.position = 0.0;
-                Action::Cancel
-            }
-        }
-    };
-    match action {
-        Action::Emit(s) => player::emit_state(&app, s),
-        Action::Replay(i) => player::play_index(&app, i),
-        Action::Cancel => {
-            let _ = state.player.audio.send(AudioCmd::Stop);
-            player::emit_state(&app, PlaybackState::Stopped);
-        }
-        Action::None => {}
-    }
+pub fn toggle_play(app: AppHandle) {
+    player::toggle_playback(&app);
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -347,19 +320,24 @@ pub fn prev_track(app: AppHandle) {
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn seek(position: f64, app: AppHandle, state: State<'_, AppState>) {
-    let progress = {
+    let (progress, pstate) = {
         let mut core = state.player.core.lock_safe();
         if core.state != PlaybackState::Playing && core.state != PlaybackState::Paused {
             return;
         }
         core.position = position.clamp(0.0, core.duration.max(0.0));
-        Progress {
-            position: core.position,
-            duration: core.duration,
-        }
+        (
+            Progress {
+                position: core.position,
+                duration: core.duration,
+            },
+            core.state,
+        )
     };
     let _ = state.player.audio.send(AudioCmd::Seek(progress.position));
     let _ = app.emit(events::PROGRESS, progress);
+    // Re-sync Discord's elapsed/remaining bar to the new position.
+    state.discord.set_state(pstate, progress.position);
 }
 
 /// Live volume change (fires continuously while the slider is dragged): updates
@@ -376,6 +354,15 @@ pub fn set_volume(volume: f32, state: State<'_, AppState>) {
 #[tauri::command(rename_all = "snake_case")]
 pub fn save_volume(volume: f32, state: State<'_, AppState>) {
     state.settings.lock_safe().set_volume(volume);
+}
+
+/// Enable or disable Discord Rich Presence and persist the choice. The Discord
+/// thread retains the last-known track, so toggling on immediately re-advertises
+/// whatever is currently playing (and toggling off clears the presence).
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_discord_rpc(enabled: bool, state: State<'_, AppState>) {
+    state.settings.lock_safe().set_discord_rpc(enabled);
+    state.discord.set_enabled(enabled);
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -428,50 +415,15 @@ pub fn queue_add(track: Track, app: AppHandle, state: State<'_, AppState>) {
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn queue_remove(index: usize, app: AppHandle, state: State<'_, AppState>) {
-    enum Action {
-        EmitOnly,
-        PlayIndex(usize),
-        Stop,
-    }
-    let action = {
+    let outcome = {
         let mut core = state.player.core.lock_safe();
-        if index >= core.queue.len() {
-            return;
-        }
-        core.queue.remove(index);
-        // Indices shift on removal; drop the now-stale shuffle history. Where
-        // the current track is kept, re-anchor on it below.
-        core.shuffle_history.clear();
-        core.shuffle_cursor = 0;
-        match core.current {
-            Some(cur) if index < cur => {
-                core.current = Some(cur - 1);
-                core.shuffle_history = vec![cur - 1];
-                Action::EmitOnly
-            }
-            // The playing track was removed: move on to whatever took its
-            // place, or stop if it was the last one.
-            Some(cur) if index == cur => {
-                if core.queue.is_empty() {
-                    core.current = None;
-                    Action::Stop
-                } else {
-                    let next = cur.min(core.queue.len() - 1);
-                    Action::PlayIndex(next)
-                }
-            }
-            // Removal was after the current track: its index is unchanged.
-            Some(cur) => {
-                core.shuffle_history = vec![cur];
-                Action::EmitOnly
-            }
-            None => Action::EmitOnly,
-        }
+        player::remove_from_queue(&mut core, index)
     };
-    match action {
-        Action::EmitOnly => player::emit_queue(&app, &state.player),
-        Action::PlayIndex(i) => player::play_index(&app, i),
-        Action::Stop => {
+    match outcome {
+        player::RemoveOutcome::None => {}
+        player::RemoveOutcome::EmitOnly => player::emit_queue(&app, &state.player),
+        player::RemoveOutcome::PlayIndex(i) => player::play_index(&app, i),
+        player::RemoveOutcome::Stop => {
             player::stop(&app);
             player::emit_queue(&app, &state.player);
         }
@@ -571,6 +523,7 @@ pub fn bootstrap(state: State<'_, AppState>) -> Bootstrap {
         queue: snapshot(&core),
         state: core.state,
         volume: core.volume,
+        discord_rpc: state.settings.lock_safe().data.discord_rpc,
         track: core.current.and_then(|i| core.queue.get(i).cloned()),
         progress: Progress {
             position: core.position,

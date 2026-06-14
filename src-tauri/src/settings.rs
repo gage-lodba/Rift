@@ -10,11 +10,16 @@ use tracing::warn;
 pub struct Settings {
     /// Playback volume in 0.0..=1.0.
     pub volume: f32,
+    /// Whether to advertise the current track as a Discord Rich Presence.
+    pub discord_rpc: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { volume: 1.0 }
+        Self {
+            volume: 1.0,
+            discord_rpc: true,
+        }
     }
 }
 
@@ -52,6 +57,11 @@ impl SettingsStore {
 
     pub fn set_volume(&mut self, volume: f32) {
         self.data.volume = volume.clamp(0.0, 1.0);
+        self.save();
+    }
+
+    pub fn set_discord_rpc(&mut self, on: bool) {
+        self.data.discord_rpc = on;
         self.save();
     }
 }

@@ -1,4 +1,4 @@
-/* ===== Rift — dark theme, red accent ===== */
+/* ===== Rift — dark theme, cosmic violet accent (matches the logo) ===== */
 
 :root {
   --bg: #0e0e10;
@@ -7,8 +7,10 @@
   --border: #232328;
   --text: #ececef;
   --text-dim: #8b8b93;
-  --accent: #f0263c;
-  --accent-dim: #b81e30;
+  /* Pulled from the logo: --accent is the nebula core violet, --accent-dim a
+     deeper shade for hover/pressed states. */
+  --accent: #8b3df0;
+  --accent-dim: #6d28d9;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -43,11 +45,35 @@ input[type="range"] { accent-color: var(--accent); }
 }
 
 .logo {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--accent);
+  padding: 0 22px 0 14px;
+}
+.logo-mark {
+  width: 22px;
+  height: 22px;
+  /* Soft cosmic glow under the mark. */
+  filter: drop-shadow(0 0 3px rgba(157, 92, 255, 0.55));
+  /* Let clicks fall through to the titlebar drag region. */
+  pointer-events: none;
+}
+.logo-text {
   font-weight: 800;
   font-size: 17px;
-  letter-spacing: 1px;
-  color: var(--accent);
-  padding: 0 22px 0 16px;
+  letter-spacing: 2px;
+  color: var(--accent); /* solid fallback */
+}
+/* Cosmic gradient wordmark echoing the rift (cyan -> violet -> pink); falls
+   back to solid accent if the engine can't clip a background to text. */
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .logo-text {
+    background: linear-gradient(110deg, #7df9ff 0%, #c084fc 50%, #ff8df5 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
 }
 
 .searchbox {
@@ -140,10 +166,26 @@ input[type="range"] { accent-color: var(--accent); }
 .sidebar {
   width: 216px;
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
   background: #111113;
   border-right: 1px solid var(--border);
   padding: 12px 10px;
+  overflow: hidden;
+}
+
+/* Scrollable nav region; keeps the Settings item pinned at the bottom. */
+.side-scroll {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+}
+
+/* Separator between the scrollable nav and the pinned Settings item. */
+.side-divider {
+  height: 1px;
+  margin: 8px 10px;
+  background: var(--border);
 }
 
 .side-item {
@@ -421,6 +463,12 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .trow:hover { background: var(--bg-raised); }
 .trow.playing { background: var(--bg-raised); }
+
+/* Offline + not downloaded: greyed and not playable. Buttons are dimmed too
+   (opacity groups) but stay clickable, so liking/removing still works. */
+.trow.unavailable { opacity: 0.4; cursor: default; }
+.trow.unavailable:hover { background: transparent; }
+.card.unavailable { opacity: 0.4; cursor: default; }
 .trow.playing .trow-title { color: var(--accent); font-weight: 600; }
 
 .trow-cover, .qrow-cover {
@@ -666,14 +714,55 @@ input[type="range"] { accent-color: var(--accent); }
   bottom: 110px;
   left: 18px;
   max-width: 420px;
+  /* Errors stay red regardless of the brand accent, so a failure always reads
+     as a failure. */
   background: #2a1216;
-  border: 1px solid var(--accent-dim);
+  border: 1px solid #b81e30;
   color: #ffb3bb;
   padding: 10px 14px;
   border-radius: 8px;
   font-size: 13px;
   z-index: 99;
 }
+
+/* ===== settings ===== */
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  max-width: 640px;
+  padding: 16px 18px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.settings-text { flex: 1; min-width: 0; }
+.settings-label { font-size: 15px; font-weight: 600; }
+.settings-desc { margin-top: 4px; font-size: 13px; color: var(--text-dim); }
+
+/* Toggle switch */
+.switch {
+  flex-shrink: 0;
+  width: 44px;
+  height: 24px;
+  padding: 2px;
+  border: none;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.switch.on { background: var(--accent); }
+.switch-knob {
+  display: block;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s ease;
+}
+.switch.on .switch-knob { transform: translateX(20px); }
 
 /* ===== scrollbars ===== */
 

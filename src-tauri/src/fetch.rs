@@ -11,10 +11,11 @@
 //! 2. **yt-dlp** (subprocess): actively maintained against YouTube changes;
 //!    downloads the m4a to a temp file which we read back into memory.
 //!
-//! A failed rustypipe attempt is remembered for the rest of the session so
-//! every following track goes straight to yt-dlp.
+//! A failed rustypipe attempt backs off to yt-dlp for the next several tracks
+//! and then re-probes, so a transient failure doesn't pin the whole session to
+//! the subprocess path.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{anyhow, bail, Context};
 use reqwest::header;
@@ -27,7 +28,13 @@ const CHUNK_SIZE_MIN: u64 = 800_000;
 const CHUNK_JITTER: u64 = 200_000;
 const MAX_ATTEMPTS: usize = 2;
 
-static RUSTYPIPE_STREAMING_OK: AtomicBool = AtomicBool::new(true);
+/// After a rustypipe failure, fall back to yt-dlp for this many fetches before
+/// re-probing rustypipe (so playback recovers automatically when upstream or
+/// the network does, instead of giving up for the whole session).
+const RUSTYPIPE_RETRY_AFTER: u32 = 50;
+
+/// Fetches remaining before rustypipe is retried. 0 means "try rustypipe now".
+static RUSTYPIPE_COOLDOWN: AtomicU32 = AtomicU32::new(0);
 
 /// Load a track for playback, preferring an offline copy under `downloads_dir`
 /// and falling back to a network fetch. Returns the audio bytes and duration
@@ -56,16 +63,21 @@ pub async fn fetch_bytes(
     http: &reqwest::Client,
     video_id: &str,
 ) -> anyhow::Result<(Vec<u8>, f64)> {
-    if RUSTYPIPE_STREAMING_OK.load(Ordering::Relaxed) {
+    if RUSTYPIPE_COOLDOWN.load(Ordering::Relaxed) == 0 {
         match fetch_via_rustypipe(rp, http, video_id).await {
             Ok(out) => return Ok(out),
             Err(e) => {
                 warn!(
-                    "rustypipe streaming failed ({e:#}); falling back to yt-dlp for this session"
+                    "rustypipe streaming failed ({e:#}); using yt-dlp for the next {RUSTYPIPE_RETRY_AFTER} tracks"
                 );
-                RUSTYPIPE_STREAMING_OK.store(false, Ordering::Relaxed);
+                RUSTYPIPE_COOLDOWN.store(RUSTYPIPE_RETRY_AFTER, Ordering::Relaxed);
             }
         }
+    } else {
+        // Count down toward the next re-probe.
+        let _ = RUSTYPIPE_COOLDOWN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
     }
     fetch_via_ytdlp(video_id).await
 }
@@ -171,6 +183,12 @@ async fn fetch_chunked(
             break;
         }
     }
+    // A known content length we didn't reach means the response was truncated
+    // (e.g. CDN throttling) — error out so the caller falls back to yt-dlp
+    // instead of playing or caching a half-finished track.
+    if size > 0 && (data.len() as u64) < size {
+        bail!("incomplete stream: got {} of {size} bytes", data.len());
+    }
     Ok(data)
 }
 
@@ -196,7 +214,7 @@ async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
         .arg(format!("https://www.youtube.com/watch?v={video_id}"))
         .output()
         .await
-        .context("could not run yt-dlp — is it installed? (e.g. pacman -S yt-dlp)")?;
+        .context("could not run yt-dlp — is it installed and on your PATH? (https://github.com/yt-dlp/yt-dlp#installation)")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
