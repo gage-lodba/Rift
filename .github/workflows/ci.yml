@@ -58,13 +58,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Prebuilt trunk binary, added to PATH for the matrix (building from
-      # source is slow and brittle; cargo-binstall's install dir wasn't picked
-      # up on PATH, so the next step failed with `trunk: command not found`).
+      # Prebuilt trunk binary, added to PATH for the matrix. Pin an explicit
+      # version: `latest` makes the action query GitHub's API unauthenticated,
+      # which gets rate-limited and returns an HTML error page ("Unexpected
+      # token '<'"). A pinned version skips that lookup and downloads directly.
       - name: Install trunk
         uses: jetli/trunk-action@v0.5.0
         with:
-          version: latest
+          version: v0.21.14
 
       # Build the WASM frontend. This also populates ../dist, which the Tauri
       # backend embeds via generate_context! when it compiles below.
