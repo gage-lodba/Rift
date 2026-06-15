@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/gage-lodba/Rift/actions/workflows/ci.yml/badge.svg)](https://github.com/gage-lodba/Rift/actions/workflows/ci.yml)
 
-An ad-free YouTube Music desktop player, written (almost) entirely in Rust.
+A minimal, ad-free desktop music player, written (almost) entirely in Rust.
 
 ![Preview](Previews/image.png)
 
-- **Backend:** Tauri 2, tokio, rodio (playback), rustypipe (YouTube Music API), serde, tracing
+- **Backend:** Tauri 2, tokio, rodio (playback), rustypipe (streaming backend), serde, tracing
 - **Frontend:** Yew (Rust → WASM), built with Trunk
-- Search YouTube Music, play tracks with auto-generated radio queues, like songs,
+- Search for music, play tracks with auto-generated radio queues, like songs,
   build playlists, and pick up where you left off — no ads, no tracking, no account.
 
 ## Download
@@ -16,7 +16,7 @@ An ad-free YouTube Music desktop player, written (almost) entirely in Rust.
 Grab the installer for your platform from the
 [latest release](https://github.com/gage-lodba/Rift/releases/latest) — `.AppImage`,
 `.deb` or `.rpm` for Linux, `.dmg` for macOS, `.msi` or `.exe` for Windows. Linux
-users still need [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed (see below).
+users also need [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed (see below).
 
 To build from source instead, read on.
 
@@ -50,16 +50,12 @@ For a distributable bundle, install `tauri-cli` (`cargo install tauri-cli`) and 
 ## How streaming works (and why yt-dlp is needed)
 
 Rift uses [rustypipe](https://crates.io/crates/rustypipe) for search, metadata and
-radio queues, and tries it first for audio streams too. However, as of mid-2026
-YouTube limits clients without a proof-of-origin token to a ~1 MB preview per
-stream URL, and rustypipe 0.11.4's signature deobfuscator (required for the
-clients that accept such tokens) no longer parses YouTube's player JavaScript —
-upstream has been dormant since mid-2025.
-
-Until that recovers, Rift transparently falls back to invoking `yt-dlp` (which is
-actively maintained against YouTube's changes) to fetch the m4a audio. Everything
-else — UI, queue, playback, library — stays in Rust. If a future rustypipe release
-fixes stream resolution, Rift will use it automatically without any changes.
+radio queues, and tries it first for audio streams too. As of mid-2026 rustypipe
+0.11.4 can no longer resolve full audio streams on its own (upstream has been
+dormant since mid-2025), so Rift transparently falls back to invoking
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) to fetch the m4a audio. Everything else
+— UI, queue, playback, library — stays in Rust. If a future rustypipe release
+restores stream resolution, Rift will use it automatically without any changes.
 
 You can verify the streaming pipeline from the command line:
 

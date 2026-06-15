@@ -25,14 +25,12 @@ jobs:
           - platform: ubuntu-22.04
             args: ''
             rust-targets: wasm32-unknown-unknown
-          # macOS Apple Silicon.
+          # macOS: one universal (Intel + Apple Silicon) bundle, built on the
+          # Apple Silicon runner. Avoids the retired/scarce Intel `macos-13`
+          # runner, which can leave its job queued indefinitely.
           - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-            rust-targets: aarch64-apple-darwin,wasm32-unknown-unknown
-          # macOS Intel.
-          - platform: macos-13
-            args: '--target x86_64-apple-darwin'
-            rust-targets: x86_64-apple-darwin,wasm32-unknown-unknown
+            args: '--target universal-apple-darwin'
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
           # Windows: .msi + .exe (NSIS).
           - platform: windows-latest
             args: ''
