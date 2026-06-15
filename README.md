@@ -11,6 +11,15 @@ An ad-free YouTube Music desktop player, written (almost) entirely in Rust.
 - Search YouTube Music, play tracks with auto-generated radio queues, like songs,
   build playlists, and pick up where you left off — no ads, no tracking, no account.
 
+## Download
+
+Grab the installer for your platform from the
+[latest release](https://github.com/gage-lodba/Rift/releases/latest) — `.AppImage`,
+`.deb` or `.rpm` for Linux, `.dmg` for macOS, `.msi` or `.exe` for Windows. Linux
+users still need [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed (see below).
+
+To build from source instead, read on.
+
 ## Requirements
 
 | Dependency | Why | Install (Arch) |
