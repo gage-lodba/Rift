@@ -1,5 +1,7 @@
 # Rift
 
+[![CI](https://github.com/gage-lodba/Rift/actions/workflows/ci.yml/badge.svg)](https://github.com/gage-lodba/Rift/actions/workflows/ci.yml)
+
 An ad-free YouTube Music desktop player, written (almost) entirely in Rust.
 
 ![Preview](Previews/image.png)
@@ -15,18 +17,21 @@ An ad-free YouTube Music desktop player, written (almost) entirely in Rust.
 |---|---|---|
 | Rust + cargo | everything | `pacman -S rustup` |
 | `wasm32-unknown-unknown` target | Yew frontend | `rustup target add wasm32-unknown-unknown` |
-| [Trunk](https://trunkrs.dev) | WASM bundler | prebuilt binary or `cargo install trunk` |
+| [Trunk](https://trunkrs.dev) | WASM bundler | `cargo binstall trunk` (prebuilt) or `cargo install trunk` |
 | webkit2gtk-4.1 | Tauri webview | `pacman -S webkit2gtk-4.1` |
 | ALSA | audio output | preinstalled on most systems |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | stream fetching (see below) | `pacman -S yt-dlp` |
 
 ## Build & run
 
+The frontend must be built first: the Tauri backend embeds `./dist` at compile time,
+so `cargo run` picks up whatever the last `trunk build` produced.
+
 ```sh
-# build the frontend (outputs to ./dist)
+# 1. build the frontend (outputs to ./dist)
 cd ui && trunk build --release && cd ..
 
-# run the app
+# 2. run the app
 cd src-tauri && cargo run --release
 ```
 
