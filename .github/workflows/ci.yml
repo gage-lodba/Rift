@@ -58,10 +58,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Prebuilt trunk via cargo-binstall (building trunk from source is slow
-      # and brittle against the host toolchain).
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall -y trunk
+      # Prebuilt trunk binary, added to PATH for the matrix (building from
+      # source is slow and brittle; cargo-binstall's install dir wasn't picked
+      # up on PATH, so the next step failed with `trunk: command not found`).
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
 
       # Build the WASM frontend. This also populates ../dist, which the Tauri
       # backend embeds via generate_context! when it compiles below.
