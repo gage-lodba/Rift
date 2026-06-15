@@ -1,0 +1,90 @@
+name: Release
+
+# Build platform bundles and attach them to a GitHub Release when a version
+# tag is pushed (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+# `workflow_dispatch` allows a manual run for testing the build (still a draft).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# tauri-action needs write access to create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: bundle (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: .deb + .rpm + .AppImage. Pinned to 22.04 so the AppImage
+          # links against an older glibc and runs on more distros.
+          - platform: ubuntu-22.04
+            args: ''
+            rust-targets: wasm32-unknown-unknown
+          # macOS Apple Silicon.
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            rust-targets: aarch64-apple-darwin,wasm32-unknown-unknown
+          # macOS Intel.
+          - platform: macos-13
+            args: '--target x86_64-apple-darwin'
+            rust-targets: x86_64-apple-darwin,wasm32-unknown-unknown
+          # Windows: .msi + .exe (NSIS).
+          - platform: windows-latest
+            args: ''
+            rust-targets: wasm32-unknown-unknown
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2's Linux build dependencies (webkit2gtk 4.1, not 4.0). macOS and
+      # Windows ship the needed webview + audio backends already.
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep per-platform caches separate.
+          key: ${{ matrix.platform }}
+
+      # Pinned version: `latest` makes the action query GitHub's API
+      # unauthenticated, which gets rate-limited and returns HTML. The Tauri
+      # build invokes `trunk build --release` via beforeBuildCommand.
+      - name: Install trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: v0.21.14
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          releaseName: Rift ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          releaseBody: 'Download the installer for your platform from the assets below.'
+          # Published as a draft so you can review/edit the notes before release.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
