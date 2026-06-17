@@ -159,6 +159,19 @@ pub struct DownloadState {
     pub downloading: Vec<String>,
 }
 
+/// Result of probing the system for the yt-dlp binary (the load-bearing
+/// streaming fallback). Surfaced in Settings so users can confirm it's
+/// installed and see which copy Rift will use.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct YtDlpStatus {
+    /// Whether a working yt-dlp was found and ran successfully.
+    pub found: bool,
+    /// Absolute path Rift resolved, if any.
+    pub path: Option<String>,
+    /// Version string reported by `yt-dlp --version`, if it ran.
+    pub version: Option<String>,
+}
+
 /// Event channel names shared by both sides.
 pub mod events {
     pub const TRACK: &str = "rift://track";

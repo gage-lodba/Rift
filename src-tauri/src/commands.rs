@@ -5,7 +5,7 @@
 
 use rift_types::{
     events, AlbumPage, AlbumSummary, ArtistPage, ArtistSummary, Bootstrap, DownloadState, Library,
-    PlaybackState, Playlist, Progress, Track,
+    PlaybackState, Playlist, Progress, Track, YtDlpStatus,
 };
 use rustypipe::model::{AlbumItem, AlbumType, Thumbnail, TrackItem};
 use tauri::{AppHandle, Emitter, State};
@@ -594,6 +594,15 @@ pub fn remove_downloads(ids: Vec<String>, app: AppHandle, state: State<'_, AppSt
         state.downloads.remove(id);
     }
     emit_downloads(&app, &state.downloads.state());
+}
+
+// ------------------------------------------------------------- diagnostics
+
+/// Probe the system for yt-dlp, the load-bearing streaming fallback. Used by
+/// the Settings view to confirm playback will work.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn check_ytdlp() -> YtDlpStatus {
+    rift::fetch::detect_ytdlp().await
 }
 
 // ---------------------------------------------------------------- window

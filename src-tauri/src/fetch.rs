@@ -15,10 +15,16 @@
 //! and then re-probes, so a transient failure doesn't pin the whole session to
 //! the subprocess path.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context};
 use reqwest::header;
+
+/// Windows process creation flag: don't allocate a console for the child.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 use rustypipe::client::{ClientType, RustyPipe};
 use rustypipe::model::AudioFormat;
 use tracing::{debug, info, warn};
@@ -202,8 +208,8 @@ async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
     let _ = tokio::fs::remove_file(&path).await;
 
     info!("fetching {video_id} via yt-dlp");
-    let output = tokio::process::Command::new("yt-dlp")
-        .arg("-f")
+    let mut cmd = tokio::process::Command::new(ytdlp_path());
+    cmd.arg("-f")
         .arg("140/bestaudio[ext=m4a]")
         .arg("--no-playlist")
         .arg("--quiet")
@@ -211,10 +217,17 @@ async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
         .arg("--force-overwrites")
         .arg("-o")
         .arg(&path)
-        .arg(format!("https://www.youtube.com/watch?v={video_id}"))
+        .arg(format!("https://www.youtube.com/watch?v={video_id}"));
+
+    // Without CREATE_NO_WINDOW, spawning a console subprocess from a GUI app
+    // flashes a console window on Windows. No-op elsewhere.
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd
         .output()
         .await
-        .context("could not run yt-dlp — is it installed and on your PATH? (https://github.com/yt-dlp/yt-dlp#installation)")?;
+        .context("could not run yt-dlp — install it (https://github.com/yt-dlp/yt-dlp#installation), or set RIFT_YTDLP to its full path")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -226,4 +239,90 @@ async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
         .context("yt-dlp produced no output file")?;
     let _ = tokio::fs::remove_file(&path).await;
     Ok((data, 0.0))
+}
+
+/// The yt-dlp binary name (platform-specific).
+#[cfg(windows)]
+const YTDLP_BIN: &str = "yt-dlp.exe";
+#[cfg(not(windows))]
+const YTDLP_BIN: &str = "yt-dlp";
+
+/// Resolve the yt-dlp executable to an absolute path, cached for the session.
+///
+/// GUI-launched apps don't inherit the interactive shell's `PATH` (a
+/// desktop-menu launch on Linux/macOS sees only the session `PATH`, which
+/// usually omits `~/.local/bin`), so `Command::new("yt-dlp")` finds nothing
+/// even though it works under `cargo tauri dev` from a terminal. We look in an
+/// explicit override, then `PATH`, then the usual install dirs, and fall back
+/// to the bare name so the "not found" error still reads sensibly.
+/// Probe the system for a usable yt-dlp: resolve its path, then run
+/// `yt-dlp --version` to confirm it actually executes (a resolved path that
+/// fails to run — wrong arch, missing perms — reports `found: false`).
+pub async fn detect_ytdlp() -> rift_types::YtDlpStatus {
+    let path = ytdlp_path();
+    let path_str = path.display().to_string();
+
+    let mut cmd = tokio::process::Command::new(path);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    match cmd.output().await {
+        Ok(out) if out.status.success() => rift_types::YtDlpStatus {
+            found: true,
+            path: Some(path_str),
+            version: Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        },
+        _ => rift_types::YtDlpStatus {
+            found: false,
+            path: path.is_file().then_some(path_str),
+            version: None,
+        },
+    }
+}
+
+fn ytdlp_path() -> &'static PathBuf {
+    static RESOLVED: OnceLock<PathBuf> = OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        // 1. Explicit override (set in the app's launcher or environment).
+        if let Some(p) = std::env::var_os("RIFT_YTDLP") {
+            let p = PathBuf::from(p);
+            if p.is_file() {
+                return p;
+            }
+        }
+
+        // 2. Honor PATH if it happens to contain yt-dlp (e.g. terminal launch).
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                let candidate = dir.join(YTDLP_BIN);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+
+        // 3. Common install locations not always on a GUI session's PATH.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(&home).join(".local/bin"));
+            dirs.push(PathBuf::from(&home).join("bin"));
+        }
+        dirs.extend(
+            ["/usr/local/bin", "/usr/bin", "/bin", "/opt/homebrew/bin"]
+                .iter()
+                .map(PathBuf::from),
+        );
+        for dir in dirs {
+            let candidate = dir.join(YTDLP_BIN);
+            if candidate.is_file() {
+                info!("resolved yt-dlp at {}", candidate.display());
+                return candidate;
+            }
+        }
+
+        // 4. Give up gracefully — let the spawn fail with a clear error.
+        warn!("yt-dlp not found in PATH or common locations; falling back to bare name");
+        PathBuf::from(YTDLP_BIN)
+    })
 }

@@ -145,6 +145,7 @@ fn main() {
             commands::bootstrap,
             commands::download_tracks,
             commands::remove_downloads,
+            commands::check_ytdlp,
             commands::window_minimize,
             commands::window_toggle_maximize,
             commands::window_close,

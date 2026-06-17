@@ -1,6 +1,8 @@
 //! Presentational components for the Rift UI.
 
-use rift_types::{ArtistRef, Library, PlaybackState, Progress, QueueSnapshot, RepeatMode, Track};
+use rift_types::{
+    ArtistRef, Library, PlaybackState, Progress, QueueSnapshot, RepeatMode, Track, YtDlpStatus,
+};
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
@@ -390,6 +392,9 @@ pub struct SettingsProps {
     pub on_discord_rpc: Callback<bool>,
 }
 
+/// `None` while a probe is in flight; `Some` once it resolves.
+type YtDlpProbe = Option<YtDlpStatus>;
+
 #[function_component(SettingsView)]
 pub fn settings_view(props: &SettingsProps) -> Html {
     let on_discord = {
@@ -397,6 +402,32 @@ pub fn settings_view(props: &SettingsProps) -> Html {
         let cb = props.on_discord_rpc.clone();
         Callback::from(move |_: MouseEvent| cb.emit(!current))
     };
+
+    // yt-dlp detection: probe once on mount, and again when the user clicks
+    // "Check again". `None` renders as a "Checking…" state.
+    let ytdlp = use_state(|| None as YtDlpProbe);
+    let check = {
+        let ytdlp = ytdlp.clone();
+        Callback::from(move |_: ()| {
+            let ytdlp = ytdlp.clone();
+            ytdlp.set(None);
+            spawn_local(async move {
+                let status = api::invoke::<YtDlpStatus>("check_ytdlp", &json!({}))
+                    .await
+                    .unwrap_or_default();
+                ytdlp.set(Some(status));
+            });
+        })
+    };
+    // Probe once when the view mounts.
+    {
+        let check = check.clone();
+        use_effect_with((), move |_| {
+            check.emit(());
+            || ()
+        });
+    }
+    let on_check = check.reform(|_: MouseEvent| ());
 
     html! {
         <>
@@ -416,7 +447,49 @@ pub fn settings_view(props: &SettingsProps) -> Html {
                     <span class="switch-knob" />
                 </button>
             </div>
+            <div class="settings-row">
+                <div class="settings-text">
+                    <div class="settings-label">{ "Streaming engine (yt-dlp)" }</div>
+                    <div class="settings-desc">
+                        { "Rift uses yt-dlp to fetch audio. Playback needs it installed and on your PATH." }
+                    </div>
+                    { ytdlp_status_line(&ytdlp) }
+                </div>
+                <button class="btn-secondary" onclick={on_check}>{ "Check again" }</button>
+            </div>
         </>
+    }
+}
+
+fn ytdlp_status_line(probe: &YtDlpProbe) -> Html {
+    match probe {
+        None => html! {
+            <div class="ytdlp-status checking">{ "Checking…" }</div>
+        },
+        Some(status) if status.found => {
+            let version = status.version.clone().unwrap_or_default();
+            let path = status.path.clone().unwrap_or_default();
+            html! {
+                <div class="ytdlp-status found">
+                    <span class="ytdlp-badge">{ "✓ Found" }</span>
+                    { if version.is_empty() { html!{} } else { html!{ <span class="ytdlp-meta">{ version }</span> } } }
+                    { if path.is_empty() { html!{} } else { html!{ <code class="ytdlp-path">{ path }</code> } } }
+                </div>
+            }
+        }
+        Some(status) => {
+            // Not found, but we may have resolved a path that failed to run.
+            let detail = match &status.path {
+                Some(p) => format!("Found a file at {p} but it didn't run."),
+                None => "Not found on your PATH or in common install locations.".to_string(),
+            };
+            html! {
+                <div class="ytdlp-status missing">
+                    <span class="ytdlp-badge">{ "✗ Not found" }</span>
+                    <span class="ytdlp-meta">{ detail }</span>
+                </div>
+            }
+        }
     }
 }
 
