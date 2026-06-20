@@ -8,7 +8,7 @@ use rift_types::{
     PlaybackState, Playlist, Progress, Track, YtDlpStatus,
 };
 use rustypipe::model::{AlbumItem, AlbumType, Thumbnail, TrackItem};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{info, warn};
 
 use crate::audio::AudioCmd;
@@ -62,6 +62,28 @@ fn convert_artists(artists: &[rustypipe::model::ArtistId]) -> Vec<rift_types::Ar
         .collect()
 }
 
+/// Heuristic: does this title look like a music-video upload rather than an
+/// audio track? YouTube Music's "Songs" filter occasionally surfaces the
+/// "Official Video" version of a track (typically when there's no separate
+/// audio-only upload), and these come back typed as a plain track, so the
+/// `TrackType` filter alone doesn't catch them.
+///
+/// Matches specific marker *phrases* (not the bare word "video") so legitimate
+/// songs whose names happen to contain "video" — e.g. "Video Games" — aren't
+/// dropped. Audio-leaning variants ("official audio", "lyric video",
+/// "visualizer") are deliberately not matched.
+fn looks_like_video_title(title: &str) -> bool {
+    let t = title.to_lowercase();
+    const MARKERS: [&str; 5] = [
+        "official video",
+        "music video",
+        "official hd video",
+        "official 4k video",
+        "video clip",
+    ];
+    MARKERS.iter().any(|m| t.contains(m))
+}
+
 fn convert(item: TrackItem) -> Track {
     Track {
         title: item.name,
@@ -101,13 +123,14 @@ pub async fn search(query: String, state: State<'_, AppState>) -> Result<Vec<Tra
         .music_search_tracks(&query)
         .await
         .map_err(|e| format!("search failed: {e}"))?;
-    // Keep official YouTube Music audio tracks only — drop music videos and
-    // podcast episodes so results are songs, not video versions.
+    // Keep official YouTube Music audio tracks only: drop music videos and
+    // podcast episodes by type, then also drop entries that slip through typed
+    // as tracks but are titled as the "Official Video" upload.
     Ok(result
         .items
         .items
         .into_iter()
-        .filter(|t| t.track_type.is_track())
+        .filter(|t| t.track_type.is_track() && !looks_like_video_title(&t.name))
         .map(convert)
         .collect())
 }
@@ -166,15 +189,185 @@ pub async fn get_artist(id: String, state: State<'_, AppState>) -> Result<Artist
         .music_artist(&id, false)
         .await
         .map_err(|e| format!("could not load artist: {e}"))?;
+
+    // Drop "Official Video" uploads so Top songs shows audio tracks, not the
+    // duplicate music-video versions (which the artist endpoint mixes in).
+    let mut tracks: Vec<Track> = artist
+        .tracks
+        .into_iter()
+        .filter(|t| t.track_type.is_track() && !looks_like_video_title(&t.name))
+        .map(convert)
+        .collect();
+
+    // Artist-page top tracks come back without durations (rustypipe only
+    // populates `duration` from search/album/playlist endpoints). Backfill them
+    // from the artist's tracks playlist, which does carry durations.
+    if tracks.iter().any(|t| t.duration.is_none()) {
+        if let Some(pl_id) = &artist.tracks_playlist_id {
+            if let Ok(pl) = state.player.rp.query().music_playlist(pl_id).await {
+                let durations: std::collections::HashMap<String, u32> = pl
+                    .tracks
+                    .items
+                    .into_iter()
+                    .filter_map(|t| t.duration.map(|d| (t.id, d)))
+                    .collect();
+                for t in tracks.iter_mut().filter(|t| t.duration.is_none()) {
+                    t.duration = durations.get(&t.id).copied();
+                }
+            }
+        }
+    }
+
     Ok(ArtistPage {
         image: thumb(&artist.header_image),
         id: artist.id,
         name: artist.name,
         description: artist.description,
         subscribers: artist.subscriber_count,
-        tracks: artist.tracks.into_iter().map(convert).collect(),
+        tracks,
         albums: artist.albums.into_iter().map(convert_album_item).collect(),
+        tracks_playlist_id: artist.tracks_playlist_id,
     })
+}
+
+/// Load an artist's full song catalog (the list behind "Show all songs"),
+/// filtered the same way as the artist page so it stays audio-tracks-only.
+///
+/// The catalog playlist YouTube Music exposes carries no per-track album, so we
+/// rebuild it in two cheap-to-expensive passes:
+///   1. Fetch the artist's albums concurrently and map each track ID to its
+///      album — one album page covers ~a dozen songs, so this resolves the bulk.
+///   2. For the stragglers (singles, collabs where the artist is featured,
+///      soundtrack/bonus cuts whose IDs don't match an album page) fall back to
+///      per-track `music_details`, which always reports an album.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_artist_songs(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Track>, String> {
+    let shared = state.player.clone();
+    let artist = shared
+        .rp
+        .query()
+        .music_artist(&id, false)
+        .await
+        .map_err(|e| format!("could not load artist: {e}"))?;
+    let pl_id = artist
+        .tracks_playlist_id
+        .ok_or_else(|| "artist has no songs list".to_string())?;
+
+    let pl = shared
+        .rp
+        .query()
+        .music_playlist(&pl_id)
+        .await
+        .map_err(|e| format!("could not load songs: {e}"))?;
+    let mut songs: Vec<Track> = pl
+        .tracks
+        .items
+        .into_iter()
+        .filter(|t| t.track_type.is_track() && !looks_like_video_title(&t.name))
+        .map(convert)
+        .collect();
+
+    let mut album_of: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    // Seed from the artist's top tracks, which already carry albums — catches
+    // singles/EPs that aren't in the main albums list.
+    for t in &artist.tracks {
+        if let Some(al) = &t.album {
+            album_of
+                .entry(t.id.clone())
+                .or_insert_with(|| (al.name.clone(), al.id.clone()));
+        }
+    }
+
+    // Pass 1: fetch each album page and index track ID -> (album, id). Bounded
+    // so we don't fire dozens of requests at once (YouTube rate-limits, which
+    // would silently drop album coverage).
+    let album_ids = artist.albums.into_iter().map(|a| a.id);
+    bounded_for_each(album_ids, |id| {
+        let shared = shared.clone();
+        async move { shared.rp.query().music_album(&id).await.ok() }
+    })
+    .await
+    .into_iter()
+    .flatten()
+    .for_each(|al| {
+        for t in al.tracks {
+            album_of
+                .entry(t.id)
+                .or_insert_with(|| (al.name.clone(), al.id.clone()));
+        }
+    });
+    for s in songs.iter_mut().filter(|s| s.album.is_none()) {
+        if let Some((name, album_id)) = album_of.get(&s.id) {
+            s.album = Some(name.clone());
+            s.album_id = Some(album_id.clone());
+        }
+    }
+
+    // Pass 2: resolve whatever the album pages didn't cover via per-track
+    // details (one request each, only for the songs still missing an album),
+    // bounded the same way.
+    let missing: Vec<String> = songs
+        .iter()
+        .filter(|s| s.album.is_none())
+        .map(|s| s.id.clone())
+        .collect();
+    bounded_for_each(missing, |id| {
+        let shared = shared.clone();
+        async move {
+            let album = shared
+                .rp
+                .query()
+                .music_details(&id)
+                .await
+                .ok()
+                .and_then(|d| d.track.album);
+            album.map(|al| (id, al.name, al.id))
+        }
+    })
+    .await
+    .into_iter()
+    .flatten()
+    .for_each(|(id, name, album_id)| {
+        if let Some(s) = songs.iter_mut().find(|s| s.id == id && s.album.is_none()) {
+            s.album = Some(name);
+            s.album_id = Some(album_id);
+        }
+    });
+
+    Ok(songs)
+}
+
+/// Run an async `task` over each item with at most [`MAX_INFLIGHT`] in flight at
+/// once, collecting the results (order not preserved). Keeps fan-out network
+/// work from overwhelming the upstream API.
+async fn bounded_for_each<I, T, F, Fut>(items: I, task: F) -> Vec<T>
+where
+    I: IntoIterator,
+    F: Fn(I::Item) -> Fut,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    const MAX_INFLIGHT: usize = 8;
+    let mut set = tokio::task::JoinSet::new();
+    let mut out = Vec::new();
+    let mut items = items.into_iter();
+    // Prime up to the limit, then replace each finished task with the next.
+    for item in items.by_ref().take(MAX_INFLIGHT) {
+        set.spawn(task(item));
+    }
+    while let Some(res) = set.join_next().await {
+        if let Ok(v) = res {
+            out.push(v);
+        }
+        if let Some(item) = items.next() {
+            set.spawn(task(item));
+        }
+    }
+    out
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -285,11 +478,15 @@ pub async fn play_track(
                         if core.epoch != epoch {
                             return; // queue was replaced meanwhile
                         }
-                        let have: Vec<String> = core.queue.iter().map(|t| t.id.clone()).collect();
+                        let have: std::collections::HashSet<String> =
+                            core.queue.iter().map(|t| t.id.clone()).collect();
                         core.queue.extend(
                             paginator
                                 .items
                                 .into_iter()
+                                .filter(|t| {
+                                    t.track_type.is_track() && !looks_like_video_title(&t.name)
+                                })
                                 .map(convert)
                                 .filter(|t| !have.contains(&t.id)),
                         );
@@ -326,6 +523,9 @@ pub fn seek(position: f64, app: AppHandle, state: State<'_, AppState>) {
             return;
         }
         core.position = position.clamp(0.0, core.duration.max(0.0));
+        // Re-evaluate the crossfade arm from the new position: a backward seek
+        // out of the overlap window should let the crossfade arm again.
+        core.crossfade_armed_for = None;
         (
             Progress {
                 position: core.position,
@@ -363,6 +563,14 @@ pub fn save_volume(volume: f32, state: State<'_, AppState>) {
 pub fn set_discord_rpc(enabled: bool, state: State<'_, AppState>) {
     state.settings.lock_safe().set_discord_rpc(enabled);
     state.discord.set_enabled(enabled);
+}
+
+/// Set the crossfade overlap (in seconds; 0 disables it) and persist it. Takes
+/// effect on the next track transition.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_crossfade(secs: f32, state: State<'_, AppState>) {
+    let clamped = state.settings.lock_safe().set_crossfade(secs);
+    state.player.core.lock_safe().crossfade = clamped as f64;
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -495,9 +703,39 @@ pub fn rename_playlist(id: String, name: String, app: AppHandle, state: State<'_
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn add_to_playlist(id: String, track: Track, app: AppHandle, state: State<'_, AppState>) {
-    let mut lib = state.library.lock_safe();
-    lib.add_to_playlist(&id, track);
-    emit_library(&app, &lib.data);
+    // A playlist whose every track is already downloaded is treated as "kept
+    // offline": adding a new track should pull it down too, so the playlist
+    // stays fully available offline. Evaluated before the add, and only for a
+    // non-empty playlist that doesn't already contain this track.
+    let keep_offline = {
+        let lib = state.library.lock_safe();
+        lib.data
+            .playlists
+            .iter()
+            .find(|p| p.id == id)
+            .is_some_and(|p| {
+                !p.tracks.is_empty()
+                    && !p.tracks.iter().any(|t| t.id == track.id)
+                    && p.tracks
+                        .iter()
+                        .all(|t| state.downloads.is_downloaded(&t.id))
+            })
+    };
+
+    {
+        let mut lib = state.library.lock_safe();
+        lib.add_to_playlist(&id, track.clone());
+        emit_library(&app, &lib.data);
+    }
+
+    if keep_offline {
+        start_downloads(
+            vec![track],
+            app,
+            state.downloads.clone(),
+            state.player.clone(),
+        );
+    }
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -518,12 +756,27 @@ pub fn remove_from_playlist(
 pub fn bootstrap(state: State<'_, AppState>) -> Bootstrap {
     let core = state.player.core.lock_safe();
     let lib = state.library.lock_safe();
+    // Read all settings under a single lock: two `lock_safe()` calls in the same
+    // struct literal would both stay alive until the literal is built and
+    // deadlock on the non-reentrant mutex.
+    let (discord_rpc, crossfade, yt_dlp_path, update_notifications) = {
+        let s = state.settings.lock_safe();
+        (
+            s.data.discord_rpc,
+            s.data.crossfade,
+            s.data.yt_dlp_path.clone(),
+            s.data.update_notifications,
+        )
+    };
     Bootstrap {
         library: lib.data.clone(),
         queue: snapshot(&core),
         state: core.state,
         volume: core.volume,
-        discord_rpc: state.settings.lock_safe().data.discord_rpc,
+        discord_rpc,
+        crossfade,
+        yt_dlp_path,
+        update_notifications,
         track: core.current.and_then(|i| core.queue.get(i).cloned()),
         progress: Progress {
             position: core.position,
@@ -544,9 +797,18 @@ fn emit_downloads(app: &AppHandle, state: &DownloadState) {
 /// progress emitted after each one.
 #[tauri::command(rename_all = "snake_case")]
 pub fn download_tracks(tracks: Vec<Track>, app: AppHandle, state: State<'_, AppState>) {
-    let downloads = state.downloads.clone();
-    let player = state.player.clone();
+    start_downloads(tracks, app, state.downloads.clone(), state.player.clone());
+}
 
+/// Spawn a background job that downloads `tracks`, skipping ones already on disk
+/// or in flight. Shared by the explicit Download action and the automatic
+/// "keep a fully-downloaded playlist offline" path.
+fn start_downloads(
+    tracks: Vec<Track>,
+    app: AppHandle,
+    downloads: std::sync::Arc<crate::downloads::Downloads>,
+    player: std::sync::Arc<crate::player::PlayerShared>,
+) {
     // `begin` atomically claims each id and returns false if one was already in
     // flight, so concurrent or repeated calls never fetch the same track twice.
     let pending: Vec<Track> = tracks
@@ -605,6 +867,176 @@ pub async fn check_ytdlp() -> YtDlpStatus {
     rift::fetch::detect_ytdlp().await
 }
 
+/// Set (or clear, with a blank value) a custom yt-dlp location, persist it,
+/// apply it immediately, and re-probe so the caller sees the new status.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn set_yt_dlp_path(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<YtDlpStatus, String> {
+    let configured = {
+        let mut settings = state.settings.lock_safe();
+        settings.set_yt_dlp_path(path);
+        settings.data.yt_dlp_path.clone()
+    };
+    rift::fetch::set_ytdlp_override(configured.map(std::path::PathBuf::from));
+    Ok(rift::fetch::detect_ytdlp().await)
+}
+
+/// Download yt-dlp for the current platform into the app data dir, set it as the
+/// active binary, and re-probe. Used by Settings when yt-dlp isn't found.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn download_ytdlp(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<YtDlpStatus, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir: {e}"))?
+        .join("bin");
+    let http = state.player.http.clone();
+    match rift::fetch::download_ytdlp(&dir, &http).await {
+        Ok(path) => {
+            let path_str = path.to_string_lossy().to_string();
+            state.settings.lock_safe().set_yt_dlp_path(Some(path_str));
+            rift::fetch::set_ytdlp_override(Some(path));
+        }
+        Err(e) => {
+            let msg = format!("Could not download yt-dlp: {e:#}");
+            warn!("{msg}");
+            let _ = app.emit(events::ERROR, msg.clone());
+            return Err(msg);
+        }
+    }
+    Ok(rift::fetch::detect_ytdlp().await)
+}
+
+// ------------------------------------------------------------- updates
+
+/// GitHub repo (owner/name) whose releases back the update check.
+const RELEASE_REPO: &str = "gage-lodba/Rift";
+
+/// Compare two dotted version strings (e.g. "0.2.0" vs "0.1.3"), returning true
+/// if `latest` is strictly newer. Non-numeric/missing components count as 0, so
+/// pre-release suffixes are treated leniently rather than crashing the check.
+fn is_newer(latest: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Vec<u32> {
+        v.trim_start_matches('v')
+            .split('.')
+            .map(|p| {
+                p.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap_or("")
+                    .parse()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+    let (l, c) = (parts(latest), parts(current));
+    for i in 0..l.len().max(c.len()) {
+        let (a, b) = (
+            l.get(i).copied().unwrap_or(0),
+            c.get(i).copied().unwrap_or(0),
+        );
+        if a != b {
+            return a > b;
+        }
+    }
+    false
+}
+
+/// Check GitHub for a newer Rift release. Compares the running version against
+/// the latest published release's tag; surfaced in Settings. Network/parse
+/// failures degrade to "latest unknown" (still reporting the running version)
+/// rather than erroring, so the UI can always show the current version.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn check_update(state: State<'_, AppState>) -> Result<rift_types::UpdateStatus, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let mut status = rift_types::UpdateStatus {
+        current: current.clone(),
+        ..Default::default()
+    };
+
+    let url = format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest");
+    let json: Option<serde_json::Value> = async {
+        state
+            .player
+            .http
+            .get(&url)
+            // GitHub's API rejects requests without a User-Agent.
+            .header(reqwest::header::USER_AGENT, "rift-update-check")
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+    .await;
+
+    if let Some(json) = json {
+        status.latest = json
+            .get("tag_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim_start_matches('v').to_string());
+        status.update_available = status
+            .latest
+            .as_deref()
+            .map(|l| is_newer(l, &current))
+            .unwrap_or(false);
+        status.url = json
+            .get("html_url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+    } else {
+        warn!("update check failed to reach GitHub");
+    }
+    Ok(status)
+}
+
+/// Enable or disable the launch-time update check/notification and persist it.
+#[tauri::command(rename_all = "snake_case")]
+pub fn set_update_notifications(enabled: bool, state: State<'_, AppState>) {
+    state.settings.lock_safe().set_update_notifications(enabled);
+}
+
+/// Open an http(s) URL in the user's default browser. Used by the "Download"
+/// action on an available update (the webview itself shouldn't navigate away).
+#[tauri::command(rename_all = "snake_case")]
+pub fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("refusing to open non-http(s) url".into());
+    }
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(&url);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(&url);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        // `start` is a cmd builtin; the empty "" is its window-title argument.
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", &url]);
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    };
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open browser: {e}"))
+}
+
 // ---------------------------------------------------------------- window
 
 #[tauri::command(rename_all = "snake_case")]
@@ -624,4 +1056,52 @@ pub fn window_toggle_maximize(window: tauri::Window) {
 #[tauri::command(rename_all = "snake_case")]
 pub fn window_close(window: tauri::Window) {
     let _ = window.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_newer, looks_like_video_title};
+
+    #[test]
+    fn detects_newer_versions() {
+        assert!(is_newer("0.2.0", "0.1.0"));
+        assert!(is_newer("0.1.1", "0.1.0"));
+        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(is_newer("v0.2.0", "0.1.0")); // leading v tolerated
+        assert!(is_newer("0.2", "0.1.9")); // uneven lengths
+    }
+
+    #[test]
+    fn ignores_same_or_older_versions() {
+        assert!(!is_newer("0.1.0", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.2.0"));
+        assert!(!is_newer("0.1.0", "0.1.0")); // identical
+        assert!(!is_newer("0.1.0-rc1", "0.1.0")); // pre-release suffix -> 0
+    }
+
+    #[test]
+    fn flags_official_video_uploads() {
+        for t in [
+            "Song Title (Official Video)",
+            "Song Title (Official Music Video)",
+            "Song Title [Music Video]",
+            "Song Title (Official HD Video)",
+            "Artist - Song (Video Clip)",
+        ] {
+            assert!(looks_like_video_title(t), "should flag: {t}");
+        }
+    }
+
+    #[test]
+    fn keeps_audio_tracks_and_video_named_songs() {
+        for t in [
+            "Video Games",                 // a real song name, not a video upload
+            "Song Title (Official Audio)", // audio variant
+            "Song Title (Lyric Video)",    // lyric videos are audio-leaning
+            "Song Title (Visualizer)",
+            "Plain Song Title",
+        ] {
+            assert!(!looks_like_video_title(t), "should keep: {t}");
+        }
+    }
 }

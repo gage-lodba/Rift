@@ -63,6 +63,15 @@ fn main() {
             let settings = SettingsStore::load(&data_dir);
             let volume = settings.data.volume;
             let discord_rpc = settings.data.discord_rpc;
+            let crossfade = settings.data.crossfade as f64;
+            // Apply the persisted custom yt-dlp location (if any) before any fetch.
+            rift::fetch::set_ytdlp_override(
+                settings
+                    .data
+                    .yt_dlp_path
+                    .clone()
+                    .map(std::path::PathBuf::from),
+            );
             tracing::info!("restored volume {volume}");
             let settings = Arc::new(Mutex::new(settings));
 
@@ -75,6 +84,7 @@ fn main() {
             let playback_path = data_dir.join("playback.json");
             let mut core = PlayerCore {
                 volume,
+                crossfade,
                 ..PlayerCore::default()
             };
             if let Some(snap) = player::load_snapshot(&playback_path) {
@@ -120,6 +130,7 @@ fn main() {
             commands::search_artists,
             commands::search_albums,
             commands::get_artist,
+            commands::get_artist_songs,
             commands::get_album,
             commands::play_tracks,
             commands::play_track,
@@ -130,6 +141,7 @@ fn main() {
             commands::set_volume,
             commands::save_volume,
             commands::set_discord_rpc,
+            commands::set_crossfade,
             commands::toggle_shuffle,
             commands::cycle_repeat,
             commands::queue_add,
@@ -146,6 +158,11 @@ fn main() {
             commands::download_tracks,
             commands::remove_downloads,
             commands::check_ytdlp,
+            commands::set_yt_dlp_path,
+            commands::download_ytdlp,
+            commands::check_update,
+            commands::set_update_notifications,
+            commands::open_url,
             commands::window_minimize,
             commands::window_toggle_maximize,
             commands::window_close,

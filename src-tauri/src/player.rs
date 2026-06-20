@@ -45,6 +45,16 @@ pub struct PlayerCore {
     /// instead of skipping forever; reset on any successful playback or a fresh
     /// user-initiated jump.
     pub failures: u32,
+    /// Crossfade overlap in seconds; 0 disables it (a hard cut between tracks).
+    pub crossfade: f64,
+    /// Generation a crossfade has already been triggered for, so the position
+    /// watcher fires at most once per track.
+    pub crossfade_armed_for: Option<u64>,
+    /// Next index drawn ahead of time by a crossfade. Consumed exactly once by
+    /// whichever advance happens first — the crossfade commit or a natural
+    /// end-of-track — so the (possibly random, under shuffle) pick isn't drawn
+    /// twice.
+    pub pending_next: Option<usize>,
 }
 
 impl Default for PlayerCore {
@@ -64,6 +74,9 @@ impl Default for PlayerCore {
             generation: 0,
             epoch: 0,
             failures: 0,
+            crossfade: 0.0,
+            crossfade_armed_for: None,
+            pending_next: None,
         }
     }
 }
@@ -158,6 +171,8 @@ fn start_playback(app: &AppHandle, index: usize) {
         };
         core.current = Some(index);
         core.generation += 1;
+        // A hard start supersedes any crossfade the position watcher prefetched.
+        core.pending_next = None;
         core.state = PlaybackState::Loading;
         core.position = 0.0;
         core.duration = track.duration.unwrap_or(0) as f64;
@@ -180,7 +195,6 @@ fn start_playback(app: &AppHandle, index: usize) {
     emit_queue(&app, &shared);
 
     tauri::async_runtime::spawn(async move {
-        let mut track = track;
         match rift::fetch::fetch_track(&shared.rp, &shared.http, &downloads.dir, &track.id).await {
             Ok((data, duration)) => {
                 {
@@ -205,29 +219,7 @@ fn start_playback(app: &AppHandle, index: usize) {
                         duration: dur,
                     },
                 );
-                // Publish now-playing metadata to the OS media session.
-                app.state::<AppState>().media.set_track(&track, dur);
-
-                // Backfill clickable artist links for tracks saved before
-                // per-artist credits existed, and persist them so list rows
-                // become linkable too.
-                if enrich_track(&shared.rp, &mut track).await {
-                    {
-                        let mut core = shared.core.lock_safe();
-                        if let Some(slot) = core.queue.get_mut(index) {
-                            if slot.id == track.id {
-                                *slot = track.clone();
-                            }
-                        }
-                    }
-                    let _ = app.emit(events::TRACK, &track);
-                    emit_queue(&app, &shared);
-                }
-
-                let mut lib = library.lock_safe();
-                lib.backfill_track(&track);
-                lib.push_recent(track);
-                let _ = app.emit(events::LIBRARY, &lib.data);
+                announce_track(&app, &shared, &library, index, track, dur).await;
             }
             Err(e) => {
                 error!("failed to play {}: {e:#}", track.id);
@@ -300,6 +292,135 @@ async fn enrich_track(rp: &RustyPipe, track: &mut Track) -> bool {
     true
 }
 
+/// Refresh the now-playing surfaces once a track is actually playing: publish
+/// it to the OS media session, backfill artist credits (persisting them so list
+/// rows become linkable), and record it in the library's recents. Shared by the
+/// fresh-start ([`start_playback`]) and crossfade ([`begin_crossfade`]) paths.
+async fn announce_track(
+    app: &AppHandle,
+    shared: &std::sync::Arc<PlayerShared>,
+    library: &std::sync::Arc<Mutex<crate::library::LibraryStore>>,
+    index: usize,
+    mut track: Track,
+    dur: f64,
+) {
+    app.state::<AppState>().media.set_track(&track, dur);
+
+    if enrich_track(&shared.rp, &mut track).await {
+        {
+            let mut core = shared.core.lock_safe();
+            if let Some(slot) = core.queue.get_mut(index) {
+                if slot.id == track.id {
+                    *slot = track.clone();
+                }
+            }
+        }
+        let _ = app.emit(events::TRACK, &track);
+        emit_queue(app, shared);
+    }
+
+    let mut lib = library.lock_safe();
+    lib.backfill_track(&track);
+    lib.push_recent(track);
+    let _ = app.emit(events::LIBRARY, &lib.data);
+}
+
+/// Begin a crossfade into the next track: draw it now, fetch it in the
+/// background, and once its bytes are ready overlap it with the current track
+/// via [`AudioCmd::Crossfade`]. Triggered by the position watcher as the current
+/// track nears its end.
+///
+/// If the fetch is too slow and the current track ends first, the natural
+/// end-of-track path advances normally (reusing the same drawn pick), and this
+/// crossfade is discarded — a graceful fall back to a hard cut.
+fn begin_crossfade(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let shared = state.player.clone();
+    let library = state.library.clone();
+    let downloads = state.downloads.clone();
+    let app = app.clone();
+
+    let (index, anchor_gen, fade) = {
+        let mut core = shared.core.lock_safe();
+        // Draw the next track now and remember it. pick_next advances the
+        // shuffle bookkeeping; pending_next pins the pick so the actual advance
+        // (here or on a natural end) reuses it instead of drawing again.
+        let Some(next) = pick_next(&mut core, false) else {
+            return;
+        };
+        core.pending_next = Some(next);
+        (next, core.generation, core.crossfade)
+    };
+
+    info!("crossfading to queue index {index}");
+
+    tauri::async_runtime::spawn(async move {
+        let Some(track) = shared.core.lock_safe().queue.get(index).cloned() else {
+            return;
+        };
+        match rift::fetch::fetch_track(&shared.rp, &shared.http, &downloads.dir, &track.id).await {
+            Ok((data, duration)) => {
+                let dur = {
+                    let mut core = shared.core.lock_safe();
+                    // Commit only if nothing advanced while we fetched: the
+                    // generation is unchanged and our pick is still pending. If
+                    // a natural end (or a skip) beat us, it already consumed the
+                    // pick and bumped the generation — drop this crossfade.
+                    if core.generation != anchor_gen || core.pending_next != Some(index) {
+                        debug!("discarding stale crossfade for {}", track.id);
+                        return;
+                    }
+                    // The crossfade armed while Playing, but the user may have
+                    // paused (or cancelled to Stopped) during the prefetch.
+                    // Committing now would call player.play() on the audio thread
+                    // and resume against the user's wish, leaving state desynced.
+                    // Leave the pick pending so the natural end-of-track path
+                    // (after the user resumes) reuses it instead.
+                    if core.state != PlaybackState::Playing {
+                        debug!("crossfade target ready but playback is paused; deferring");
+                        return;
+                    }
+                    core.pending_next = None;
+                    core.current = Some(index);
+                    core.state = PlaybackState::Playing;
+                    core.generation += 1;
+                    core.failures = 0;
+                    core.position = 0.0;
+                    core.duration = if duration > 0.0 {
+                        duration
+                    } else {
+                        track.duration.unwrap_or(0) as f64
+                    };
+                    core.duration
+                };
+
+                let fade = std::time::Duration::from_secs_f64(fade.max(0.0));
+                let _ = shared.audio.send(AudioCmd::Crossfade(data, fade));
+                // Playback never left the Playing state, so only the track and
+                // its surfaces need refreshing.
+                let _ = app.emit(events::TRACK, &track);
+                app.state::<AppState>().discord.set_track(&track, dur);
+                emit_state(&app, PlaybackState::Playing);
+                emit_queue(&app, &shared);
+                let _ = app.emit(
+                    events::PROGRESS,
+                    Progress {
+                        position: 0.0,
+                        duration: dur,
+                    },
+                );
+                announce_track(&app, &shared, &library, index, track, dur).await;
+            }
+            Err(e) => {
+                // Leave the pick pending so the natural end-of-track retries it
+                // (and its own skip logic handles a track that stays broken),
+                // rather than redrawing and corrupting the shuffle cycle.
+                debug!("crossfade prefetch failed for {}: {e:#}", track.id);
+            }
+        }
+    });
+}
+
 fn rand_index(len: usize) -> usize {
     (rand::random::<u64>() as usize) % len
 }
@@ -317,6 +438,13 @@ fn pick_next(core: &mut PlayerCore, manual: bool) -> Option<usize> {
     let cur = core.current?;
     if len == 0 {
         return None;
+    }
+    // A crossfade may have already drawn the next track (advancing the shuffle
+    // bookkeeping as it did). Honour that pick so it isn't drawn twice.
+    if let Some(i) = core.pending_next.take() {
+        if i < len {
+            return Some(i);
+        }
     }
     if !manual && core.repeat == RepeatMode::One {
         return Some(cur);
@@ -527,13 +655,33 @@ pub async fn event_loop(app: AppHandle, mut rx: UnboundedReceiver<AudioEvent>) {
                 let _ = app.emit(events::PROGRESS, Progress { position, duration });
             }
             AudioEvent::Position(position) => {
-                let duration = {
+                let (duration, crossfade) = {
                     let state = app.state::<AppState>();
                     let mut core = state.player.core.lock_safe();
                     core.position = position;
-                    core.duration
+                    // Arm a crossfade once, when the track is within the overlap
+                    // window of its end. Repeat-one is excluded (a track can't
+                    // overlap itself); keyed by generation so it fires at most
+                    // once per track.
+                    let arm = core.crossfade > 0.0
+                        && core.state == PlaybackState::Playing
+                        && core.repeat != RepeatMode::One
+                        && core.duration > 0.0
+                        && core.crossfade_armed_for != Some(core.generation)
+                        // Don't re-arm while a crossfade prefetch is already in
+                        // flight (e.g. after a seek cleared the arm flag).
+                        && core.pending_next.is_none()
+                        && core.duration - position <= core.crossfade;
+                    if arm {
+                        core.crossfade_armed_for = Some(core.generation);
+                    }
+                    (core.duration, arm)
                 };
                 let _ = app.emit(events::PROGRESS, Progress { position, duration });
+                if crossfade {
+                    debug!("nearing track end, starting crossfade");
+                    begin_crossfade(&app);
+                }
             }
             AudioEvent::Ended => {
                 debug!("track ended, advancing queue");
@@ -663,6 +811,35 @@ mod tests {
             current,
             ..PlayerCore::default()
         }
+    }
+
+    #[test]
+    fn pending_next_is_honoured_once_then_falls_through() {
+        let mut core = PlayerCore {
+            queue: (0..3).map(dummy_track).collect(),
+            current: Some(0),
+            pending_next: Some(2),
+            ..PlayerCore::default()
+        };
+        // A crossfade-prefetched pick is returned and consumed.
+        assert_eq!(pick_next(&mut core, false), Some(2));
+        assert_eq!(core.pending_next, None);
+        // The next call falls through to normal sequential order.
+        advance(&mut core, 2);
+        assert_eq!(pick_next(&mut core, true), Some(0));
+    }
+
+    #[test]
+    fn stale_out_of_range_pending_next_is_ignored() {
+        let mut core = PlayerCore {
+            queue: (0..2).map(dummy_track).collect(),
+            current: Some(0),
+            pending_next: Some(9),
+            ..PlayerCore::default()
+        };
+        // An index left over from a longer queue is dropped, not played.
+        assert_eq!(pick_next(&mut core, false), Some(1));
+        assert_eq!(core.pending_next, None);
     }
 
     #[test]
