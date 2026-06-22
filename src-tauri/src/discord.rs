@@ -10,7 +10,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use discord_rich_presence::activity::{Activity, ActivityType, Assets, Timestamps};
+use discord_rich_presence::activity::{Activity, ActivityType, Assets, Button, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use rift_types::{PlaybackState, Track};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -23,6 +23,10 @@ const APP_ID: &str = "1504731045847634042";
 /// Asset key of a logo uploaded under the app's Rich Presence → Art Assets,
 /// shown as a small badge over the cover. Leave empty to show only the cover.
 const LOGO_ASSET: &str = "rift_logo";
+
+/// Rich Presence button linking viewers to the project.
+const GITHUB_LABEL: &str = "View on GitHub";
+const GITHUB_URL: &str = "https://github.com/gage-lodba/Rift";
 
 enum DiscordCmd {
     Track {
@@ -174,7 +178,8 @@ fn build_activity(n: &Now) -> Activity<'_> {
         .activity_type(ActivityType::Listening)
         .details(n.title.as_str())
         .state(n.artist.as_str())
-        .assets(assets);
+        .assets(assets)
+        .buttons(vec![Button::new(GITHUB_LABEL, GITHUB_URL)]);
 
     // A start+end pair renders Discord's elapsed/remaining time bar — only
     // meaningful while actually playing and when the duration is known.

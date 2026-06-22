@@ -95,10 +95,21 @@ impl LibraryStore {
     }
 
     pub fn create_playlist(&mut self, name: String) -> Playlist {
+        self.create_playlist_with(name, Vec::new())
+    }
+
+    /// Create a playlist pre-populated with `tracks` (used by import). Duplicate
+    /// track ids within the input are dropped, preserving first-seen order.
+    pub fn create_playlist_with(&mut self, name: String, tracks: Vec<Track>) -> Playlist {
+        let mut seen = std::collections::HashSet::new();
+        let tracks = tracks
+            .into_iter()
+            .filter(|t| seen.insert(t.id.clone()))
+            .collect();
         let playlist = Playlist {
             id: format!("pl-{:016x}", rand::random::<u64>()),
             name,
-            tracks: Vec::new(),
+            tracks,
         };
         self.data.playlists.push(playlist.clone());
         self.save();

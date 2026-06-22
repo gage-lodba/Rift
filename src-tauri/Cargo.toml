@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "An ad-free YouTube Music player"
 
+# The executable is named `rift-music`, not `rift`, so Discord's automatic
+# game detection doesn't mistake the process for the game "RIFT" (which it
+# matches by executable basename). The app, window, and Discord Rich Presence
+# are all still branded "Rift" via tauri.conf.json. The library target stays
+# `rift` so `rift::fetch` re-exports are unaffected.
+[[bin]]
+name = "rift-music"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -29,3 +38,4 @@ tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 discord-rich-presence = "1.1.0"
+tauri-plugin-dialog = "2.7.1"

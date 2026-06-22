@@ -63,6 +63,10 @@ pub struct ArtistPage {
     /// The artist's most popular tracks.
     pub tracks: Vec<Track>,
     pub albums: Vec<AlbumSummary>,
+    /// Playlist ID backing the artist's full song catalog, if one exists. When
+    /// set, the UI offers a "Show all songs" view that loads it on demand.
+    #[serde(default)]
+    pub tracks_playlist_id: Option<String>,
 }
 
 /// A full album page.
@@ -148,6 +152,15 @@ pub struct Bootstrap {
     /// Whether Discord Rich Presence is currently enabled.
     #[serde(default)]
     pub discord_rpc: bool,
+    /// Crossfade overlap between tracks, in seconds (0 = disabled).
+    #[serde(default)]
+    pub crossfade: f32,
+    /// User-configured custom path to the yt-dlp binary (empty = auto-detect).
+    #[serde(default)]
+    pub yt_dlp_path: Option<String>,
+    /// Whether to check for updates on launch and notify the user.
+    #[serde(default)]
+    pub update_notifications: bool,
 }
 
 /// Offline-download status, sent to the frontend whenever it changes.
@@ -172,6 +185,20 @@ pub struct YtDlpStatus {
     pub version: Option<String>,
 }
 
+/// Result of checking GitHub for a newer Rift release.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UpdateStatus {
+    /// The running app version (e.g. "0.1.0").
+    pub current: String,
+    /// Latest published release version, with any leading `v` stripped.
+    /// `None` if the check failed or no release exists.
+    pub latest: Option<String>,
+    /// Whether `latest` is newer than `current`.
+    pub update_available: bool,
+    /// URL of the latest release page, for the "Download" action.
+    pub url: Option<String>,
+}
+
 /// Event channel names shared by both sides.
 pub mod events {
     pub const TRACK: &str = "rift://track";
@@ -181,4 +208,9 @@ pub mod events {
     pub const LIBRARY: &str = "rift://library";
     pub const DOWNLOADS: &str = "rift://downloads";
     pub const ERROR: &str = "rift://error";
+    /// Informational (non-error) toast, e.g. "Exported …".
+    pub const NOTICE: &str = "rift://notice";
+    /// Ask the frontend to navigate to a playlist (payload: its id). Emitted
+    /// after a backend-driven import so the user lands on the new playlist.
+    pub const OPEN_PLAYLIST: &str = "rift://open_playlist";
 }

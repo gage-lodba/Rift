@@ -6,7 +6,7 @@
 
 use std::io::Cursor;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rodio::stream::DeviceSinkBuilder;
 use rodio::{Decoder, Player, Source};
@@ -16,6 +16,9 @@ use tracing::{error, info};
 pub enum AudioCmd {
     /// Decode and play a full in-memory audio file, replacing whatever plays.
     Play(Vec<u8>),
+    /// Decode and play a new track, fading it in over the given duration while
+    /// the current track fades out over the same window (a crossfade).
+    Crossfade(Vec<u8>, Duration),
     Pause,
     Resume,
     Stop,
@@ -23,6 +26,14 @@ pub enum AudioCmd {
     Seek(f64),
     /// Volume in 0.0..=1.0.
     Volume(f32),
+}
+
+/// A track on its way out during a crossfade: its player's volume is ramped
+/// from the master volume down to zero, then dropped (which stops it).
+struct FadeOut {
+    player: Player,
+    start: Instant,
+    dur: Duration,
 }
 
 pub enum AudioEvent {
@@ -54,23 +65,37 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
             return;
         }
     };
-    let player = Player::connect_new(device.mixer());
+    let mut player = Player::connect_new(device.mixer());
     info!("audio thread started");
 
     // True while a track is loaded and we should watch for it ending.
     let mut active = false;
+    // Master volume (0.0..=1.0), applied to every player including fade-outs.
+    let mut volume = 1.0f32;
+    // Tracks currently fading out behind the current one.
+    let mut fading: Vec<FadeOut> = Vec::new();
 
     loop {
-        match rx.recv_timeout(Duration::from_millis(250)) {
+        // Tick fast enough for smooth fades while one is in progress; idle
+        // slower the rest of the time.
+        let timeout = if fading.is_empty() {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(30)
+        };
+        match rx.recv_timeout(timeout) {
             Ok(cmd) => match cmd {
                 AudioCmd::Play(data) => {
                     player.clear();
+                    // A hard cut discards any in-progress crossfade.
+                    fading.clear();
                     match Decoder::new(Cursor::new(data)) {
                         Ok(source) => {
                             // Report the real length so the seek bar is
                             // accurate even when metadata duration is missing.
                             let dur = source.total_duration().map(|d| d.as_secs_f64());
                             player.append(source);
+                            player.set_volume(volume);
                             player.play();
                             active = true;
                             if let Some(d) = dur.filter(|d| *d > 0.0) {
@@ -84,10 +109,50 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                         }
                     }
                 }
-                AudioCmd::Pause => player.pause(),
-                AudioCmd::Resume => player.play(),
+                AudioCmd::Crossfade(data, fade) => match Decoder::new(Cursor::new(data)) {
+                    Ok(source) => {
+                        let dur = source.total_duration().map(|d| d.as_secs_f64());
+                        // Retire the current track onto its own fade-out and
+                        // bring the new one up on a fresh player so the two
+                        // overlap.
+                        let outgoing =
+                            std::mem::replace(&mut player, Player::connect_new(device.mixer()));
+                        if active {
+                            fading.push(FadeOut {
+                                player: outgoing,
+                                start: Instant::now(),
+                                dur: fade,
+                            });
+                        }
+                        player.append(source.fade_in(fade));
+                        player.set_volume(volume);
+                        player.play();
+                        active = true;
+                        if let Some(d) = dur.filter(|d| *d > 0.0) {
+                            let _ = events.send(AudioEvent::Duration(d));
+                        }
+                    }
+                    Err(e) => {
+                        // Leave the current track playing on decode failure; the
+                        // queue will advance normally when it ends.
+                        error!("failed to decode crossfade audio: {e}");
+                    }
+                },
+                AudioCmd::Pause => {
+                    player.pause();
+                    for f in &fading {
+                        f.player.pause();
+                    }
+                }
+                AudioCmd::Resume => {
+                    player.play();
+                    for f in &fading {
+                        f.player.play();
+                    }
+                }
                 AudioCmd::Stop => {
                     player.clear();
+                    fading.clear();
                     active = false;
                 }
                 AudioCmd::Seek(secs) => {
@@ -95,11 +160,26 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                         error!("seek failed: {e}");
                     }
                 }
-                AudioCmd::Volume(v) => player.set_volume(v.clamp(0.0, 1.0)),
+                AudioCmd::Volume(v) => {
+                    volume = v.clamp(0.0, 1.0);
+                    player.set_volume(volume);
+                }
             },
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+
+        // Advance any fade-outs, dropping (and so silencing) the ones that have
+        // run their course.
+        fading.retain(|f| {
+            let t = f.start.elapsed().as_secs_f32() / f.dur.as_secs_f32().max(0.001);
+            if t >= 1.0 || f.player.empty() {
+                false
+            } else {
+                f.player.set_volume(volume * (1.0 - t));
+                true
+            }
+        });
 
         if active {
             if player.empty() {

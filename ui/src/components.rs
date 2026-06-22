@@ -1,11 +1,12 @@
 //! Presentational components for the Rift UI.
 
 use rift_types::{
-    ArtistRef, Library, PlaybackState, Progress, QueueSnapshot, RepeatMode, Track, YtDlpStatus,
+    ArtistRef, Library, PlaybackState, Progress, QueueSnapshot, RepeatMode, Track, UpdateStatus,
+    YtDlpStatus,
 };
 use serde_json::json;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::HtmlInputElement;
+use web_sys::{DragEvent, HtmlInputElement};
 use yew::prelude::*;
 
 use crate::api;
@@ -18,6 +19,8 @@ pub enum View {
     Settings,
     Playlist(String),
     Artist(String),
+    /// All songs by an artist; the inner value is the artist ID.
+    ArtistSongs(String),
     Album(String),
 }
 
@@ -163,6 +166,34 @@ pub fn titlebar(props: &TitlebarProps) -> Html {
             }
         })
     };
+    // Debounced live search: each keystroke schedules a search ~300ms out, and a
+    // monotonically increasing token cancels earlier pending ones so only the
+    // last pause in typing actually fires. Enter still searches immediately.
+    let debounce = use_mut_ref(|| 0u32);
+    let oninput = {
+        let on_search = props.on_search.clone();
+        let debounce = debounce.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            let q = el.value().trim().to_string();
+            let token = {
+                let mut d = debounce.borrow_mut();
+                *d += 1;
+                *d
+            };
+            if q.is_empty() {
+                return;
+            }
+            let on_search = on_search.clone();
+            let debounce = debounce.clone();
+            spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(300).await;
+                if *debounce.borrow() == token {
+                    on_search.emit(q);
+                }
+            });
+        })
+    };
     let onclick = {
         let submit = submit.clone();
         Callback::from(move |_| submit.emit(()))
@@ -175,7 +206,7 @@ pub fn titlebar(props: &TitlebarProps) -> Html {
                 <span class="logo-text" data-tauri-drag-region="true">{ "RIFT" }</span>
             </div>
             <div class="searchbox">
-                <input ref={input} type="text" placeholder="Search YouTube Music..." {onkeydown} />
+                <input ref={input} type="text" placeholder="Search YouTube Music..." {onkeydown} {oninput} />
                 <button class="search-btn" {onclick}>{ "Search" }</button>
             </div>
             <div class="tb-space" data-tauri-drag-region="true"></div>
@@ -200,8 +231,14 @@ pub struct SidebarProps {
     pub playlists: Vec<(String, String, usize)>,
     pub on_nav: Callback<View>,
     pub on_new_playlist: Callback<String>,
+    /// Import a playlist from a pasted YouTube Music link or ID.
+    pub on_import_playlist: Callback<String>,
+    /// Import a playlist from a Rift JSON file (opens a native picker).
+    pub on_import_file: Callback<()>,
     pub on_rename_playlist: Callback<String>,
     pub on_delete_playlist: Callback<String>,
+    /// Export a playlist (by id) to a JSON file.
+    pub on_export_playlist: Callback<String>,
     /// Source tag of the playing queue ("liked", "playlist:<id>").
     pub playing_source: Option<String>,
     pub is_playing: bool,
@@ -211,6 +248,8 @@ pub struct SidebarProps {
 pub fn sidebar(props: &SidebarProps) -> Html {
     let creating = use_state(|| false);
     let input = use_node_ref();
+    let importing = use_state(|| false);
+    let import_ref = use_node_ref();
 
     let nav = |view: View| {
         let on_nav = props.on_nav.clone();
@@ -221,24 +260,78 @@ pub fn sidebar(props: &SidebarProps) -> Html {
         let creating = creating.clone();
         Callback::from(move |_: MouseEvent| creating.set(true))
     };
-    let onkeydown = {
+    // Read the draft name and create the playlist if it isn't blank.
+    let submit_create = {
         let creating = creating.clone();
         let input = input.clone();
         let on_new = props.on_new_playlist.clone();
-        Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
-            "Enter" => {
-                if let Some(el) = input.cast::<HtmlInputElement>() {
-                    let name = el.value();
-                    if !name.trim().is_empty() {
-                        on_new.emit(name.trim().to_string());
-                    }
+        move || {
+            if let Some(el) = input.cast::<HtmlInputElement>() {
+                let name = el.value();
+                if !name.trim().is_empty() {
+                    on_new.emit(name.trim().to_string());
                 }
-                creating.set(false);
             }
+            creating.set(false);
+        }
+    };
+    let onkeydown = {
+        let submit = submit_create.clone();
+        let creating = creating.clone();
+        Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
+            "Enter" => submit(),
             "Escape" => creating.set(false),
             _ => {}
         })
     };
+    let confirm_create = {
+        let submit = submit_create.clone();
+        Callback::from(move |_: MouseEvent| submit())
+    };
+    let cancel_create = {
+        let creating = creating.clone();
+        Callback::from(move |_: MouseEvent| creating.set(false))
+    };
+
+    let start_import = {
+        let importing = importing.clone();
+        Callback::from(move |_: MouseEvent| importing.set(true))
+    };
+    // Read the pasted link/ID and kick off the import if it isn't blank.
+    let submit_import = {
+        let importing = importing.clone();
+        let import_ref = import_ref.clone();
+        let on_import = props.on_import_playlist.clone();
+        move || {
+            if let Some(el) = import_ref.cast::<HtmlInputElement>() {
+                let url = el.value();
+                if !url.trim().is_empty() {
+                    on_import.emit(url.trim().to_string());
+                }
+            }
+            importing.set(false);
+        }
+    };
+    let import_keydown = {
+        let submit = submit_import.clone();
+        let importing = importing.clone();
+        Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
+            "Enter" => submit(),
+            "Escape" => importing.set(false),
+            _ => {}
+        })
+    };
+    let confirm_import = {
+        let submit = submit_import.clone();
+        Callback::from(move |_: MouseEvent| submit())
+    };
+    let cancel_import = {
+        let importing = importing.clone();
+        Callback::from(move |_: MouseEvent| importing.set(false))
+    };
+    // Stop the input from blurring (which would cancel) before a button's click
+    // lands, so the check/X buttons act on the still-focused input.
+    let keep_focus = Callback::from(|e: MouseEvent| e.prevent_default());
 
     let item_class = |active: bool| classes!("side-item", active.then_some("active"));
 
@@ -274,18 +367,57 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                         on_nav={props.on_nav.clone()}
                         on_rename={props.on_rename_playlist.clone()}
                         on_delete={props.on_delete_playlist.clone()}
+                        on_export={props.on_export_playlist.clone()}
                     />
                 }) }
 
                 if *creating {
-                    <input class="side-new-input" ref={input} type="text"
-                           placeholder="Playlist name" autofocus=true {onkeydown}
-                           onblur={ let c = creating.clone(); Callback::from(move |_| c.set(false)) } />
+                    <div class="side-new-row">
+                        <input class="side-new-input" ref={input} type="text"
+                               placeholder="Playlist name" autofocus=true {onkeydown}
+                               onblur={ let c = creating.clone(); Callback::from(move |_| c.set(false)) } />
+                        <button class="ibtn side-new-btn confirm" title="Create"
+                                onmousedown={keep_focus.clone()} onclick={confirm_create}>
+                            { icon("check") }
+                        </button>
+                        <button class="ibtn side-new-btn cancel" title="Cancel"
+                                onmousedown={keep_focus.clone()} onclick={cancel_create}>
+                            { icon("x") }
+                        </button>
+                    </div>
                 } else {
                     <div class="side-item side-new" onclick={start_create}>
                         { icon("plus") }<span>{ "New playlist" }</span>
                     </div>
                 }
+            </div>
+
+            // Import actions pinned to the bottom, above the Settings divider.
+            if *importing {
+                <div class="side-new-row">
+                    <input class="side-new-input" ref={import_ref} type="text"
+                           placeholder="YouTube Music link or ID" autofocus=true onkeydown={import_keydown}
+                           onblur={ let i = importing.clone(); Callback::from(move |_| i.set(false)) } />
+                    <button class="ibtn side-new-btn confirm" title="Import"
+                            onmousedown={keep_focus.clone()} onclick={confirm_import}>
+                        { icon("check") }
+                    </button>
+                    <button class="ibtn side-new-btn cancel" title="Cancel"
+                            onmousedown={keep_focus} onclick={cancel_import}>
+                        { icon("x") }
+                    </button>
+                </div>
+            } else {
+                <div class="side-item side-new" onclick={start_import}>
+                    { icon("download") }<span>{ "Import playlist" }</span>
+                </div>
+            }
+
+            <div class="side-item side-new" onclick={
+                let cb = props.on_import_file.clone();
+                Callback::from(move |_: MouseEvent| cb.emit(()))
+            }>
+                { icon("album") }<span>{ "Import from file" }</span>
             </div>
 
             <div class="side-divider" />
@@ -310,6 +442,7 @@ struct SidebarPlaylistProps {
     on_nav: Callback<View>,
     on_rename: Callback<String>,
     on_delete: Callback<String>,
+    on_export: Callback<String>,
 }
 
 #[function_component(SidebarPlaylist)]
@@ -358,6 +491,16 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
             },
         },
         MenuAction::Item {
+            icon: "download",
+            label: "Export".into(),
+            danger: false,
+            cb: {
+                let cb = props.on_export.clone();
+                let id = props.id.clone();
+                Callback::from(move |_| cb.emit(id.clone()))
+            },
+        },
+        MenuAction::Item {
             icon: "trash",
             label: "Delete".into(),
             danger: true,
@@ -390,7 +533,23 @@ pub struct SettingsProps {
     pub discord_rpc: bool,
     /// Called with the new value when the Discord toggle is flipped.
     pub on_discord_rpc: Callback<bool>,
+    /// Crossfade overlap in seconds; 0 means disabled.
+    pub crossfade: f32,
+    /// Called with the new crossfade duration in seconds (0 disables it).
+    pub on_crossfade: Callback<f32>,
+    /// Configured custom yt-dlp path (empty/None = auto-detect).
+    #[prop_or_default]
+    pub yt_dlp_path: Option<String>,
+    /// Whether launch-time update notifications are enabled.
+    pub update_notifications: bool,
+    /// Called with the new value when the update-notification toggle is flipped.
+    pub on_update_notifications: Callback<bool>,
 }
+
+/// Default overlap applied when crossfade is toggled on from off.
+const DEFAULT_CROSSFADE: f32 = 6.0;
+/// Largest overlap the slider offers (mirrors the backend's `MAX_CROSSFADE`).
+const MAX_CROSSFADE: f32 = 12.0;
 
 /// `None` while a probe is in flight; `Some` once it resolves.
 type YtDlpProbe = Option<YtDlpStatus>;
@@ -401,6 +560,24 @@ pub fn settings_view(props: &SettingsProps) -> Html {
         let current = props.discord_rpc;
         let cb = props.on_discord_rpc.clone();
         Callback::from(move |_: MouseEvent| cb.emit(!current))
+    };
+
+    let crossfade_on = props.crossfade > 0.0;
+    // The toggle flips crossfade between off and a sensible default.
+    let on_crossfade_toggle = {
+        let cb = props.on_crossfade.clone();
+        Callback::from(move |_: MouseEvent| {
+            cb.emit(if crossfade_on { 0.0 } else { DEFAULT_CROSSFADE })
+        })
+    };
+    let on_crossfade_slider = {
+        let cb = props.on_crossfade.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            if let Ok(v) = el.value().parse::<f32>() {
+                cb.emit(v);
+            }
+        })
     };
 
     // yt-dlp detection: probe once on mount, and again when the user clicks
@@ -429,6 +606,97 @@ pub fn settings_view(props: &SettingsProps) -> Html {
     }
     let on_check = check.reform(|_: MouseEvent| ());
 
+    // Custom yt-dlp location: draft mirrors the input; saving persists it and
+    // re-probes. A blank value clears the override (back to auto-detect).
+    let path_draft = use_state(|| props.yt_dlp_path.clone().unwrap_or_default());
+    let on_path_input = {
+        let path_draft = path_draft.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            path_draft.set(el.value());
+        })
+    };
+    let save_path = {
+        let ytdlp = ytdlp.clone();
+        let path_draft = path_draft.clone();
+        Callback::from(move |_: MouseEvent| {
+            let ytdlp = ytdlp.clone();
+            let value = (*path_draft).clone();
+            ytdlp.set(None);
+            spawn_local(async move {
+                let status =
+                    api::invoke::<YtDlpStatus>("set_yt_dlp_path", &json!({ "path": value }))
+                        .await
+                        .unwrap_or_default();
+                ytdlp.set(Some(status));
+            });
+        })
+    };
+
+    // Download yt-dlp into the app data dir when it isn't installed.
+    let downloading = use_state(|| false);
+    let download = {
+        let ytdlp = ytdlp.clone();
+        let downloading = downloading.clone();
+        let path_draft = path_draft.clone();
+        Callback::from(move |_: MouseEvent| {
+            let ytdlp = ytdlp.clone();
+            let downloading = downloading.clone();
+            let path_draft = path_draft.clone();
+            downloading.set(true);
+            spawn_local(async move {
+                let status = api::invoke::<YtDlpStatus>("download_ytdlp", &json!({}))
+                    .await
+                    .unwrap_or_default();
+                if let Some(p) = &status.path {
+                    path_draft.set(p.clone());
+                }
+                ytdlp.set(Some(status));
+                downloading.set(false);
+            });
+        })
+    };
+    // Offer the download only once a probe has confirmed yt-dlp is missing.
+    let missing = matches!(&*ytdlp, Some(s) if !s.found);
+
+    // Update check: probe GitHub on mount and on demand. `None` = checking.
+    let update = use_state(|| None as Option<UpdateStatus>);
+    let check_update = {
+        let update = update.clone();
+        Callback::from(move |_: ()| {
+            let update = update.clone();
+            update.set(None);
+            spawn_local(async move {
+                let status = api::invoke::<UpdateStatus>("check_update", &json!({}))
+                    .await
+                    .unwrap_or_default();
+                update.set(Some(status));
+            });
+        })
+    };
+    {
+        let check_update = check_update.clone();
+        use_effect_with((), move |_| {
+            check_update.emit(());
+            || ()
+        });
+    }
+    let on_check_update = check_update.reform(|_: MouseEvent| ());
+    let on_update_toggle = {
+        let current = props.update_notifications;
+        let cb = props.on_update_notifications.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(!current))
+    };
+    // Open the release page in the default browser.
+    let open_release = {
+        let update = update.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(url) = (*update).as_ref().and_then(|u| u.url.clone()) {
+                api::fire("open_url", json!({ "url": url }));
+            }
+        })
+    };
+
     html! {
         <>
             <h2>{ "Settings" }</h2>
@@ -449,15 +717,110 @@ pub fn settings_view(props: &SettingsProps) -> Html {
             </div>
             <div class="settings-row">
                 <div class="settings-text">
+                    <div class="settings-label">{ "Crossfade" }</div>
+                    <div class="settings-desc">
+                        { "Overlap the end of each track with the start of the next for a smooth transition." }
+                    </div>
+                    if crossfade_on {
+                        <div class="crossfade-control">
+                            <input
+                                class="crossfade-slider"
+                                type="range"
+                                min="1"
+                                max={MAX_CROSSFADE.to_string()}
+                                step="1"
+                                value={props.crossfade.to_string()}
+                                oninput={on_crossfade_slider} />
+                            <span class="crossfade-value">
+                                { format!("{}s", props.crossfade.round() as i32) }
+                            </span>
+                        </div>
+                    }
+                </div>
+                <button
+                    class={classes!("switch", crossfade_on.then_some("on"))}
+                    role="switch"
+                    aria-checked={crossfade_on.to_string()}
+                    onclick={on_crossfade_toggle}>
+                    <span class="switch-knob" />
+                </button>
+            </div>
+            <div class="settings-row">
+                <div class="settings-text">
                     <div class="settings-label">{ "Streaming engine (yt-dlp)" }</div>
                     <div class="settings-desc">
-                        { "Rift uses yt-dlp to fetch audio. Playback needs it installed and on your PATH." }
+                        { "Rift uses yt-dlp to fetch audio. It's auto-detected from your PATH and common install locations; set a custom path below if it lives elsewhere." }
                     </div>
                     { ytdlp_status_line(&ytdlp) }
+                    if missing {
+                        <div class="ytdlp-actions">
+                            <button class="btn-primary" onclick={download} disabled={*downloading}>
+                                { if *downloading { "Downloading…" } else { "Download yt-dlp" } }
+                            </button>
+                            <span class="ytdlp-hint">{ "Fetches the latest build into Rift's data folder." }</span>
+                        </div>
+                    }
+                    <div class="ytdlp-custom">
+                        <input class="ytdlp-input" type="text"
+                               placeholder="Custom yt-dlp path (leave blank to auto-detect)"
+                               value={(*path_draft).clone()}
+                               oninput={on_path_input} />
+                        <button class="btn-secondary" onclick={save_path}>{ "Save" }</button>
+                    </div>
                 </div>
                 <button class="btn-secondary" onclick={on_check}>{ "Check again" }</button>
             </div>
+            <div class="settings-row">
+                <div class="settings-text">
+                    <div class="settings-label">{ "Updates" }</div>
+                    <div class="settings-desc">
+                        { "Check GitHub for a newer version of Rift on launch and notify you." }
+                    </div>
+                    { update_status_line(&update) }
+                    <div class="ytdlp-actions">
+                        <button class="btn-secondary" onclick={on_check_update}>{ "Check now" }</button>
+                        if matches!(&*update, Some(u) if u.update_available) {
+                            <button class="btn-primary" onclick={open_release}>
+                                { "Download update" }
+                            </button>
+                        }
+                    </div>
+                </div>
+                <button
+                    class={classes!("switch", props.update_notifications.then_some("on"))}
+                    role="switch"
+                    aria-checked={props.update_notifications.to_string()}
+                    onclick={on_update_toggle}>
+                    <span class="switch-knob" />
+                </button>
+            </div>
         </>
+    }
+}
+
+fn update_status_line(probe: &Option<UpdateStatus>) -> Html {
+    match probe {
+        None => html! { <div class="ytdlp-status checking">{ "Checking…" }</div> },
+        Some(u) if u.update_available => html! {
+            <div class="ytdlp-status missing">
+                <span class="ytdlp-badge">{ "Update available" }</span>
+                <span class="ytdlp-meta">
+                    { format!("v{} → v{}", u.current, u.latest.clone().unwrap_or_default()) }
+                </span>
+            </div>
+        },
+        Some(u) if u.latest.is_some() => html! {
+            <div class="ytdlp-status found">
+                <span class="ytdlp-badge">{ "✓ Up to date" }</span>
+                <span class="ytdlp-meta">{ format!("v{}", u.current) }</span>
+            </div>
+        },
+        // Latest unknown (check failed / offline): just show the running version.
+        Some(u) => html! {
+            <div class="ytdlp-status">
+                <span class="ytdlp-meta">{ format!("Rift v{} — could not reach GitHub", u.current) }</span>
+            </div>
+        },
     }
 }
 
@@ -501,6 +864,8 @@ pub struct HomeProps {
     pub on_nav: Callback<View>,
     /// Play a single track (starts radio).
     pub on_play: Callback<Track>,
+    pub on_rename_playlist: Callback<String>,
+    pub on_delete_playlist: Callback<String>,
     #[prop_or(true)]
     pub online: bool,
     #[prop_or_default]
@@ -529,10 +894,47 @@ pub fn home_view(props: &HomeProps) -> Html {
                 { card(View::Liked,
                        lib.liked.first().map(|t| t.cover.as_str()).unwrap_or(""),
                        "Liked Songs", lib.liked.len()) }
-                { for lib.playlists.iter().map(|p| card(
-                    View::Playlist(p.id.clone()),
-                    p.tracks.first().map(|t| t.cover.as_str()).unwrap_or(""),
-                    &p.name, p.tracks.len())) }
+                { for lib.playlists.iter().map(|p| {
+                    let on_nav = props.on_nav.clone();
+                    let v = View::Playlist(p.id.clone());
+                    let cover_url = p.tracks.first().map(|t| t.cover.as_str()).unwrap_or("");
+                    let actions = vec![
+                        MenuAction::Item {
+                            icon: "edit",
+                            label: "Rename".into(),
+                            danger: false,
+                            cb: {
+                                let cb = props.on_rename_playlist.clone();
+                                let id = p.id.clone();
+                                Callback::from(move |_| cb.emit(id.clone()))
+                            },
+                        },
+                        MenuAction::Item {
+                            icon: "trash",
+                            label: "Delete".into(),
+                            danger: true,
+                            cb: {
+                                let cb = props.on_delete_playlist.clone();
+                                let id = p.id.clone();
+                                Callback::from(move |_| cb.emit(id.clone()))
+                            },
+                        },
+                    ];
+                    html! {
+                        <div class="card" onclick={Callback::from(move |_| on_nav.emit(v.clone()))}>
+                            { cover(cover_url, "card-cover") }
+                            <div class="card-foot">
+                                <div class="card-text">
+                                    <div class="card-name">{ &p.name }</div>
+                                    <div class="card-sub">{ format!("{} songs", p.tracks.len()) }</div>
+                                </div>
+                                <div class="card-menu">
+                                    <MenuButton actions={actions} align_right=true />
+                                </div>
+                            </div>
+                        </div>
+                    }
+                }) }
             </div>
 
             <h2>{ "Recently played" }</h2>
@@ -620,8 +1022,8 @@ pub fn menu(props: &MenuProps) -> Html {
     html! {
         <>
             <div class="menu-backdrop"
-                 onclick={Callback::from(move |_| backdrop_close.emit(()))}
-                 oncontextmenu={let c = close.clone(); Callback::from(move |e: MouseEvent| { e.prevent_default(); c.emit(()); })}>
+                 onclick={Callback::from(move |e: MouseEvent| { e.stop_propagation(); backdrop_close.emit(()); })}
+                 oncontextmenu={let c = close.clone(); Callback::from(move |e: MouseEvent| { e.prevent_default(); e.stop_propagation(); c.emit(()); })}>
             </div>
             <div class={classes!("menu", props.align_right.then_some("menu-right"))}
                  onclick={|e: MouseEvent| e.stop_propagation()}>
@@ -721,6 +1123,9 @@ pub struct TrackListProps {
     /// IDs available offline, marked with an indicator.
     #[prop_or_default]
     pub downloaded_ids: Vec<String>,
+    /// IDs whose download is currently in flight.
+    #[prop_or_default]
+    pub downloading_ids: Vec<String>,
     /// Whether the network is reachable. When false, un-downloaded tracks are
     /// greyed out and can't be played.
     #[prop_or(true)]
@@ -737,6 +1142,12 @@ pub struct TrackListProps {
     /// When set, rows get a remove button (used inside playlists).
     #[prop_or_default]
     pub on_remove: Option<Callback<usize>>,
+    /// Download a single track for offline listening.
+    pub on_download: Callback<Track>,
+    /// Remove a single track's offline copy (by id).
+    pub on_remove_download: Callback<String>,
+    /// Insert a single track right after the current one.
+    pub on_play_next: Callback<Track>,
 }
 
 #[function_component(TrackList)]
@@ -749,6 +1160,7 @@ pub fn track_list(props: &TrackListProps) -> Html {
                     index={i}
                     liked={props.liked_ids.contains(&t.id)}
                     downloaded={props.downloaded_ids.contains(&t.id)}
+                    downloading={props.downloading_ids.contains(&t.id)}
                     online={props.online}
                     playing={props.playing_id.as_deref() == Some(t.id.as_str())}
                     playlists={props.playlists.clone()}
@@ -759,6 +1171,9 @@ pub fn track_list(props: &TrackListProps) -> Html {
                     on_open_artist={props.on_open_artist.clone()}
                     on_open_album={props.on_open_album.clone()}
                     on_remove={props.on_remove.clone()}
+                    on_download={props.on_download.clone()}
+                    on_remove_download={props.on_remove_download.clone()}
+                    on_play_next={props.on_play_next.clone()}
                 />
             }) }
         </div>
@@ -782,6 +1197,15 @@ struct TrackRowProps {
     on_open_artist: Callback<String>,
     on_open_album: Callback<String>,
     on_remove: Option<Callback<usize>>,
+    /// Whether a download for this track is currently in flight.
+    #[prop_or_default]
+    downloading: bool,
+    /// Download this track for offline listening.
+    on_download: Callback<Track>,
+    /// Remove this track's offline copy (by id).
+    on_remove_download: Callback<String>,
+    /// Insert this track right after the current one.
+    on_play_next: Callback<Track>,
 }
 
 #[function_component(TrackRow)]
@@ -836,16 +1260,28 @@ fn track_row(props: &TrackRowProps) -> Html {
     });
 
     // Build the kebab / right-click menu.
-    let mut actions: Vec<MenuAction> = vec![MenuAction::Item {
-        icon: "queue",
-        label: "Add to queue".into(),
-        danger: false,
-        cb: {
-            let cb = props.on_queue.clone();
-            let track = t.clone();
-            Callback::from(move |_| cb.emit(track.clone()))
+    let mut actions: Vec<MenuAction> = vec![
+        MenuAction::Item {
+            icon: "next",
+            label: "Play next".into(),
+            danger: false,
+            cb: {
+                let cb = props.on_play_next.clone();
+                let track = t.clone();
+                Callback::from(move |_| cb.emit(track.clone()))
+            },
         },
-    }];
+        MenuAction::Item {
+            icon: "queue",
+            label: "Add to queue".into(),
+            danger: false,
+            cb: {
+                let cb = props.on_queue.clone();
+                let track = t.clone();
+                Callback::from(move |_| cb.emit(track.clone()))
+            },
+        },
+    ];
     if !props.playlists.is_empty() {
         actions.push(MenuAction::Sub {
             icon: "plus",
@@ -858,6 +1294,39 @@ fn track_row(props: &TrackRowProps) -> Html {
             },
         });
     }
+    // Per-song offline download: download, or remove the offline copy.
+    if props.downloaded {
+        actions.push(MenuAction::Item {
+            icon: "check-circle",
+            label: "Remove download".into(),
+            danger: false,
+            cb: {
+                let cb = props.on_remove_download.clone();
+                let id = t.id.clone();
+                Callback::from(move |_| cb.emit(id.clone()))
+            },
+        });
+    } else if props.downloading {
+        // In flight: a non-actionable status entry.
+        actions.push(MenuAction::Item {
+            icon: "download",
+            label: "Downloading…".into(),
+            danger: false,
+            cb: Callback::noop(),
+        });
+    } else {
+        actions.push(MenuAction::Item {
+            icon: "download",
+            label: "Download".into(),
+            danger: false,
+            cb: {
+                let cb = props.on_download.clone();
+                let track = t.clone();
+                Callback::from(move |_| cb.emit(track.clone()))
+            },
+        });
+    }
+
     let artist_id = t.artists.iter().find_map(|a| a.id.clone());
     if artist_id.is_some() || t.album_id.is_some() {
         actions.push(MenuAction::Separator);
@@ -912,6 +1381,7 @@ fn track_row(props: &TrackRowProps) -> Html {
                     { t.album.clone().unwrap_or_default() }
                 }
             </div>
+            <div class="trow-spacer"></div>
             if props.downloaded {
                 <span class="trow-dl" title="Available offline">{ icon("check-circle") }</span>
             }
@@ -937,11 +1407,15 @@ pub struct QueuePanelProps {
     pub on_jump: Callback<usize>,
     pub on_remove: Callback<usize>,
     pub on_clear: Callback<()>,
+    /// Reorder: move the track at the first index to the second.
+    pub on_move: Callback<(usize, usize)>,
 }
 
 #[function_component(QueuePanel)]
 pub fn queue_panel(props: &QueuePanelProps) -> Html {
     let collapsed = use_state(|| false);
+    // Index of the row currently being dragged, for reorder-by-drag.
+    let drag_src = use_state(|| None::<usize>);
     if props.queue.tracks.is_empty() {
         return html! {};
     }
@@ -972,8 +1446,31 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
                             Callback::from(move |e: MouseEvent| { e.stop_propagation(); cb.emit(i); })
                         };
                         let current = props.queue.current == Some(i);
+                        let dragstart = {
+                            let drag_src = drag_src.clone();
+                            Callback::from(move |_: DragEvent| drag_src.set(Some(i)))
+                        };
+                        // Allow this row to be a drop target.
+                        let dragover = Callback::from(|e: DragEvent| e.prevent_default());
+                        let drop = {
+                            let drag_src = drag_src.clone();
+                            let cb = props.on_move.clone();
+                            Callback::from(move |e: DragEvent| {
+                                e.prevent_default();
+                                if let Some(from) = *drag_src {
+                                    if from != i {
+                                        cb.emit((from, i));
+                                    }
+                                }
+                                drag_src.set(None);
+                            })
+                        };
+                        let dragend = { let drag_src = drag_src.clone(); Callback::from(move |_: DragEvent| drag_src.set(None)) };
+                        let dragging = *drag_src == Some(i);
                         html! {
-                            <div class={classes!("qrow", current.then_some("current"))} onclick={jump}>
+                            <div class={classes!("qrow", current.then_some("current"), dragging.then_some("dragging"))}
+                                 draggable="true" onclick={jump}
+                                 ondragstart={dragstart} ondragover={dragover} ondrop={drop} ondragend={dragend}>
                                 { cover(&t.cover, "qrow-cover") }
                                 <div class="trow-meta">
                                     <div class="trow-title">{ &t.title }</div>

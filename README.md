@@ -8,15 +8,27 @@ A minimal, ad-free desktop music player, written (almost) entirely in Rust.
 
 - **Backend:** Tauri 2, tokio, rodio (playback), rustypipe (streaming backend), serde, tracing
 - **Frontend:** Yew (Rust → WASM), built with Trunk
-- Search for music, play tracks with auto-generated radio queues, like songs,
-  build playlists, and pick up where you left off — no ads, no tracking, no account.
+
+No ads, no tracking, no account. Features:
+
+- Search songs, artists, and albums; browse artist pages (top songs, full
+  discography split into albums and singles) and album pages.
+- Auto-generated radio queues for endless playback, with shuffle and repeat.
+- Like songs, build and manage playlists, and resume your session on next launch.
+- Download tracks for offline listening.
+- Crossfade between tracks, OS media-key / now-playing integration, and Discord
+  Rich Presence.
+- Filters out music-video versions so results stay audio-only.
+- Built-in yt-dlp detection (with one-click install) and an update checker.
 
 ## Download
 
 Grab the installer for your platform from the
 [latest release](https://github.com/gage-lodba/Rift/releases/latest) — `.AppImage`,
-`.deb` or `.rpm` for Linux, `.dmg` for macOS, `.msi` or `.exe` for Windows. Linux
-users also need [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed (see below).
+`.deb` or `.rpm` for Linux, `.dmg` for macOS, `.msi` or `.exe` for Windows.
+Playback needs [yt-dlp](https://github.com/yt-dlp/yt-dlp) (see below); Rift
+detects it automatically and can install it for you from **Settings** if it's
+missing.
 
 To build from source instead, read on.
 
