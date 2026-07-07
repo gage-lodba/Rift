@@ -45,7 +45,9 @@ pub(crate) fn album_type_label(t: AlbumType) -> String {
     }
 }
 
-pub(crate) fn convert_artists(artists: &[rustypipe::model::ArtistId]) -> Vec<rift_types::ArtistRef> {
+pub(crate) fn convert_artists(
+    artists: &[rustypipe::model::ArtistId],
+) -> Vec<rift_types::ArtistRef> {
     artists
         .iter()
         .map(|a| rift_types::ArtistRef {
