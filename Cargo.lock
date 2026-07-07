@@ -4145,7 +4145,7 @@ dependencies = [
 
 [[package]]
 name = "rift"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "discord-rich-presence",
@@ -4169,14 +4169,14 @@ dependencies = [
 
 [[package]]
 name = "rift-types"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rift-ui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "gloo-timers 0.3.0",
  "js-sys",
