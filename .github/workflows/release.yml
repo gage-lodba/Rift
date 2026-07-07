@@ -41,7 +41,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Tauri v2's Linux build dependencies (webkit2gtk 4.1, not 4.0). macOS and
       # Windows ship the needed webview + audio backends already.
@@ -69,13 +69,13 @@ jobs:
           # Keep per-platform caches separate.
           key: ${{ matrix.platform }}
 
-      # Pinned version: `latest` makes the action query GitHub's API
-      # unauthenticated, which gets rate-limited and returns HTML. The Tauri
-      # build invokes `trunk build --release` via beforeBuildCommand.
+      # Prebuilt trunk binary via taiki-e/install-action (a composite action, so
+      # no deprecated Node runtime). The Tauri build invokes `trunk build
+      # --release` via beforeBuildCommand.
       - name: Install trunk
-        uses: jetli/trunk-action@v0.5.0
+        uses: taiki-e/install-action@v2
         with:
-          version: v0.21.14
+          tool: trunk@0.21.14
 
       - name: Build and release
         uses: tauri-apps/tauri-action@v0

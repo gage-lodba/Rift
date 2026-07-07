@@ -18,7 +18,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -35,7 +35,7 @@ jobs:
         # proc-macro-error-attr host dylib (pulled in transitively by yew).
         os: [ubuntu-22.04, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Tauri v2's Linux build dependencies (note: webkit2gtk 4.1, not 4.0).
       # macOS and Windows ship the needed webview + audio backends already.
@@ -61,14 +61,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Prebuilt trunk binary, added to PATH for the matrix. Pin an explicit
-      # version: `latest` makes the action query GitHub's API unauthenticated,
-      # which gets rate-limited and returns an HTML error page ("Unexpected
-      # token '<'"). A pinned version skips that lookup and downloads directly.
+      # Prebuilt trunk binary via taiki-e/install-action (a composite action, so
+      # no deprecated Node runtime); pinned to a specific trunk version.
       - name: Install trunk
-        uses: jetli/trunk-action@v0.5.0
+        uses: taiki-e/install-action@v2
         with:
-          version: v0.21.14
+          tool: trunk@0.21.14
 
       # Build the WASM frontend. This also populates ../dist, which the Tauri
       # backend embeds via generate_context! when it compiles below.

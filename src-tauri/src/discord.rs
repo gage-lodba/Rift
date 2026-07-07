@@ -16,17 +16,28 @@ use rift_types::{PlaybackState, Track};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, warn};
 
-/// Shortest spacing between pushes to Discord. Discord's IPC rate-limits
-/// activity updates (~5 per 20s); bursts past that are dropped, which is how the
-/// presence gets stuck on a track you already skipped. Commands that arrive
-/// inside this window are coalesced into a single push of the latest snapshot.
-const MIN_SEND: Duration = Duration::from_secs(2);
+/// Shortest spacing between pushes to Discord. Discord only re-renders the
+/// displayed activity on an internal ~15s cadence: an update sent *inside* that
+/// window is accepted (`evt:null`) but never shown, and — because it becomes the
+/// "last received" payload — identical re-sends afterward are deduped, so the
+/// presence sticks on the previous song until a genuinely different activity
+/// arrives. So we never send inside the window: a rapid switch is held and only
+/// the latest snapshot is sent once the window has passed, guaranteeing Discord's
+/// first receipt of the new song lands past the cadence and actually renders.
+/// The cost is up to this much lag on back-to-back switches — unavoidable, it's
+/// Discord's own refresh rate. An isolated switch after a quiet spell still goes
+/// out immediately.
+const MIN_INTERVAL: Duration = Duration::from_secs(15);
 
-/// How often the current snapshot is re-asserted even without a new command.
-/// This is the self-heal: a push Discord dropped (rate limit) or that failed (a
-/// transient socket drop, or Discord launched after Rift) is re-sent within this
-/// window, and a reconnect is retried, so the presence can't stay stale.
-const HEARTBEAT: Duration = Duration::from_secs(15);
+/// Poll/coalesce granularity: how often the loop wakes with no new command, to
+/// flush a change that was waiting on the interval and to check the heartbeat.
+const POLL: Duration = Duration::from_secs(1);
+
+/// Idle re-assert: with nothing changing we still re-send occasionally so a
+/// reconnect is retried after Discord is launched/restarted. Kept well above
+/// [`MIN_INTERVAL`] so it rarely delays a real change, and long because the
+/// re-send is otherwise a no-op (Discord dedups an unchanged activity).
+const HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// Rift's Discord application ID (Developer Portal → General Information). It
 /// sets the app name shown as "Listening to Rift" and hosts uploaded art.
@@ -51,6 +62,13 @@ enum DiscordCmd {
         state: PlaybackState,
         position: f64,
     },
+    /// The authoritative length read from the decoder, which can arrive after
+    /// playback started (metadata duration was missing or wrong). Carries the
+    /// current position so the elapsed bar anchors correctly.
+    Duration {
+        duration: f64,
+        position: f64,
+    },
     Enabled(bool),
 }
 
@@ -73,6 +91,12 @@ impl DiscordHandle {
     pub fn set_state(&self, state: PlaybackState, position: f64) {
         if let Some(tx) = &self.0 {
             let _ = tx.send(DiscordCmd::State { state, position });
+        }
+    }
+
+    pub fn set_duration(&self, duration: f64, position: f64) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(DiscordCmd::Duration { duration, position });
         }
     }
 
@@ -130,6 +154,18 @@ fn run(rx: UnboundedReceiver<DiscordCmd>, enabled: bool) {
     rt.block_on(event_loop(rx, enabled));
 }
 
+/// Absolute `(start_ms, end_ms)` for Discord's elapsed/remaining bar, or `None`
+/// when no bar should show (not playing, or unknown length). Anchored to wall
+/// time from the current position so Discord animates the rest itself.
+fn anchor(state: PlaybackState, duration: f64, position: f64) -> Option<(i64, i64)> {
+    if matches!(state, PlaybackState::Playing) && duration > 0.0 {
+        let start = unix_millis() - (position * 1000.0) as i64;
+        Some((start, start + (duration * 1000.0) as i64))
+    } else {
+        None
+    }
+}
+
 /// Apply one command to the retained snapshot. Kept separate so a burst can be
 /// drained and folded in before a single push.
 fn fold(cmd: DiscordCmd, now: &mut Option<Now>, enabled: &mut bool) {
@@ -154,15 +190,18 @@ fn fold(cmd: DiscordCmd, now: &mut Option<Now>, enabled: &mut bool) {
         DiscordCmd::State { state, position } => {
             if let Some(n) = now {
                 n.state = state;
-                // Anchor the elapsed bar only while actually playing a track of
-                // known length; recomputed here (and only here) so a resume or
-                // seek re-syncs it, while heartbeats leave it fixed.
-                n.anchor = if matches!(state, PlaybackState::Playing) && n.duration > 0.0 {
-                    let start = unix_millis() - (position * 1000.0) as i64;
-                    Some((start, start + (n.duration * 1000.0) as i64))
-                } else {
-                    None
-                };
+                // Recomputed on every state change so a resume or seek re-syncs
+                // the bar, while heartbeats leave it fixed.
+                n.anchor = anchor(state, n.duration, position);
+            }
+        }
+        DiscordCmd::Duration { duration, position } => {
+            if let Some(n) = now {
+                n.duration = duration;
+                // The true length can land after the Playing transition, when
+                // the bar was anchored with a zero/placeholder duration (so it
+                // didn't show). Re-anchor now that the length is known.
+                n.anchor = anchor(n.state, duration, position);
             }
         }
         DiscordCmd::Enabled(on) => *enabled = on,
@@ -179,11 +218,10 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
 
     // A change is pending a push; `last_send` gates how soon it can go out.
     let mut dirty = false;
-    // Seed so the first push isn't held back by the min-send window.
+    // Seed so the first change goes out immediately (not held for MIN_INTERVAL).
     let mut last_send = Instant::now() - HEARTBEAT;
-    // Wake at the coalescing granularity: frequent enough to flush a debounced
-    // change promptly, and the same clock the heartbeat is measured against.
-    let mut ticker = tokio::time::interval(MIN_SEND);
+
+    let mut ticker = tokio::time::interval(POLL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -193,7 +231,7 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
                 fold(cmd, &mut now, &mut enabled);
                 // Fold any commands already queued behind it, so a burst (rapid
                 // skips, track+state for one song) collapses into one push of
-                // the final state instead of several that Discord would drop.
+                // the final state instead of several.
                 while let Ok(cmd) = rx.try_recv() {
                     fold(cmd, &mut now, &mut enabled);
                 }
@@ -202,13 +240,20 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
             _ = ticker.tick() => {}
         }
 
+        // Send a pending change once MIN_INTERVAL has passed since the last push
+        // (so it never lands inside Discord's refresh window), or re-assert on
+        // the slower heartbeat to retry a reconnect. A change arriving during
+        // the window waits here and coalesces to the latest, so back-to-back
+        // switches send only the final song, once the window clears.
         let elapsed = last_send.elapsed();
-        // Push a pending change once the min-send window has passed, or
-        // re-assert the current snapshot on the heartbeat so a dropped or failed
-        // update self-heals (and a lazy reconnect is retried).
-        if (dirty && elapsed >= MIN_SEND) || elapsed >= HEARTBEAT {
-            apply(&mut client, &mut connected, enabled, now.as_ref());
-            last_send = Instant::now();
+        if (dirty && elapsed >= MIN_INTERVAL) || elapsed >= HEARTBEAT {
+            // Only advance the interval clock when a push actually went out. A
+            // Loading snapshot is skipped (the previous track stays up), so if it
+            // reset `last_send` the real Playing push moments later would be held
+            // for a whole MIN_INTERVAL — the new song wouldn't show for ~15s.
+            if apply(&mut client, &mut connected, enabled, now.as_ref()) {
+                last_send = Instant::now();
+            }
             dirty = false;
         }
     }
@@ -216,31 +261,87 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
 
 /// Push the current snapshot to Discord, clearing the presence when disabled,
 /// stopped, or idle. Connects on demand and drops the connection flag on
-/// failure so the next update retries.
-fn apply(client: &mut DiscordIpcClient, connected: &mut bool, enabled: bool, now: Option<&Now>) {
+/// failure so the next update retries. Returns whether an IPC operation was
+/// attempted, so the caller only paces the interval on a real push (a skipped
+/// Loading frame must not consume the send slot).
+fn apply(
+    client: &mut DiscordIpcClient,
+    connected: &mut bool,
+    enabled: bool,
+    now: Option<&Now>,
+) -> bool {
+    // While a new track is still loading, leave the current presence untouched
+    // rather than push a bar-less entry (the bar is withheld until Playing so it
+    // can't run ahead during the buffer). The Playing push that follows replaces
+    // it with the real time bar, so a switch reads old-track-with-bar ->
+    // new-track-with-bar instead of flashing a barless name in between.
+    if enabled && matches!(now.map(|n| n.state), Some(PlaybackState::Loading)) {
+        return false;
+    }
     let show = enabled
         && matches!(
             now.map(|n| n.state),
-            Some(PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Loading)
+            Some(PlaybackState::Playing | PlaybackState::Paused)
         );
     if !show {
-        if *connected && client.clear_activity().is_err() {
-            *connected = false;
+        if *connected {
+            match client.clear_activity() {
+                Ok(()) => drain(client, connected),
+                Err(_) => *connected = false,
+            }
+            return true;
         }
-        return;
+        return false;
     }
-    let Some(n) = now else { return };
+    let Some(n) = now else { return false };
 
     if !*connected {
         if let Err(e) = client.connect() {
             debug!("discord not available: {e}");
-            return;
+            // A connect attempt is paced so a closed Discord isn't probed every
+            // poll; the heartbeat retries it.
+            return true;
         }
+        debug!("discord connected");
         *connected = true;
     }
 
-    if client.set_activity(build_activity(n)).is_err() {
+    if let Err(e) = client.set_activity(build_activity(n)) {
         // The socket likely went away (Discord closed); retry on the next tick.
+        warn!("discord set_activity failed: {e}");
+        *connected = false;
+        return true;
+    }
+    // Drain Discord's response to this command. The library's set_activity only
+    // writes and never reads the reply, so left unread the pipe's buffer backs
+    // up until Discord stalls applying our updates — writes keep returning Ok
+    // while the presence freezes on an old track. Reading it also surfaces
+    // rate-limit ERROR replies and detects a dead pipe (recv Err -> reconnect).
+    match client.recv() {
+        Ok((_, val)) => {
+            if val.get("evt").and_then(|e| e.as_str()) == Some("ERROR") {
+                warn!("discord rejected activity: {val}");
+            } else {
+                debug!(
+                    "discord push: \"{}\" state={:?} bar={}",
+                    n.title,
+                    n.state,
+                    n.anchor.is_some()
+                );
+            }
+        }
+        Err(e) => {
+            warn!("discord recv failed, reconnecting next tick: {e}");
+            *connected = false;
+        }
+    }
+    true
+}
+
+/// Read and discard one response frame (after a `clear_activity`), dropping the
+/// connection on a broken pipe so the next push reconnects.
+fn drain(client: &mut DiscordIpcClient, connected: &mut bool) {
+    if client.recv().is_err() {
         *connected = false;
     }
 }

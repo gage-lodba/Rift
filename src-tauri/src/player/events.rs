@@ -18,13 +18,25 @@ pub async fn event_loop(app: AppHandle, mut rx: UnboundedReceiver<AudioEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
             AudioEvent::Duration(duration) => {
-                let position = {
+                let (position, changed) = {
                     let state = app.state::<AppState>();
                     let mut core = state.player.core.lock_safe();
+                    // Only a real correction is worth a Discord push: if the
+                    // fetch already supplied this length the bar is anchored, and
+                    // a second identical push just burns Discord's rate budget.
+                    let changed = (core.duration - duration).abs() > 0.5;
                     core.duration = duration;
-                    core.position
+                    (core.position, changed)
                 };
                 let _ = app.emit(events::PROGRESS, Progress { position, duration });
+                // The decoder's length is authoritative and may correct a
+                // missing/zero metadata duration; hand a genuine correction to
+                // Discord so its time bar shows (and is accurate) for those tracks.
+                if changed {
+                    app.state::<AppState>()
+                        .discord
+                        .set_duration(duration, position);
+                }
             }
             AudioEvent::Position(position) => {
                 let (duration, crossfade) = {
