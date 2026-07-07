@@ -36,6 +36,19 @@ struct FadeOut {
     dur: Duration,
 }
 
+/// Decode a full in-memory audio file. The explicit byte length marks the
+/// source as seekable; without it symphonia treats the stream as forward-only,
+/// and a backward seek in a fragmented MP4 (YouTube m4a) leaves the demuxer
+/// unable to rewind — the source drains and the track appears to have ended.
+fn decode(data: Vec<u8>) -> Result<Decoder<Cursor<Vec<u8>>>, rodio::decoder::DecoderError> {
+    let len = data.len() as u64;
+    Decoder::builder()
+        .with_data(Cursor::new(data))
+        .with_byte_len(len)
+        .with_seekable(true)
+        .build()
+}
+
 pub enum AudioEvent {
     /// Authoritative track length in seconds, read from the decoder.
     Duration(f64),
@@ -89,7 +102,7 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                     player.clear();
                     // A hard cut discards any in-progress crossfade.
                     fading.clear();
-                    match Decoder::new(Cursor::new(data)) {
+                    match decode(data) {
                         Ok(source) => {
                             // Report the real length so the seek bar is
                             // accurate even when metadata duration is missing.
@@ -109,7 +122,7 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                         }
                     }
                 }
-                AudioCmd::Crossfade(data, fade) => match Decoder::new(Cursor::new(data)) {
+                AudioCmd::Crossfade(data, fade) => match decode(data) {
                     Ok(source) => {
                         let dur = source.total_duration().map(|d| d.as_secs_f64());
                         // Retire the current track onto its own fade-out and

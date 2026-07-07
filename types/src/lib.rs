@@ -161,6 +161,10 @@ pub struct Bootstrap {
     /// Whether to check for updates on launch and notify the user.
     #[serde(default)]
     pub update_notifications: bool,
+    /// Preview mode: the UI renders placeholder data instead of the library
+    /// (dev builds launched with RIFT_PREVIEW=1; always false in releases).
+    #[serde(default)]
+    pub preview: bool,
 }
 
 /// Offline-download status, sent to the frontend whenever it changes.
@@ -170,6 +174,10 @@ pub struct DownloadState {
     pub downloaded: Vec<String>,
     /// Track IDs currently being downloaded.
     pub downloading: Vec<String>,
+    /// Track IDs whose download was given up on after repeated failures. Rows
+    /// surface these with a retry affordance instead of retrying forever.
+    #[serde(default)]
+    pub failed: Vec<String>,
 }
 
 /// Result of probing the system for the yt-dlp binary (the load-bearing

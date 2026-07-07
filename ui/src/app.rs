@@ -184,6 +184,10 @@ pub fn app() -> Html {
     let artist_songs = use_state(|| None::<(String, Vec<Track>)>);
     let album_page = use_state(|| None::<AlbumPage>);
     let downloads = use_state(DownloadState::default);
+    // Preview mode (dev builds launched with RIFT_PREVIEW=1): render neutral
+    // placeholder data instead of the personal library, for repo screenshots.
+    // The flag arrives via bootstrap; release builds never set it.
+    let preview = use_state(|| false);
     // Network reachability (from the webview); offline greys out un-downloaded
     // tracks since they can't be streamed.
     let online = use_state(|| {
@@ -211,6 +215,7 @@ pub fn app() -> Html {
         let update_notifications = update_notifications.clone();
         let update_banner = update_banner.clone();
         let downloads = downloads.clone();
+        let preview = preview.clone();
         let toast = toast.clone();
         let toast_gen = toast_gen.clone();
         let view = view.clone();
@@ -243,13 +248,10 @@ pub fn app() -> Html {
                     Callback::from(move |v| track.set(Some(v))),
                 );
             }
-            {
-                let progress = progress.clone();
-                api::listen_event::<Progress>(
-                    events::PROGRESS,
-                    Callback::from(move |v| progress.set(v)),
-                );
-            }
+            // NB: the PROGRESS event is intentionally *not* subscribed here.
+            // PlayerBar owns live progress and subscribes itself, so ~4 Hz ticks
+            // re-render only the bar, not the whole app. `progress` below is
+            // seeded once from bootstrap and handed to PlayerBar as its seed.
             {
                 let downloads = downloads.clone();
                 api::listen_event::<DownloadState>(
@@ -300,6 +302,7 @@ pub fn app() -> Html {
                         yt_dlp_path.set(b.yt_dlp_path);
                         update_notifications.set(b.update_notifications);
                         downloads.set(b.downloads);
+                        preview.set(b.preview);
 
                         // Launch-time update check (only if the user hasn't
                         // silenced it). Surfaces a dismissible banner if a newer
@@ -680,6 +683,16 @@ pub fn app() -> Html {
     let on_queue_move = Callback::from(|(from, to): (usize, usize)| {
         api::fire("queue_move", json!({ "from": from, "to": to }));
     });
+    // Sidebar reorder: resolve the dragged index to a playlist id at emit time
+    // (the backend moves by id, so a stale index can't move the wrong list).
+    let on_move_playlist = {
+        let library = library.clone();
+        Callback::from(move |(from, to): (usize, usize)| {
+            if let Some(p) = library.playlists.get(from) {
+                api::fire("move_playlist", json!({ "id": p.id, "to": to }));
+            }
+        })
+    };
     let on_queue_clear = Callback::from(|()| api::fire("queue_clear", json!({})));
     let on_volume = {
         let volume = volume.clone();
@@ -690,6 +703,37 @@ pub fn app() -> Html {
     };
 
     // -------------------------------------------------------------- views
+
+    // Preview mode (dev builds only) swaps everything rendered below for
+    // neutral placeholders; the action callbacks above still hold the real
+    // state handles, so the app keeps running underneath. Release builds
+    // compile the placeholder path out entirely.
+    //
+    // `library` is borrowed, not cloned: App re-renders on every progress tick
+    // (~4x/s while playing) and a deep Library clone each time is pure churn.
+    // (track/queue were already cloned per render; progress/pstate are Copy.)
+    #[cfg(debug_assertions)]
+    let preview_lib = (*preview).then(preview_library);
+    #[cfg(not(debug_assertions))]
+    let preview_lib: Option<Library> = None;
+    let library: &Library = preview_lib.as_ref().unwrap_or(&library);
+
+    #[cfg(debug_assertions)]
+    let (track, queue, progress, pstate) = if *preview {
+        (
+            Some(preview_track(1)),
+            preview_queue(),
+            Progress {
+                position: 83.0,
+                duration: 214.0,
+            },
+            PlaybackState::Playing,
+        )
+    } else {
+        ((*track).clone(), (*queue).clone(), *progress, *pstate)
+    };
+    #[cfg(not(debug_assertions))]
+    let (track, queue, progress, pstate) = ((*track).clone(), (*queue).clone(), *progress, *pstate);
 
     let liked_ids: Vec<String> = library.liked.iter().map(|t| t.id.clone()).collect();
     let playlist_opts: Vec<(String, String)> = library
@@ -702,6 +746,20 @@ pub fn app() -> Html {
         .iter()
         .map(|p| (p.id.clone(), p.name.clone(), p.tracks.len()))
         .collect();
+    // Tracks whose offline copy is pinned by a fully-downloaded playlist.
+    // on_remove_download refuses these, so rows show a plain indicator instead
+    // of a remove button (the mirror of that guard).
+    let pinned_ids: Vec<String> = library
+        .playlists
+        .iter()
+        .filter(|p| {
+            !p.tracks.is_empty()
+                && p.tracks
+                    .iter()
+                    .all(|t| downloads.downloaded.contains(&t.id))
+        })
+        .flat_map(|p| p.tracks.iter().map(|t| t.id.clone()))
+        .collect();
 
     let list = |tracks: Vec<Track>, source: Option<String>, removable: Option<Callback<usize>>| {
         html! {
@@ -711,6 +769,8 @@ pub fn app() -> Html {
                 playing_id={track.as_ref().map(|t| t.id.clone())}
                 downloaded_ids={downloads.downloaded.clone()}
                 downloading_ids={downloads.downloading.clone()}
+                pinned_ids={pinned_ids.clone()}
+                failed_ids={downloads.failed.clone()}
                 online={*online}
                 playlists={playlist_opts.clone()}
                 on_play={play_list(tracks, source)}
@@ -749,11 +809,11 @@ pub fn app() -> Html {
         let is_current = source.is_some()
             && source == queue.source
             && matches!(
-                *pstate,
+                pstate,
                 PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Loading
             );
         let show_pause =
-            is_current && matches!(*pstate, PlaybackState::Playing | PlaybackState::Loading);
+            is_current && matches!(pstate, PlaybackState::Playing | PlaybackState::Loading);
 
         let play = {
             let tracks = tracks.clone();
@@ -812,32 +872,6 @@ pub fn app() -> Html {
             }
         };
 
-        // Overflow menu: queue the whole collection without replacing what plays.
-        let queue_menu = vec![
-            MenuAction::Item {
-                icon: "next",
-                label: "Play next".into(),
-                danger: false,
-                cb: {
-                    let tracks = tracks.clone();
-                    Callback::from(move |_| {
-                        api::fire("queue_play_next", json!({ "tracks": tracks.clone() }));
-                    })
-                },
-            },
-            MenuAction::Item {
-                icon: "queue",
-                label: "Add to queue".into(),
-                danger: false,
-                cb: {
-                    let tracks = tracks.clone();
-                    Callback::from(move |_| {
-                        api::fire("queue_add_tracks", json!({ "tracks": tracks.clone() }));
-                    })
-                },
-            },
-        ];
-
         html! {
             <div class="head-actions">
                 <button class="play-all" onclick={play}>
@@ -845,18 +879,53 @@ pub fn app() -> Html {
                     <span>{ if show_pause { "Pause" } else { "Play" } }</span>
                 </button>
                 { download }
-                <MenuButton actions={queue_menu} btn_class={classes!("head-btn")} />
             </div>
         }
     };
 
     let main = match &*view {
-        View::Home => html! {
-            <HomeView library={(*library).clone()} on_nav={on_nav.clone()} on_play={on_play_single.clone()}
-                      on_rename_playlist={on_rename_playlist.clone()}
-                      on_delete_playlist={on_delete_playlist.clone()}
-                      online={*online} downloaded_ids={downloads.downloaded.clone()} />
-        },
+        View::Home => {
+            let recent: Vec<Track> = library.recently_played.iter().take(12).cloned().collect();
+            // Clicking a row plays just that song (with radio fill), like the
+            // old cards did — not the whole recently-played list.
+            let play_recent = {
+                let tracks = recent.clone();
+                let on_play_single = on_play_single.clone();
+                Callback::from(move |i: usize| {
+                    if let Some(t) = tracks.get(i) {
+                        on_play_single.emit(t.clone());
+                    }
+                })
+            };
+            let recent_list = html! {
+                <TrackList
+                    tracks={recent}
+                    liked_ids={liked_ids.clone()}
+                    playing_id={track.as_ref().map(|t| t.id.clone())}
+                    downloaded_ids={downloads.downloaded.clone()}
+                    downloading_ids={downloads.downloading.clone()}
+                    pinned_ids={pinned_ids.clone()}
+                    failed_ids={downloads.failed.clone()}
+                    online={*online}
+                    playlists={playlist_opts.clone()}
+                    on_play={play_recent}
+                    on_like={on_like.clone()}
+                    on_queue={on_queue_add.clone()}
+                    on_add_to_playlist={on_add_to_playlist.clone()}
+                    on_open_artist={on_open_artist.clone()}
+                    on_open_album={on_open_album.clone()}
+                    on_download={on_download.clone()}
+                    on_remove_download={on_remove_download.clone()}
+                    on_play_next={on_play_next.clone()}
+                />
+            };
+            html! {
+                <HomeView library={(*library).clone()} on_nav={on_nav.clone()}
+                          on_rename_playlist={on_rename_playlist.clone()}
+                          on_delete_playlist={on_delete_playlist.clone()}
+                          recent={recent_list} />
+            }
+        }
         View::Search => {
             let tab_btn = |t: SearchTab, label: &str| {
                 let on_tab = on_tab.clone();
@@ -1178,13 +1247,13 @@ pub fn app() -> Html {
         .unwrap_or(false);
 
     // Show the equalizer only while a track is actually loaded.
-    let playing_source = match *pstate {
+    let playing_source = match pstate {
         PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Loading => {
             queue.source.clone()
         }
         PlaybackState::Stopped => None,
     };
-    let is_playing = *pstate == PlaybackState::Playing;
+    let is_playing = pstate == PlaybackState::Playing;
 
     html! {
         <div class="app">
@@ -1195,11 +1264,12 @@ pub fn app() -> Html {
                          on_import_playlist={on_import_playlist} on_import_file={on_import_file}
                          on_rename_playlist={on_rename_playlist} on_delete_playlist={on_delete_playlist}
                          on_export_playlist={on_export_playlist}
+                         on_move_playlist={on_move_playlist}
                          playing_source={playing_source} is_playing={is_playing} />
                 <div class="content">
                     <main class="main">{ main }</main>
                     if *view != View::Settings {
-                        <QueuePanel queue={(*queue).clone()}
+                        <QueuePanel queue={queue.clone()}
                                     on_jump={on_queue_jump}
                                     on_remove={on_queue_remove}
                                     on_move={on_queue_move}
@@ -1207,7 +1277,7 @@ pub fn app() -> Html {
                     }
                 </div>
             </div>
-            <PlayerBar track={(*track).clone()} state={*pstate} progress={*progress}
+            <PlayerBar track={track.clone()} state={pstate} progress={progress}
                        volume={*volume} shuffle={queue.shuffle} repeat={queue.repeat}
                        liked={liked_current} on_open_artist={on_open_artist.clone()}
                        on_volume={on_volume} />
@@ -1253,5 +1323,51 @@ pub fn app() -> Html {
                 } }
             }
         </div>
+    }
+}
+
+// ------------------------------------------------------------ preview mode
+
+/// A placeholder track for preview mode (empty cover renders the fallback
+/// tile, so no real artwork appears).
+#[cfg(debug_assertions)]
+fn preview_track(n: usize) -> Track {
+    Track {
+        id: format!("preview-{n}"),
+        title: format!("Song Title {n}"),
+        artist: "Artist Name".into(),
+        album: Some("Album Name".into()),
+        duration: Some(150 + (n as u32 * 37) % 120),
+        cover: String::new(),
+        artists: Vec::new(),
+        album_id: None,
+    }
+}
+
+/// Neutral library rendered in preview mode, so repo screenshots show generic
+/// placeholders instead of a personal library.
+#[cfg(debug_assertions)]
+fn preview_library() -> Library {
+    let playlist = |n: usize, len: usize, start: usize| Playlist {
+        id: format!("preview-pl-{n}"),
+        name: format!("Playlist {n}"),
+        tracks: (start..start + len).map(preview_track).collect(),
+    };
+    Library {
+        liked: (1..=8).map(preview_track).collect(),
+        playlists: vec![playlist(1, 12, 1), playlist(2, 9, 13), playlist(3, 16, 22)],
+        recently_played: (1..=12).map(preview_track).collect(),
+    }
+}
+
+/// Placeholder queue: a handful of upcoming tracks with the first playing.
+#[cfg(debug_assertions)]
+fn preview_queue() -> QueueSnapshot {
+    QueueSnapshot {
+        tracks: (1..=6).map(preview_track).collect(),
+        current: Some(0),
+        shuffle: false,
+        repeat: rift_types::RepeatMode::Off,
+        source: None,
     }
 }

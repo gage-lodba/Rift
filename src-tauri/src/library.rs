@@ -10,11 +10,23 @@ const RECENT_CAP: usize = 30;
 pub struct LibraryStore {
     path: PathBuf,
     pub data: Library,
+    /// Preview mode: the library lives in memory only. The real library.json is
+    /// neither read nor written, so interacting with placeholder rows can't
+    /// persist junk or reorder the user's real playlists.
+    ephemeral: bool,
 }
 
 impl LibraryStore {
     pub fn load(dir: &std::path::Path) -> Self {
         let path = dir.join("library.json");
+        if crate::settings::preview_mode() {
+            warn!("preview mode: library runs in memory only and will not be saved");
+            return Self {
+                path,
+                data: Library::default(),
+                ephemeral: true,
+            };
+        }
         let data = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| match serde_json::from_str(&s) {
@@ -26,10 +38,17 @@ impl LibraryStore {
             })
             .unwrap_or_default();
         info!("library loaded from {}", path.display());
-        Self { path, data }
+        Self {
+            path,
+            data,
+            ephemeral: false,
+        }
     }
 
     pub fn save(&self) {
+        if self.ephemeral {
+            return;
+        }
         match serde_json::to_string_pretty(&self.data) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&self.path, json) {
@@ -126,6 +145,21 @@ impl LibraryStore {
             p.name = name;
             self.save();
         }
+    }
+
+    /// Move the playlist with `id` to position `to` in the sidebar order.
+    /// Returns `true` if the order changed.
+    pub fn move_playlist(&mut self, id: &str, to: usize) -> bool {
+        let Some(from) = self.data.playlists.iter().position(|p| p.id == id) else {
+            return false;
+        };
+        if from == to || to >= self.data.playlists.len() {
+            return false;
+        }
+        let p = self.data.playlists.remove(from);
+        self.data.playlists.insert(to, p);
+        self.save();
+        true
     }
 
     pub fn add_to_playlist(&mut self, id: &str, track: Track) {

@@ -31,6 +31,14 @@ fn default_true() -> bool {
 /// Largest crossfade overlap the UI offers and the backend accepts.
 pub const MAX_CROSSFADE: f32 = 12.0;
 
+/// Whether the app was launched in preview mode (a dev build with
+/// RIFT_PREVIEW=1): the UI renders placeholder data and settings run as
+/// in-memory defaults that are never written to disk. Always false in
+/// release builds so the mode can't ship.
+pub fn preview_mode() -> bool {
+    cfg!(debug_assertions) && std::env::var("RIFT_PREVIEW").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -46,11 +54,22 @@ impl Default for Settings {
 pub struct SettingsStore {
     path: PathBuf,
     pub data: Settings,
+    /// Preview mode: settings live in memory only; nothing touches disk, and
+    /// the user's real settings.json is neither read nor overwritten.
+    ephemeral: bool,
 }
 
 impl SettingsStore {
     pub fn load(dir: &Path) -> Self {
         let path = dir.join("settings.json");
+        if preview_mode() {
+            warn!("preview mode: settings run in memory only and will not be saved");
+            return Self {
+                path,
+                data: Settings::default(),
+                ephemeral: true,
+            };
+        }
         let data = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| match serde_json::from_str(&s) {
@@ -61,10 +80,17 @@ impl SettingsStore {
                 }
             })
             .unwrap_or_default();
-        Self { path, data }
+        Self {
+            path,
+            data,
+            ephemeral: false,
+        }
     }
 
     fn save(&self) {
+        if self.ephemeral {
+            return;
+        }
         match serde_json::to_string_pretty(&self.data) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&self.path, json) {

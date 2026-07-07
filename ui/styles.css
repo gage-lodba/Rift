@@ -11,6 +11,8 @@
      deeper shade for hover/pressed states. */
   --accent: #8b3df0;
   --accent-dim: #6d28d9;
+  /* Failed-download / error affordances. */
+  --danger: #e5484d;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -188,7 +190,8 @@ input[type="range"] { accent-color: var(--accent); }
 /* ===== sidebar ===== */
 
 .sidebar {
-  width: 216px;
+  position: relative;
+  width: 216px; /* fallback; the drag-resize handle sets an inline width */
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
@@ -197,6 +200,18 @@ input[type="range"] { accent-color: var(--accent); }
   padding: 12px 10px;
   overflow: hidden;
 }
+
+/* Drag handle on the sidebar's right edge. */
+.side-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 10;
+}
+.side-resizer:hover { background: rgba(139, 61, 240, 0.35); }
 
 /* Scrollable nav region; keeps the Settings item pinned at the bottom. */
 .side-scroll {
@@ -242,6 +257,32 @@ input[type="range"] { accent-color: var(--accent); }
 /* On hover (or while its menu is open) the count gives way to the ⋮ button. */
 .side-item:hover .side-count,
 .side-item.menu-open .side-count { display: none; }
+
+/* ===== reorder-by-drag (sidebar playlists + queue rows) =====
+   Rows carry inline translateY transforms during a drag so the list previews
+   the post-drop order live. The transition is scoped to `.reordering` (only
+   present while a drag is active) so the post-drop re-render — where the real
+   order arrives and transforms reset — snaps instead of animating twice. */
+.side-item, .qrow { position: relative; }
+.reordering .side-item, .reordering .qrow { transition: transform 0.15s ease; }
+/* Hold the grabbing cursor across the whole list while a drag is live, so text
+   or buttons under the pointer don't flip it to the I-beam / pointer mid-drag.
+   `!important` beats the per-element cursors (grab, pointer, default). */
+.reordering, .reordering * { cursor: grabbing !important; }
+/* While dragging — and after a drop, until the mouse really moves — the
+   browser leaves :hover stuck on the row at the grab position. Mute hover
+   effects for that window (the .hover-calm class is cleared on mousemove). */
+.hover-calm .qrow:hover { background: transparent; }
+.hover-calm .qrow:hover .ibtn { opacity: 0; }
+.hover-calm .side-item:hover { background: transparent; color: var(--text-dim); }
+.hover-calm .side-item:hover .side-count { display: inline; }
+.hover-calm .side-item:hover .side-kebab { display: none; }
+.side-item.dragging, .qrow.dragging {
+  opacity: 0.92;
+  background: var(--bg-raised);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  z-index: 3;
+}
 
 /* `.side-item` prefix needed to beat `.menu-anchor`'s display rule. */
 .side-item .side-kebab { display: none; }
@@ -432,14 +473,27 @@ input[type="range"] { accent-color: var(--accent); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* per-row offline indicator */
+/* per-row offline slot: check when downloaded, spinner while fetching, or a
+   hover-revealed download button. Fixed width so the album column stays
+   aligned across rows regardless of state. */
 .trow-dl {
   display: flex;
   align-items: center;
+  justify-content: center;
+  width: 28px;
   color: var(--accent);
   flex-shrink: 0;
 }
-.trow-dl svg { width: 15px; height: 15px; }
+.trow-dl > span { display: flex; align-items: center; }
+.trow-dl svg, .trow-dl .ibtn svg { width: 15px; height: 15px; }
+/* Like the kebab, the download button only shows while the row is hovered;
+   the downloaded check doubles as the offline indicator, so it stays visible. */
+.trow-dl .ibtn { opacity: 0; }
+.trow:hover .trow-dl .ibtn,
+.trow-dl .ibtn.accent,
+/* A failed download stays visible as a standing warning, like the check. */
+.trow-dl .ibtn.error { opacity: 1; }
+.trow-dl .ibtn.error, .trow-dl .ibtn.error:hover { color: var(--danger); }
 
 /* ===== cards ===== */
 
@@ -663,6 +717,13 @@ input[type="range"] { accent-color: var(--accent); }
   color: var(--text-dim);
   cursor: pointer;
 }
+.queue-head:hover { color: var(--text); }
+
+/* Collapse/expand indicator; points down when open, right when collapsed. */
+.queue-title { display: inline-flex; align-items: center; gap: 6px; }
+.queue-caret { display: inline-flex; transition: transform 0.15s ease; }
+.queue-caret svg { width: 14px; height: 14px; }
+.queue-caret.collapsed { transform: rotate(-90deg); }
 
 .queue-list { max-height: 190px; overflow-y: auto; padding: 0 8px 8px; }
 
@@ -678,9 +739,8 @@ input[type="range"] { accent-color: var(--accent); }
 .qrow.current .trow-title { color: var(--accent); }
 .qrow .ibtn { opacity: 0; }
 .qrow:hover .ibtn { opacity: 1; }
-/* Reorder-by-drag affordance. */
+/* Reorder-by-drag affordance (drag styling lives with the sidebar rules). */
 .qrow { cursor: grab; }
-.qrow.dragging { opacity: 0.5; }
 
 /* ===== player bar ===== */
 

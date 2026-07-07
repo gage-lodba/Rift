@@ -34,14 +34,30 @@ To build from source instead, read on.
 
 ## Requirements
 
-| Dependency | Why | Install (Arch) |
+Common to all platforms:
+
+| Dependency | Why | Install |
 |---|---|---|
-| Rust + cargo | everything | `pacman -S rustup` |
+| Rust + cargo | everything | [rustup.rs](https://rustup.rs), or `pacman -S rustup` / `winget install Rustlang.Rustup` |
 | `wasm32-unknown-unknown` target | Yew frontend | `rustup target add wasm32-unknown-unknown` |
 | [Trunk](https://trunkrs.dev) | WASM bundler | `cargo binstall trunk` (prebuilt) or `cargo install trunk` |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | stream fetching (see below) | `pacman -S yt-dlp` / `winget install yt-dlp.yt-dlp`, or one-click from **Settings** |
+
+Linux (Arch shown; use your distro's equivalents):
+
+| Dependency | Why | Install |
+|---|---|---|
 | webkit2gtk-4.1 | Tauri webview | `pacman -S webkit2gtk-4.1` |
 | ALSA | audio output | preinstalled on most systems |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | stream fetching (see below) | `pacman -S yt-dlp` |
+
+Windows:
+
+| Dependency | Why | Install |
+|---|---|---|
+| Visual Studio C++ Build Tools | MSVC linker for Rust | `winget install Microsoft.VisualStudio.2022.BuildTools` (select the "Desktop development with C++" workload) |
+| WebView2 runtime | Tauri webview | preinstalled on Windows 10/11 |
+
+Audio output on Windows uses WASAPI directly — nothing extra to install.
 
 ## Build & run
 
@@ -55,6 +71,9 @@ cd ui && trunk build --release && cd ..
 # 2. run the app
 cd src-tauri && cargo run --release
 ```
+
+The same commands work on Windows in PowerShell 7 or `cmd` (Windows
+PowerShell 5 doesn't support `&&` — run the commands one at a time there).
 
 For a distributable bundle, install `tauri-cli` (`cargo install tauri-cli`) and run
 `cargo tauri build`.
@@ -78,9 +97,10 @@ cd src-tauri && cargo run --example probe -- your search terms
 ## Data
 
 Your library (liked songs, playlists, recently played) is stored as JSON in
-`~/.local/share/dev.jerimiah.rift/library.json`. Logs follow `RUST_LOG`
+`~/.local/share/dev.jerimiah.rift/library.json` on Linux, or
+`%APPDATA%\dev.jerimiah.rift\library.json` on Windows. Logs follow `RUST_LOG`
 (default `rift=debug,rustypipe=info`).
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE).

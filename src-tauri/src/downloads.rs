@@ -16,6 +16,10 @@ pub struct Downloads {
     pub dir: PathBuf,
     downloaded: Mutex<HashSet<String>>,
     downloading: Mutex<HashSet<String>>,
+    /// Tracks whose download was abandoned after repeated failures. Purely a
+    /// session-scoped UI hint (rows show a retry affordance); cleared the moment
+    /// a track is re-attempted, finished, or removed.
+    failed: Mutex<HashSet<String>>,
 }
 
 impl Downloads {
@@ -43,6 +47,7 @@ impl Downloads {
             dir,
             downloaded: Mutex::new(downloaded),
             downloading: Mutex::new(HashSet::new()),
+            failed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -60,23 +65,36 @@ impl Downloads {
 
     /// Claim a download. Returns `true` if it was newly started, `false` if one
     /// was already in flight — this atomic check-and-set is what prevents the
-    /// same track being fetched twice concurrently.
+    /// same track being fetched twice concurrently. Starting (or restarting) a
+    /// download clears any prior "failed" mark.
     pub fn begin(&self, id: &str) -> bool {
+        self.failed.lock_safe().remove(id);
         self.downloading.lock_safe().insert(id.to_string())
     }
 
     pub fn finish(&self, id: &str) {
         self.downloading.lock_safe().remove(id);
+        self.failed.lock_safe().remove(id);
         self.downloaded.lock_safe().insert(id.to_string());
     }
 
+    /// Release an in-flight claim after a failed pass, without marking the track
+    /// as permanently failed (a retry may still be scheduled).
     pub fn fail(&self, id: &str) {
         self.downloading.lock_safe().remove(id);
+    }
+
+    /// Give up on a track after repeated failures: drop any in-flight claim and
+    /// record it as failed so the UI can offer a manual retry.
+    pub fn mark_failed(&self, id: &str) {
+        self.downloading.lock_safe().remove(id);
+        self.failed.lock_safe().insert(id.to_string());
     }
 
     /// Delete a downloaded file. Returns true if it existed.
     pub fn remove(&self, id: &str) -> bool {
         self.downloaded.lock_safe().remove(id);
+        self.failed.lock_safe().remove(id);
         match std::fs::remove_file(self.path(id)) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -91,6 +109,7 @@ impl Downloads {
         DownloadState {
             downloaded: self.downloaded.lock_safe().iter().cloned().collect(),
             downloading: self.downloading.lock_safe().iter().cloned().collect(),
+            failed: self.failed.lock_safe().iter().cloned().collect(),
         }
     }
 }
@@ -143,6 +162,30 @@ mod tests {
         assert!(!d.is_downloaded("a"));
         assert!(!d.path("a").exists());
         assert!(!d.remove("a"), "removing a missing download reports false");
+    }
+
+    #[test]
+    fn mark_failed_records_and_is_cleared_by_a_retry_or_success() {
+        let d = temp_downloads();
+        d.begin("a");
+        d.mark_failed("a");
+        assert!(!d.is_downloading("a"), "the in-flight claim is dropped");
+        assert!(d.state().failed.contains(&"a".to_string()));
+
+        // Re-attempting clears the failed mark (the row stops showing retry).
+        assert!(d.begin("a"));
+        assert!(!d.state().failed.contains(&"a".to_string()));
+
+        // Finishing also clears it, and removing does too.
+        d.mark_failed("a");
+        d.finish("a");
+        assert!(!d.state().failed.contains(&"a".to_string()));
+        assert!(d.is_downloaded("a"));
+
+        std::fs::write(d.path("a"), b"x").unwrap();
+        d.mark_failed("a");
+        d.remove("a");
+        assert!(!d.state().failed.contains(&"a".to_string()));
     }
 
     #[test]
