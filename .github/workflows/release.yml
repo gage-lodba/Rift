@@ -27,8 +27,11 @@ jobs:
             rust-targets: wasm32-unknown-unknown
           # macOS: one universal (Intel + Apple Silicon) bundle, built on the
           # Apple Silicon runner. Avoids the retired/scarce Intel `macos-13`
-          # runner, which can leave its job queued indefinitely.
-          - platform: macos-latest
+          # runner, which can leave its job queued indefinitely. Pinned to
+          # `macos-15` (Xcode 16 / clang 16): `macos-latest` has rolled to
+          # macOS 26 / Xcode 26.5, whose clang 21 linker segfaults building the
+          # `proc-macro-error-attr` host dylib (pulled in transitively by yew).
+          - platform: macos-15
             args: '--target universal-apple-darwin'
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
           # Windows: .msi + .exe (NSIS).

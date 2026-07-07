@@ -30,7 +30,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        # macos-15 (not macos-latest): macos-latest has rolled to macOS 26 /
+        # Xcode 26.5, whose clang 21 linker segfaults building the
+        # proc-macro-error-attr host dylib (pulled in transitively by yew).
+        os: [ubuntu-22.04, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
