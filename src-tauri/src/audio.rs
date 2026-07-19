@@ -124,8 +124,8 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                         Err(e) => {
                             error!("failed to decode audio: {e}");
                             active = false;
-                            let _ = events
-                                .send(AudioEvent::DecodeFailed(format!("decode error: {e}")));
+                            let _ =
+                                events.send(AudioEvent::DecodeFailed(format!("decode error: {e}")));
                         }
                     }
                 }

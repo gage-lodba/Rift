@@ -177,22 +177,22 @@ mod tests {
         d.begin("a");
         d.mark_failed("a");
         assert!(!d.is_downloading("a"), "the in-flight claim is dropped");
-        assert!(d.state().failed.contains(&"a".to_string()));
+        assert!(d.state().failed.contains("a"));
 
         // Re-attempting clears the failed mark (the row stops showing retry).
         assert!(d.begin("a"));
-        assert!(!d.state().failed.contains(&"a".to_string()));
+        assert!(!d.state().failed.contains("a"));
 
         // Finishing also clears it, and removing does too.
         d.mark_failed("a");
         d.finish("a");
-        assert!(!d.state().failed.contains(&"a".to_string()));
+        assert!(!d.state().failed.contains("a"));
         assert!(d.is_downloaded("a"));
 
         std::fs::write(d.path("a"), b"x").unwrap();
         d.mark_failed("a");
         d.remove("a");
-        assert!(!d.state().failed.contains(&"a".to_string()));
+        assert!(!d.state().failed.contains("a"));
     }
 
     #[test]
