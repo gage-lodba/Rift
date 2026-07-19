@@ -1,5 +1,7 @@
 //! Shared data models between the Tauri backend and the Yew frontend.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// A single artist credit on a track.
@@ -168,16 +170,19 @@ pub struct Bootstrap {
 }
 
 /// Offline-download status, sent to the frontend whenever it changes.
+/// Sets, not lists: the UI checks membership per rendered row, and long track
+/// lists against a large offline collection would make `Vec::contains` scans
+/// quadratic per render.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DownloadState {
     /// Track IDs that are fully downloaded and available offline.
-    pub downloaded: Vec<String>,
+    pub downloaded: HashSet<String>,
     /// Track IDs currently being downloaded.
-    pub downloading: Vec<String>,
+    pub downloading: HashSet<String>,
     /// Track IDs whose download was given up on after repeated failures. Rows
     /// surface these with a retry affordance instead of retrying forever.
     #[serde(default)]
-    pub failed: Vec<String>,
+    pub failed: HashSet<String>,
 }
 
 /// Result of probing the system for the yt-dlp binary (the load-bearing

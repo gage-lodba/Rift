@@ -88,6 +88,7 @@ pub fn queue_clear(app: AppHandle, state: State<'_, AppState>) {
         core.source = None;
         core.shuffle_history.clear();
         core.shuffle_cursor = 0;
+        core.pending_next = None;
         core.epoch += 1;
     }
     player::stop(&app);

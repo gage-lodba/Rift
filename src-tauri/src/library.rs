@@ -27,16 +27,7 @@ impl LibraryStore {
                 ephemeral: true,
             };
         }
-        let data = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| match serde_json::from_str(&s) {
-                Ok(lib) => Some(lib),
-                Err(e) => {
-                    warn!("could not parse {}: {e}", path.display());
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let data = crate::util::load_json(&path);
         info!("library loaded from {}", path.display());
         Self {
             path,
@@ -49,14 +40,7 @@ impl LibraryStore {
         if self.ephemeral {
             return;
         }
-        match serde_json::to_string_pretty(&self.data) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    warn!("failed to save library: {e}");
-                }
-            }
-            Err(e) => warn!("failed to serialize library: {e}"),
-        }
+        crate::util::save_json(&self.path, &self.data, "library");
     }
 
     pub fn toggle_like(&mut self, track: Track) {

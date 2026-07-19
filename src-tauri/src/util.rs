@@ -6,6 +6,40 @@ use std::sync::{Mutex, MutexGuard};
 
 use tracing::warn;
 
+/// Read and parse a JSON state file, defaulting when missing. On a parse
+/// failure the corrupt file is renamed aside (`*.json.bad`) so a later save
+/// can't silently overwrite — and permanently destroy — the user's data.
+pub(crate) fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return T::default();
+    };
+    match serde_json::from_str(&s) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("could not parse {}: {e}", path.display());
+            let backup = path.with_extension("json.bad");
+            match std::fs::rename(path, &backup) {
+                Ok(()) => warn!("moved the corrupt file to {}", backup.display()),
+                Err(e) => warn!("could not preserve the corrupt file: {e}"),
+            }
+            T::default()
+        }
+    }
+}
+
+/// Serialize `value` and write it to `path` atomically, logging (not
+/// propagating) failures. `what` names the file in log messages.
+pub(crate) fn save_json<T: serde::Serialize>(path: &Path, value: &T, what: &str) {
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => {
+            if let Err(e) = atomic_write(path, json.as_bytes()) {
+                warn!("failed to save {what}: {e}");
+            }
+        }
+        Err(e) => warn!("failed to serialize {what}: {e}"),
+    }
+}
+
 /// Lock a mutex, recovering the guard even if a previous holder panicked.
 ///
 /// Playback and library state are guarded by plain `Mutex`es; if one thread

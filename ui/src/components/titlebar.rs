@@ -16,11 +16,17 @@ pub struct TitlebarProps {
 #[function_component(Titlebar)]
 pub fn titlebar(props: &TitlebarProps) -> Html {
     let input = use_node_ref();
+    // Monotonic token cancelling pending debounced searches (see `oninput`).
+    let debounce = use_mut_ref(|| 0u32);
 
     let submit = {
         let input = input.clone();
         let on_search = props.on_search.clone();
+        let debounce = debounce.clone();
         Callback::from(move |()| {
+            // An explicit submit supersedes any pending debounced search, so
+            // the same query isn't fired twice.
+            *debounce.borrow_mut() += 1;
             if let Some(el) = input.cast::<HtmlInputElement>() {
                 let q = el.value();
                 if !q.trim().is_empty() {
@@ -40,7 +46,6 @@ pub fn titlebar(props: &TitlebarProps) -> Html {
     // Debounced live search: each keystroke schedules a search ~300ms out, and a
     // monotonically increasing token cancels earlier pending ones so only the
     // last pause in typing actually fires. Enter still searches immediately.
-    let debounce = use_mut_ref(|| 0u32);
     let oninput = {
         let on_search = props.on_search.clone();
         let debounce = debounce.clone();

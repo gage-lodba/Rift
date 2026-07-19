@@ -1,48 +1,38 @@
 //! Track list and its per-row rendering (cover, actions, offline state).
 
-use rift_types::Track;
+use std::collections::HashSet;
+
+use rift_types::{DownloadState, Track};
 use yew::prelude::*;
 
 use super::icons::{artist_links, cover, fmt_secs, icon};
 use super::menu::{Menu, MenuAction};
 
-#[derive(Properties, PartialEq)]
-pub struct TrackListProps {
-    pub tracks: Vec<Track>,
-    pub liked_ids: Vec<String>,
+/// Per-render context shared by every track list on screen: the id sets that
+/// decorate rows and the track-level callbacks that are the same for all
+/// lists. Bundled so each call site passes one value instead of re-plumbing a
+/// dozen identical props.
+#[derive(Clone, PartialEq)]
+pub struct TrackListCtx {
+    /// IDs of liked tracks.
+    pub liked_ids: HashSet<String>,
     /// ID of the track currently playing, highlighted in the list.
-    #[prop_or_default]
     pub playing_id: Option<String>,
-    /// IDs available offline, marked with an indicator.
-    #[prop_or_default]
-    pub downloaded_ids: Vec<String>,
-    /// IDs whose download is currently in flight.
-    #[prop_or_default]
-    pub downloading_ids: Vec<String>,
+    /// Offline download status (downloaded / in flight / given up).
+    pub downloads: DownloadState,
     /// IDs kept offline by a fully-downloaded playlist; their downloads can't
     /// be removed from the row, only by un-downloading the playlist.
-    #[prop_or_default]
-    pub pinned_ids: Vec<String>,
-    /// IDs whose download was given up on after repeated failures; rows show a
-    /// retry affordance instead of the plain download button.
-    #[prop_or_default]
-    pub failed_ids: Vec<String>,
+    pub pinned_ids: HashSet<String>,
     /// Whether the network is reachable. When false, un-downloaded tracks are
     /// greyed out and can't be played.
-    #[prop_or(true)]
     pub online: bool,
     /// (id, name) of user playlists, for the add-to-playlist dropdown.
     pub playlists: Vec<(String, String)>,
-    /// Play the track at this index (within this list).
-    pub on_play: Callback<usize>,
     pub on_like: Callback<Track>,
     pub on_queue: Callback<Track>,
     pub on_add_to_playlist: Callback<(String, Track)>,
     pub on_open_artist: Callback<String>,
     pub on_open_album: Callback<String>,
-    /// When set, rows get a remove button (used inside playlists).
-    #[prop_or_default]
-    pub on_remove: Option<Callback<usize>>,
     /// Download a single track for offline listening.
     pub on_download: Callback<Track>,
     /// Remove a single track's offline copy (by id).
@@ -51,32 +41,44 @@ pub struct TrackListProps {
     pub on_play_next: Callback<Track>,
 }
 
+#[derive(Properties, PartialEq)]
+pub struct TrackListProps {
+    pub ctx: TrackListCtx,
+    pub tracks: Vec<Track>,
+    /// Play the track at this index (within this list).
+    pub on_play: Callback<usize>,
+    /// When set, rows get a remove button (used inside playlists).
+    #[prop_or_default]
+    pub on_remove: Option<Callback<usize>>,
+}
+
 #[function_component(TrackList)]
 pub fn track_list(props: &TrackListProps) -> Html {
+    let c = &props.ctx;
     html! {
         <div class="tracklist">
             { for props.tracks.iter().enumerate().map(|(i, t)| html! {
                 <TrackRow
                     track={t.clone()}
                     index={i}
-                    liked={props.liked_ids.contains(&t.id)}
-                    downloaded={props.downloaded_ids.contains(&t.id)}
-                    downloading={props.downloading_ids.contains(&t.id)}
-                    pinned={props.pinned_ids.contains(&t.id)}
-                    failed={props.failed_ids.contains(&t.id)}
-                    online={props.online}
-                    playing={props.playing_id.as_deref() == Some(t.id.as_str())}
-                    playlists={props.playlists.clone()}
+                    liked={c.liked_ids.contains(&t.id)}
+                    downloaded={c.downloads.downloaded.contains(&t.id)}
+                    downloading={c.downloads.downloading.contains(&t.id)}
+                    pinned={c.pinned_ids.contains(&t.id)}
+                    failed={c.downloads.failed.contains(&t.id)}
+                    online={c.online}
+                    playing={c.playing_id.as_deref() == Some(t.id.as_str())}
+                    playlists={c.playlists.clone()}
                     on_play={props.on_play.clone()}
-                    on_like={props.on_like.clone()}
-                    on_queue={props.on_queue.clone()}
-                    on_add_to_playlist={props.on_add_to_playlist.clone()}
-                    on_open_artist={props.on_open_artist.clone()}
-                    on_open_album={props.on_open_album.clone()}
+                    on_like={c.on_like.clone()}
+                    on_queue={c.on_queue.clone()}
+                    on_add_to_playlist={c.on_add_to_playlist.clone()}
+                    on_open_artist={c.on_open_artist.clone()}
+                    on_open_album={c.on_open_album.clone()}
                     on_remove={props.on_remove.clone()}
-                    on_download={props.on_download.clone()}
-                    on_remove_download={props.on_remove_download.clone()}
-                    on_play_next={props.on_play_next.clone()}
+                    on_download={c.on_download.clone()}
+                    on_remove_download={c.on_remove_download.clone()}
+                    on_play_next={c.on_play_next.clone()}
                 />
             }) }
         </div>

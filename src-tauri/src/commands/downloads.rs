@@ -48,6 +48,17 @@ fn pin_retry_delay(attempt: u32) -> std::time::Duration {
     }
 }
 
+/// Whether every track of `p` is downloaded (and it has at least one) — the
+/// "kept fully offline" rule shared by the auto-download on add
+/// ([`crate::commands::library::add_to_playlist`]) and the batch-aware retry
+/// logic below.
+pub(crate) fn playlist_fully_downloaded(
+    p: &Playlist,
+    is_downloaded: impl Fn(&str) -> bool,
+) -> bool {
+    !p.tracks.is_empty() && p.tracks.iter().all(|t| is_downloaded(&t.id))
+}
+
 /// Whether `id`'s playlist is being *kept* fully offline — i.e. it had an
 /// established offline copy that the current download `batch` is only topping
 /// up. A playlist qualifies when it contains `id` and every one of its tracks
@@ -139,16 +150,26 @@ fn start_downloads_attempt(
         for track in pending {
             let dest = downloads.path(&track.id);
             let err = match rift::fetch::fetch_bytes(&player.rp, &player.http, &track.id).await {
-                Ok((data, _)) => match tokio::fs::write(&dest, &data).await {
-                    Ok(()) => {
-                        downloads.finish(&track.id);
-                        None
+                Ok((data, _)) => {
+                    // Temp file + rename: a crash mid-write must not leave a
+                    // truncated .m4a, which the next launch's directory scan
+                    // would treat as a valid offline copy.
+                    let tmp = dest.with_extension("m4a.part");
+                    let write = async {
+                        tokio::fs::write(&tmp, &data).await?;
+                        tokio::fs::rename(&tmp, &dest).await
+                    };
+                    match write.await {
+                        Ok(()) => {
+                            downloads.finish(&track.id);
+                            None
+                        }
+                        Err(e) => Some(format!(
+                            "Could not save \u{201c}{}\u{201d}: {e}",
+                            track.title
+                        )),
                     }
-                    Err(e) => Some(format!(
-                        "Could not save \u{201c}{}\u{201d}: {e}",
-                        track.title
-                    )),
-                },
+                }
                 Err(e) => Some(format!(
                     "Could not download \u{201c}{}\u{201d}: {e:#}",
                     track.title

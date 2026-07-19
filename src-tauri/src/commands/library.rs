@@ -81,7 +81,10 @@ pub async fn import_yt_playlist(
         .await
         .map_err(|e| format!("could not load playlist: {e}"))?;
     // Pull beyond the first page so long playlists import in full (bounded).
-    let _ = pl.tracks.extend_limit(&q, MAX_FETCH_TRACKS).await;
+    // A continuation failure still imports what loaded, but shouldn't be silent.
+    if let Err(e) = pl.tracks.extend_limit(&q, MAX_FETCH_TRACKS).await {
+        warn!("playlist continuation failed; importing a partial list: {e}");
+    }
 
     let tracks: Vec<Track> = pl
         .tracks
@@ -246,11 +249,10 @@ pub fn add_to_playlist(id: String, track: Track, app: AppHandle, state: State<'_
             .iter()
             .find(|p| p.id == id)
             .is_some_and(|p| {
-                !p.tracks.is_empty()
-                    && !p.tracks.iter().any(|t| t.id == track.id)
-                    && p.tracks
-                        .iter()
-                        .all(|t| state.downloads.is_downloaded(&t.id))
+                !p.tracks.iter().any(|t| t.id == track.id)
+                    && super::downloads::playlist_fully_downloaded(p, |tid| {
+                        state.downloads.is_downloaded(tid)
+                    })
             })
     };
 

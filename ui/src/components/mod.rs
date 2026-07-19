@@ -5,6 +5,7 @@
 //! (drag-to-reorder state). The names the app shell reaches for are re-exported
 //! here so `use crate::components::*` picks them all up.
 
+mod grids;
 mod home;
 mod icons;
 mod menu;
@@ -15,7 +16,9 @@ mod settings;
 mod sidebar;
 mod titlebar;
 mod track_list;
+mod update_banner;
 
+pub use grids::{album_grid, artist_grid, results_view};
 pub use home::HomeView;
 pub use icons::{cover, icon};
 pub use menu::{MenuAction, MenuButton};
@@ -24,7 +27,8 @@ pub use queue::QueuePanel;
 pub use settings::SettingsView;
 pub use sidebar::Sidebar;
 pub use titlebar::Titlebar;
-pub use track_list::TrackList;
+pub use track_list::{TrackList, TrackListCtx};
+pub use update_banner::UpdateBanner;
 
 /// The main view routed to by the sidebar and search.
 #[derive(Clone, PartialEq)]

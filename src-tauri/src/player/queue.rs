@@ -26,6 +26,10 @@ pub fn remove_from_queue(core: &mut PlayerCore, index: usize) -> RemoveOutcome {
     core.queue.remove(index);
     core.shuffle_history.clear();
     core.shuffle_cursor = 0;
+    // Indices shifted, so a crossfade pick prefetched before the removal now
+    // points at (and would play as) the wrong track. Drop it; the crossfade
+    // commit and pick_next both treat a cleared pick as "draw normally".
+    core.pending_next = None;
     match core.current {
         // A track before the current one went away: current shifts down by one.
         Some(cur) if index < cur => {

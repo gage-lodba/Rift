@@ -2,6 +2,7 @@
 //! between views.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use rift_types::{
@@ -33,73 +34,6 @@ enum SearchTab {
     Albums,
 }
 
-fn format_subs(n: u64) -> String {
-    // "1.0M" -> "1M", "1.2M" -> "1.2M"
-    fn compact(x: f64, unit: &str) -> String {
-        let s = format!("{x:.1}");
-        format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))
-    }
-    match n {
-        1 => "1 subscriber".into(),
-        n if n >= 1_000_000 => format!("{} subscribers", compact(n as f64 / 1e6, "M")),
-        n if n >= 1_000 => format!("{} subscribers", compact(n as f64 / 1e3, "K")),
-        n => format!("{n} subscribers"),
-    }
-}
-
-fn album_subtitle(a: &AlbumSummary) -> String {
-    match a.year {
-        Some(y) => format!("{} • {y}", a.album_type),
-        None => a.album_type.clone(),
-    }
-}
-
-fn album_grid(albums: &[AlbumSummary], on_open: Callback<String>) -> Html {
-    html! {
-        <div class="card-grid">
-            { for albums.iter().map(|a| {
-                let cb = on_open.clone();
-                let id = a.id.clone();
-                html! {
-                    <div class="card" onclick={Callback::from(move |_| cb.emit(id.clone()))}>
-                        { cover(&a.cover, "card-cover") }
-                        <div class="card-name">{ &a.name }</div>
-                        <div class="card-sub">{ album_subtitle(a) }</div>
-                    </div>
-                }
-            }) }
-        </div>
-    }
-}
-
-fn artist_grid(artists: &[ArtistSummary], on_open: Callback<String>) -> Html {
-    html! {
-        <div class="card-grid">
-            { for artists.iter().map(|a| {
-                let cb = on_open.clone();
-                let id = a.id.clone();
-                html! {
-                    <div class="card card-artist" onclick={Callback::from(move |_| cb.emit(id.clone()))}>
-                        { cover(&a.avatar, "card-cover round") }
-                        <div class="card-name">{ &a.name }</div>
-                        <div class="card-sub">{ a.subscribers.map(format_subs).unwrap_or_default() }</div>
-                    </div>
-                }
-            }) }
-        </div>
-    }
-}
-
-/// Render a lazily-loaded search tab: a loading state while `None`, an
-/// empty state for no results, otherwise the given grid.
-fn results_view<T>(results: &Option<Vec<T>>, render: impl FnOnce(&[T]) -> Html) -> Html {
-    match results {
-        None => html! { <div class="empty">{ "Searching..." }</div> },
-        Some(v) if v.is_empty() => html! { <div class="empty">{ "No results." }</div> },
-        Some(v) => render(v),
-    }
-}
-
 /// Human-readable total duration for a collection subtitle, e.g. "1 hr 23 min".
 fn fmt_total_duration(secs: u32) -> String {
     let (h, m) = (secs / 3600, (secs % 3600) / 60);
@@ -121,6 +55,13 @@ fn collection_meta(tracks: &[Track]) -> Html {
             { format!("{n} song{} • {}", if n == 1 { "" } else { "s" }, fmt_total_duration(total)) }
         </div>
     }
+}
+
+/// Every track of `p` is downloaded (and it has any): the playlist pins its
+/// tracks' offline copies, which then can't be removed individually. Shared by
+/// the pinned-row computation and the remove-download guard (its mirror).
+fn playlist_fully_downloaded(p: &Playlist, downloaded: &HashSet<String>) -> bool {
+    !p.tracks.is_empty() && p.tracks.iter().all(|t| downloaded.contains(&t.id))
 }
 
 /// Fire the `play_tracks` command for a collection, tagged with where it came
@@ -172,6 +113,10 @@ pub fn app() -> Html {
     // Set when a launch-time update check finds a newer release; drives the
     // dismissible update banner.
     let update_banner = use_state(|| None::<UpdateStatus>);
+    // Cached result of the GitHub release check, shared by the launch check and
+    // the Settings view so repeated Settings visits don't re-hit the API.
+    // `None` = not checked yet / a check is in flight.
+    let update_status = use_state(|| None::<UpdateStatus>);
     let view = use_state(|| View::Home);
     let search = use_state(Search::default);
     let search_tab = use_state(SearchTab::default);
@@ -200,6 +145,9 @@ pub fn app() -> Html {
     let toast = use_state(|| None::<String>);
     // Bumped on every toast so overlapping toasts don't clear each other early.
     let toast_gen = use_mut_ref(|| 0u64);
+    // Bumped on every song search so a slow, stale response can't overwrite the
+    // results of a newer one (the invokes race; last *arrival* would win).
+    let search_gen = use_mut_ref(|| 0u64);
 
     // Subscribe to backend events and load the initial snapshot, once.
     {
@@ -214,6 +162,7 @@ pub fn app() -> Html {
         let yt_dlp_path = yt_dlp_path.clone();
         let update_notifications = update_notifications.clone();
         let update_banner = update_banner.clone();
+        let update_status = update_status.clone();
         let downloads = downloads.clone();
         let preview = preview.clone();
         let toast = toast.clone();
@@ -306,16 +255,18 @@ pub fn app() -> Html {
 
                         // Launch-time update check (only if the user hasn't
                         // silenced it). Surfaces a dismissible banner if a newer
-                        // release exists.
+                        // release exists, and seeds the cache Settings reads.
                         if b.update_notifications {
                             let update_banner = update_banner.clone();
+                            let update_status = update_status.clone();
                             spawn_local(async move {
                                 if let Ok(status) =
                                     api::invoke::<UpdateStatus>("check_update", &json!({})).await
                                 {
                                     if status.update_available {
-                                        update_banner.set(Some(status));
+                                        update_banner.set(Some(status.clone()));
                                     }
+                                    update_status.set(Some(status));
                                 }
                             });
                         }
@@ -449,6 +400,7 @@ pub fn app() -> Html {
         let search_tab = search_tab.clone();
         let artist_results = artist_results.clone();
         let album_results = album_results.clone();
+        let search_gen = search_gen.clone();
         Callback::from(move |query: String| {
             view.set(View::Search);
             search_tab.set(SearchTab::Songs);
@@ -459,10 +411,20 @@ pub fn app() -> Html {
                 results: vec![],
                 busy: true,
             });
+            let token = {
+                let mut g = search_gen.borrow_mut();
+                *g += 1;
+                *g
+            };
             let search = search.clone();
+            let search_gen = search_gen.clone();
             spawn_local(async move {
-                match api::invoke::<Vec<Track>>("search", &json!({ "query": query.clone() })).await
-                {
+                let result =
+                    api::invoke::<Vec<Track>>("search", &json!({ "query": query.clone() })).await;
+                if *search_gen.borrow() != token {
+                    return; // superseded by a newer search
+                }
+                match result {
                     Ok(results) => search.set(Search {
                         query,
                         results,
@@ -572,6 +534,22 @@ pub fn app() -> Html {
         })
     };
 
+    // Re-run the GitHub release check (Settings' "Check now", or its mount when
+    // no launch check has populated the cache yet).
+    let on_check_update = {
+        let update_status = update_status.clone();
+        Callback::from(move |_: ()| {
+            let update_status = update_status.clone();
+            update_status.set(None);
+            spawn_local(async move {
+                let status = api::invoke::<UpdateStatus>("check_update", &json!({}))
+                    .await
+                    .unwrap_or_default();
+                update_status.set(Some(status));
+            });
+        })
+    };
+
     let on_like = Callback::from(|t: Track| api::fire("toggle_like", json!({ "track": t })));
     let on_download =
         Callback::from(|t: Track| api::fire("download_tracks", json!({ "tracks": [t] })));
@@ -589,9 +567,7 @@ pub fn app() -> Html {
                 .iter()
                 .filter(|p| {
                     p.tracks.iter().any(|t| t.id == id)
-                        && p.tracks
-                            .iter()
-                            .all(|t| downloads.downloaded.contains(&t.id))
+                        && playlist_fully_downloaded(p, &downloads.downloaded)
                 })
                 .map(|p| format!("\u{201c}{}\u{201d}", p.name))
                 .collect();
@@ -735,7 +711,7 @@ pub fn app() -> Html {
     #[cfg(not(debug_assertions))]
     let (track, queue, progress, pstate) = ((*track).clone(), (*queue).clone(), *progress, *pstate);
 
-    let liked_ids: Vec<String> = library.liked.iter().map(|t| t.id.clone()).collect();
+    let liked_ids: HashSet<String> = library.liked.iter().map(|t| t.id.clone()).collect();
     let playlist_opts: Vec<(String, String)> = library
         .playlists
         .iter()
@@ -749,41 +725,38 @@ pub fn app() -> Html {
     // Tracks whose offline copy is pinned by a fully-downloaded playlist.
     // on_remove_download refuses these, so rows show a plain indicator instead
     // of a remove button (the mirror of that guard).
-    let pinned_ids: Vec<String> = library
+    let pinned_ids: HashSet<String> = library
         .playlists
         .iter()
-        .filter(|p| {
-            !p.tracks.is_empty()
-                && p.tracks
-                    .iter()
-                    .all(|t| downloads.downloaded.contains(&t.id))
-        })
+        .filter(|p| playlist_fully_downloaded(p, &downloads.downloaded))
         .flat_map(|p| p.tracks.iter().map(|t| t.id.clone()))
         .collect();
 
-    let list = |tracks: Vec<Track>, source: Option<String>, removable: Option<Callback<usize>>| {
-        html! {
-            <TrackList
-                tracks={tracks.clone()}
-                liked_ids={liked_ids.clone()}
-                playing_id={track.as_ref().map(|t| t.id.clone())}
-                downloaded_ids={downloads.downloaded.clone()}
-                downloading_ids={downloads.downloading.clone()}
-                pinned_ids={pinned_ids.clone()}
-                failed_ids={downloads.failed.clone()}
-                online={*online}
-                playlists={playlist_opts.clone()}
-                on_play={play_list(tracks, source)}
-                on_like={on_like.clone()}
-                on_queue={on_queue_add.clone()}
-                on_add_to_playlist={on_add_to_playlist.clone()}
-                on_open_artist={on_open_artist.clone()}
-                on_open_album={on_open_album.clone()}
-                on_remove={removable}
-                on_download={on_download.clone()}
-                on_remove_download={on_remove_download.clone()}
-                on_play_next={on_play_next.clone()}
-            />
+    // Everything a TrackList needs that doesn't vary per list.
+    let ctx = TrackListCtx {
+        liked_ids: liked_ids.clone(),
+        playing_id: track.as_ref().map(|t| t.id.clone()),
+        downloads: (*downloads).clone(),
+        pinned_ids,
+        online: *online,
+        playlists: playlist_opts,
+        on_like: on_like.clone(),
+        on_queue: on_queue_add.clone(),
+        on_add_to_playlist: on_add_to_playlist.clone(),
+        on_open_artist: on_open_artist.clone(),
+        on_open_album: on_open_album.clone(),
+        on_download: on_download.clone(),
+        on_remove_download: on_remove_download.clone(),
+        on_play_next: on_play_next.clone(),
+    };
+
+    let list = {
+        let ctx = ctx.clone();
+        move |tracks: Vec<Track>, source: Option<String>, removable: Option<Callback<usize>>| {
+            html! {
+                <TrackList ctx={ctx.clone()} tracks={tracks.clone()}
+                           on_play={play_list(tracks, source)} on_remove={removable} />
+            }
         }
     };
 
@@ -796,11 +769,11 @@ pub fn app() -> Html {
         let total = ids.len();
         let n_done = ids
             .iter()
-            .filter(|id| downloads.downloaded.contains(id))
+            .filter(|id| downloads.downloaded.contains(*id))
             .count();
         let n_active = ids
             .iter()
-            .filter(|id| downloads.downloading.contains(id))
+            .filter(|id| downloads.downloading.contains(*id))
             .count();
 
         // Whether this collection is the one currently loaded in the player, so
@@ -898,26 +871,7 @@ pub fn app() -> Html {
                 })
             };
             let recent_list = html! {
-                <TrackList
-                    tracks={recent}
-                    liked_ids={liked_ids.clone()}
-                    playing_id={track.as_ref().map(|t| t.id.clone())}
-                    downloaded_ids={downloads.downloaded.clone()}
-                    downloading_ids={downloads.downloading.clone()}
-                    pinned_ids={pinned_ids.clone()}
-                    failed_ids={downloads.failed.clone()}
-                    online={*online}
-                    playlists={playlist_opts.clone()}
-                    on_play={play_recent}
-                    on_like={on_like.clone()}
-                    on_queue={on_queue_add.clone()}
-                    on_add_to_playlist={on_add_to_playlist.clone()}
-                    on_open_artist={on_open_artist.clone()}
-                    on_open_album={on_open_album.clone()}
-                    on_download={on_download.clone()}
-                    on_remove_download={on_remove_download.clone()}
-                    on_play_next={on_play_next.clone()}
-                />
+                <TrackList ctx={ctx.clone()} tracks={recent} on_play={play_recent} />
             };
             html! {
                 <HomeView library={(*library).clone()} on_nav={on_nav.clone()}
@@ -1002,6 +956,8 @@ pub fn app() -> Html {
                     yt_dlp_path={(*yt_dlp_path).clone()}
                     update_notifications={*update_notifications}
                     on_update_notifications={on_update_notifications.clone()}
+                    update={(*update_status).clone()}
+                    on_check_update={on_check_update.clone()}
                 />
             }
         }
@@ -1285,42 +1241,23 @@ pub fn app() -> Html {
                 <div class="toast">{ msg }</div>
             }
             if let Some(u) = &*update_banner {
-                { {
-                    let dismiss = {
+                <UpdateBanner
+                    status={u.clone()}
+                    on_dismiss={
                         let update_banner = update_banner.clone();
-                        Callback::from(move |_: MouseEvent| update_banner.set(None))
-                    };
-                    let download = {
-                        let url = u.url.clone();
-                        Callback::from(move |_: MouseEvent| {
-                            if let Some(url) = url.clone() {
-                                api::fire("open_url", json!({ "url": url }));
-                            }
-                        })
-                    };
+                        Callback::from(move |()| update_banner.set(None))
+                    }
                     // "Don't ask again" silences future launch checks and clears
                     // the banner; the same switch lives in Settings.
-                    let silence = {
+                    on_silence={
                         let on_update_notifications = on_update_notifications.clone();
                         let update_banner = update_banner.clone();
-                        Callback::from(move |_: MouseEvent| {
+                        Callback::from(move |()| {
                             on_update_notifications.emit(false);
                             update_banner.set(None);
                         })
-                    };
-                    html! {
-                        <div class="update-banner">
-                            <span class="update-banner-text">
-                                { format!("Rift v{} is available.", u.latest.clone().unwrap_or_default()) }
-                            </span>
-                            <button class="btn-primary" onclick={download}>{ "Download" }</button>
-                            <button class="btn-secondary" onclick={silence}>{ "Don't ask again" }</button>
-                            <button class="ibtn update-banner-close" title="Dismiss" onclick={dismiss}>
-                                { icon("x") }
-                            </button>
-                        </div>
                     }
-                } }
+                />
             }
         </div>
     }

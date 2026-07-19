@@ -56,7 +56,10 @@ pub enum AudioEvent {
     Position(f64),
     /// The current track finished playing.
     Ended,
-    /// Decoding or device failure for the current track.
+    /// The current track's bytes wouldn't decode (e.g. a corrupt offline
+    /// file). The track is unplayable, but the queue can still advance.
+    DecodeFailed(String),
+    /// Device-level failure; playback can't continue at all.
     Failed(String),
 }
 
@@ -87,6 +90,9 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
     let mut volume = 1.0f32;
     // Tracks currently fading out behind the current one.
     let mut fading: Vec<FadeOut> = Vec::new();
+    // Paces position ticks at ~4 Hz: a crossfade tightens the loop to 30 ms
+    // for smooth volume ramps, but the UI doesn't need 33 progress events/s.
+    let mut last_position = Instant::now() - Duration::from_secs(1);
 
     loop {
         // Tick fast enough for smooth fades while one is in progress; idle
@@ -118,7 +124,8 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                         Err(e) => {
                             error!("failed to decode audio: {e}");
                             active = false;
-                            let _ = events.send(AudioEvent::Failed(format!("decode error: {e}")));
+                            let _ = events
+                                .send(AudioEvent::DecodeFailed(format!("decode error: {e}")));
                         }
                     }
                 }
@@ -198,7 +205,8 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
             if player.empty() {
                 active = false;
                 let _ = events.send(AudioEvent::Ended);
-            } else if !player.is_paused() {
+            } else if !player.is_paused() && last_position.elapsed() >= Duration::from_millis(200) {
+                last_position = Instant::now();
                 let _ = events.send(AudioEvent::Position(player.get_pos().as_secs_f64()));
             }
         }

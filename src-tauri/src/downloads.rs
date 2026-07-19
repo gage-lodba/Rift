@@ -31,10 +31,17 @@ impl Downloads {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("m4a") {
-                    if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-                        downloaded.insert(id.to_string());
+                match path.extension().and_then(|e| e.to_str()) {
+                    Some("m4a") => {
+                        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                            downloaded.insert(id.to_string());
+                        }
                     }
+                    // A temp file left by a crash mid-download; never valid.
+                    Some("part") => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    _ => {}
                 }
             }
         }

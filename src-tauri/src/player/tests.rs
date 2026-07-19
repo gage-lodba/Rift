@@ -202,6 +202,19 @@ fn remove_last_remaining_current_stops() {
 }
 
 #[test]
+fn remove_clears_a_pending_crossfade_pick() {
+    let mut core = queue_core(5, Some(1));
+    core.pending_next = Some(3);
+    // Removal shifts indices, so a prefetched pick would land on the wrong
+    // track if it survived.
+    assert!(matches!(
+        remove_from_queue(&mut core, 2),
+        RemoveOutcome::EmitOnly
+    ));
+    assert_eq!(core.pending_next, None);
+}
+
+#[test]
 fn remove_out_of_range_is_a_noop() {
     let mut core = queue_core(2, Some(0));
     assert!(matches!(

@@ -70,16 +70,7 @@ impl SettingsStore {
                 ephemeral: true,
             };
         }
-        let data = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| match serde_json::from_str(&s) {
-                Ok(settings) => Some(settings),
-                Err(e) => {
-                    warn!("could not parse {}: {e}", path.display());
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let data = crate::util::load_json(&path);
         Self {
             path,
             data,
@@ -91,14 +82,7 @@ impl SettingsStore {
         if self.ephemeral {
             return;
         }
-        match serde_json::to_string_pretty(&self.data) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, json) {
-                    warn!("failed to save settings: {e}");
-                }
-            }
-            Err(e) => warn!("failed to serialize settings: {e}"),
-        }
+        crate::util::save_json(&self.path, &self.data, "settings");
     }
 
     pub fn set_volume(&mut self, volume: f32) {

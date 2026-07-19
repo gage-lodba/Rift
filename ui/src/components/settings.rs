@@ -24,6 +24,11 @@ pub struct SettingsProps {
     pub update_notifications: bool,
     /// Called with the new value when the update-notification toggle is flipped.
     pub on_update_notifications: Callback<bool>,
+    /// Cached update-check result owned by the app (`None` = checking / not
+    /// yet run). Cached there so reopening Settings doesn't re-hit GitHub.
+    pub update: Option<UpdateStatus>,
+    /// Re-run the GitHub release check.
+    pub on_check_update: Callback<()>,
 }
 
 /// Default overlap applied when crossfade is toggled on from off.
@@ -89,6 +94,15 @@ pub fn settings_view(props: &SettingsProps) -> Html {
     // Custom yt-dlp location: draft mirrors the input; saving persists it and
     // re-probes. A blank value clears the override (back to auto-detect).
     let path_draft = use_state(|| props.yt_dlp_path.clone().unwrap_or_default());
+    {
+        // Re-sync the draft when the configured path changes after mount
+        // (e.g. bootstrap resolving late) — `use_state` only seeds once.
+        let path_draft = path_draft.clone();
+        use_effect_with(props.yt_dlp_path.clone(), move |p| {
+            path_draft.set(p.clone().unwrap_or_default());
+            || ()
+        });
+    }
     let on_path_input = {
         let path_draft = path_draft.clone();
         Callback::from(move |e: InputEvent| {
@@ -139,29 +153,20 @@ pub fn settings_view(props: &SettingsProps) -> Html {
     // Offer the download only once a probe has confirmed yt-dlp is missing.
     let missing = matches!(&*ytdlp, Some(s) if !s.found);
 
-    // Update check: probe GitHub on mount and on demand. `None` = checking.
-    let update = use_state(|| None as Option<UpdateStatus>);
-    let check_update = {
-        let update = update.clone();
-        Callback::from(move |_: ()| {
-            let update = update.clone();
-            update.set(None);
-            spawn_local(async move {
-                let status = api::invoke::<UpdateStatus>("check_update", &json!({}))
-                    .await
-                    .unwrap_or_default();
-                update.set(Some(status));
-            });
-        })
-    };
+    // Update check: the app owns the cached status. Trigger a check on mount
+    // only when nothing is cached yet (the launch check may have run already);
+    // "Check now" always forces a fresh one.
     {
-        let check_update = check_update.clone();
+        let cached = props.update.is_some();
+        let check = props.on_check_update.clone();
         use_effect_with((), move |_| {
-            check_update.emit(());
+            if !cached {
+                check.emit(());
+            }
             || ()
         });
     }
-    let on_check_update = check_update.reform(|_: MouseEvent| ());
+    let on_check_update = props.on_check_update.reform(|_: MouseEvent| ());
     let on_update_toggle = {
         let current = props.update_notifications;
         let cb = props.on_update_notifications.clone();
@@ -169,9 +174,9 @@ pub fn settings_view(props: &SettingsProps) -> Html {
     };
     // Open the release page in the default browser.
     let open_release = {
-        let update = update.clone();
+        let url = props.update.as_ref().and_then(|u| u.url.clone());
         Callback::from(move |_: MouseEvent| {
-            if let Some(url) = (*update).as_ref().and_then(|u| u.url.clone()) {
+            if let Some(url) = url.clone() {
                 api::fire("open_url", json!({ "url": url }));
             }
         })
@@ -256,10 +261,10 @@ pub fn settings_view(props: &SettingsProps) -> Html {
                     <div class="settings-desc">
                         { "Check GitHub for a newer version of Rift on launch and notify you." }
                     </div>
-                    { update_status_line(&update) }
+                    { update_status_line(&props.update) }
                     <div class="ytdlp-actions">
                         <button class="btn-secondary" onclick={on_check_update}>{ "Check now" }</button>
-                        if matches!(&*update, Some(u) if u.update_available) {
+                        if matches!(&props.update, Some(u) if u.update_available) {
                             <button class="btn-primary" onclick={open_release}>
                                 { "Download update" }
                             </button>

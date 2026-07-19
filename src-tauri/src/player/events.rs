@@ -71,6 +71,24 @@ pub async fn event_loop(app: AppHandle, mut rx: UnboundedReceiver<AudioEvent>) {
                 debug!("track ended, advancing queue");
                 play_next(&app, false);
             }
+            AudioEvent::DecodeFailed(msg) => {
+                // An unplayable track (fetched fine, won't decode): skip it like
+                // a failed fetch, with the same budget so a queue of all-broken
+                // tracks stops instead of spinning forever.
+                let _ = app.emit(events::ERROR, msg);
+                let skip = {
+                    let state = app.state::<AppState>();
+                    let mut core = state.player.core.lock_safe();
+                    core.failures += 1;
+                    core.failures < core.queue.len().max(1) as u32
+                };
+                if skip {
+                    debug!("auto-skipping undecodable track");
+                    play_next(&app, false);
+                } else {
+                    stop(&app);
+                }
+            }
             AudioEvent::Failed(msg) => {
                 let _ = app.emit(events::ERROR, msg);
                 stop(&app);

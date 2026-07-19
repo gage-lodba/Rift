@@ -230,6 +230,8 @@ async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
         .context("could not run yt-dlp — install it (https://github.com/yt-dlp/yt-dlp#installation), or set RIFT_YTDLP to its full path")?;
 
     if !output.status.success() {
+        // yt-dlp may have left a partial output file behind.
+        let _ = tokio::fs::remove_file(&path).await;
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("yt-dlp failed: {}", stderr.trim());
     }

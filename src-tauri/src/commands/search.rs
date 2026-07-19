@@ -2,7 +2,7 @@
 
 use rift_types::{AlbumPage, AlbumSummary, ArtistPage, ArtistSummary, Track};
 use tauri::State;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::convert::{
     album_type_label, convert, convert_album_item, convert_artists, is_audio_track, join_artists,
@@ -159,7 +159,9 @@ pub async fn get_artist_songs(
         .await
         .map_err(|e| format!("could not load songs: {e}"))?;
     // Pull past the first page so prolific artists' catalogs aren't truncated.
-    let _ = pl.tracks.extend_limit(&q, MAX_FETCH_TRACKS).await;
+    if let Err(e) = pl.tracks.extend_limit(&q, MAX_FETCH_TRACKS).await {
+        warn!("catalog continuation failed; showing a partial list: {e}");
+    }
     let mut songs: Vec<Track> = pl
         .tracks
         .items
