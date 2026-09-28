@@ -1,0 +1,5 @@
+# Store text files with LF line endings everywhere. The repository is already
+# LF-normalized; without this, `core.autocrlf=true` (the Windows default) marks
+# already-clean files as modified and emits "LF will be replaced by CRLF"
+# warnings. Binary files (icons, etc.) are left untouched by `text=auto`.
+* text=auto eol=lf
