@@ -6,7 +6,7 @@ A minimal, ad-free desktop music player, written (almost) entirely in Rust.
 
 ![Preview](Previews/image.png)
 
-- **Backend:** Tauri 2, tokio, rodio (playback), rustypipe (streaming backend), serde, tracing
+- **Backend:** Tauri 2, tokio, rodio (playback), rift-ytmusic (metadata), serde, tracing
 - **Frontend:** Yew (Rust → WASM), built with Trunk
 
 No ads, no tracking, no account. Features:
@@ -80,13 +80,18 @@ For a distributable bundle, install `tauri-cli` (`cargo install tauri-cli`) and 
 
 ## How streaming works (and why yt-dlp is needed)
 
-Rift uses [rustypipe](https://crates.io/crates/rustypipe) for search, metadata and
-radio queues, and tries it first for audio streams too. As of mid-2026 rustypipe
-0.11.4 can no longer resolve full audio streams on its own (upstream has been
-dormant since mid-2025), so Rift transparently falls back to invoking
-[yt-dlp](https://github.com/yt-dlp/yt-dlp) to fetch the m4a audio. Everything else
-— UI, queue, playback, library — stays in Rust. If a future rustypipe release
-restores stream resolution, Rift will use it automatically without any changes.
+Rift resolves its audio through [yt-dlp](https://github.com/yt-dlp/yt-dlp):
+the subprocess fetches the m4a, which Rift reads back into memory and decodes
+with rodio. yt-dlp is actively maintained against YouTube's changes and owns
+the signature/`n` deobfuscation and proof-of-origin token handling that a
+pure-Rust client would otherwise have to chase continuously — there is no
+pure-Rust PO-token path to depend on today. The reasoning, with the evidence,
+is written up in [`docs/innertube-research.md`](docs/innertube-research.md).
+
+Search, metadata, artist/album pages, and playlist import are handled in Rust
+by `crates/ytmusic` (`rift-ytmusic`), a clean-room client for the anonymous
+YouTube Music innertube API. Everything else — UI, queue, playback, library —
+also stays in Rust.
 
 You can verify the streaming pipeline from the command line:
 
@@ -94,12 +99,18 @@ You can verify the streaming pipeline from the command line:
 cd src-tauri && cargo run --example probe -- your search terms
 ```
 
+The metadata client has its own parser tests against recorded responses:
+
+```sh
+cargo test -p rift-ytmusic
+```
+
 ## Data
 
 Your library (liked songs, playlists, recently played) is stored as JSON in
 `~/.local/share/dev.jerimiah.rift/library.json` on Linux, or
 `%APPDATA%\dev.jerimiah.rift\library.json` on Windows. Logs follow `RUST_LOG`
-(default `rift=debug,rustypipe=info`).
+(default `rift=debug,rift_music=debug`).
 
 ## Discord Rich Presence
 
