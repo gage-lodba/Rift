@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["types", "ui", "src-tauri"]
+members = ["types", "ui", "src-tauri", "crates/ytmusic"]
 
 [workspace.package]
 version = "0.4.3"

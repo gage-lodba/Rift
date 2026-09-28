@@ -33,6 +33,10 @@ use tracing::{debug, info, warn};
 const CHUNK_SIZE_MIN: u64 = 800_000;
 const CHUNK_JITTER: u64 = 200_000;
 const MAX_ATTEMPTS: usize = 2;
+/// Upper bound on the upfront buffer reserved for a fetched stream. `size`
+/// comes from untrusted stream metadata; a bogus value must not force a huge
+/// (or, on 32-bit targets, truncated) allocation.
+const MAX_PREALLOC: usize = 64 * 1024 * 1024;
 
 /// After a rustypipe failure, fall back to yt-dlp for this many fetches before
 /// re-probing rustypipe (so playback recovers automatically when upstream or
@@ -41,6 +45,30 @@ const RUSTYPIPE_RETRY_AFTER: u32 = 50;
 
 /// Fetches remaining before rustypipe is retried. 0 means "try rustypipe now".
 static RUSTYPIPE_COOLDOWN: AtomicU32 = AtomicU32::new(0);
+
+/// Sanitize a video/track id into a safe single filename component. Real
+/// YouTube ids are `[A-Za-z0-9_-]` and pass through unchanged; a playlist
+/// imported from an arbitrary JSON file can carry any string, so everything
+/// else (path separators, `..`, whitespace) folds to `_`. This keeps a
+/// malicious id from escaping the downloads/temp directory when it is used to
+/// build a file path.
+pub fn safe_stem(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "_".into()
+    } else {
+        cleaned
+    }
+}
 
 /// Load a track for playback, preferring an offline copy under `downloads_dir`
 /// and falling back to a network fetch. Returns the audio bytes and duration
@@ -51,7 +79,7 @@ pub async fn fetch_track(
     downloads_dir: &std::path::Path,
     video_id: &str,
 ) -> anyhow::Result<(Vec<u8>, f64)> {
-    let local = downloads_dir.join(format!("{video_id}.m4a"));
+    let local = downloads_dir.join(format!("{}.m4a", safe_stem(video_id)));
     if local.exists() {
         if let Ok(data) = tokio::fs::read(&local).await {
             debug!("playing {video_id} from offline download");
@@ -157,7 +185,7 @@ async fn fetch_chunked(
     user_agent: &str,
     size: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut data: Vec<u8> = Vec::with_capacity(size as usize);
+    let mut data: Vec<u8> = Vec::with_capacity((size as usize).min(MAX_PREALLOC));
     let mut offset: u64 = 0;
 
     while size == 0 || offset < size {
@@ -184,8 +212,10 @@ async fn fetch_chunked(
         }
         offset += bytes.len() as u64;
         data.extend_from_slice(&bytes);
-        // A short read means the server reached end of file.
-        if (bytes.len() as u64) < requested {
+        // A short read means the server reached end of file. A *tiny* read when
+        // we requested a large chunk also signals EOF — this guards against a
+        // pathological server trickling 1-byte responses forever when size==0.
+        if (bytes.len() as u64) < requested || (size == 0 && bytes.len() < 1024) {
             break;
         }
     }
@@ -202,7 +232,8 @@ async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
     // A random suffix keeps concurrent fetches of the same id from writing to —
     // and reading back — the same temp file.
     let path = std::env::temp_dir().join(format!(
-        "rift-{video_id}-{:016x}.m4a",
+        "rift-{}-{:016x}.m4a",
+        safe_stem(video_id),
         rand::random::<u64>()
     ));
     let _ = tokio::fs::remove_file(&path).await;
@@ -435,4 +466,21 @@ fn probe_ytdlp_locations() -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_stem;
+
+    #[test]
+    fn safe_stem_preserves_real_ids_and_neutralizes_traversal() {
+        // Real YouTube ids are already a safe single component and pass through.
+        assert_eq!(safe_stem("dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+        assert_eq!(safe_stem("a-b_c"), "a-b_c");
+        // Separators, `..`, and whitespace fold to `_` instead of escaping.
+        assert_eq!(safe_stem(".."), "__");
+        assert_eq!(safe_stem("../etc/passwd"), "___etc_passwd");
+        // An empty id still yields a safe name.
+        assert_eq!(safe_stem(""), "_");
+    }
 }

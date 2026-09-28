@@ -9,7 +9,8 @@ use super::View;
 
 #[derive(Properties, PartialEq)]
 pub struct HomeProps {
-    pub library: Library,
+    /// Shared via Rc so the app can pass it down without a deep clone per render.
+    pub library: std::rc::Rc<Library>,
     pub on_nav: Callback<View>,
     pub on_rename_playlist: Callback<String>,
     pub on_delete_playlist: Callback<String>,

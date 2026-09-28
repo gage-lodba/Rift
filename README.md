@@ -13,7 +13,7 @@ No ads, no tracking, no account. Features:
 
 - Search songs, artists, and albums; browse artist pages (top songs, full
   discography split into albums and singles) and album pages.
-- Auto-generated radio queues for endless playback, with shuffle and repeat.
+- Shuffle and repeat playback modes.
 - Like songs, build and manage playlists, and resume your session on next launch.
 - Download tracks for offline listening.
 - Crossfade between tracks, OS media-key / now-playing integration, and Discord
@@ -100,6 +100,14 @@ Your library (liked songs, playlists, recently played) is stored as JSON in
 `~/.local/share/dev.jerimiah.rift/library.json` on Linux, or
 `%APPDATA%\dev.jerimiah.rift\library.json` on Windows. Logs follow `RUST_LOG`
 (default `rift=debug,rustypipe=info`).
+
+## Discord Rich Presence
+
+Rift advertises the currently playing track as a "Listening to Rift" status on
+Discord. This uses a Discord application ID baked into the build. **Forks** need
+their own Discord application: create one at the
+[Discord Developer Portal](https://discord.com/developers/applications), then
+replace `APP_ID` in `src-tauri/src/discord.rs` with your application's ID.
 
 ## License
 

@@ -59,7 +59,7 @@ impl Downloads {
     }
 
     pub fn path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.m4a"))
+        self.dir.join(format!("{}.m4a", rift::fetch::safe_stem(id)))
     }
 
     pub fn is_downloaded(&self, id: &str) -> bool {

@@ -100,7 +100,10 @@ fn sticky_toast(toast: &UseStateHandle<Option<String>>, gen: &Rc<RefCell<u64>>, 
 
 #[function_component(App)]
 pub fn app() -> Html {
-    let library = use_state(Library::default);
+    // Rc so the whole library can be shared with child views without a deep
+    // clone per render (the library can be large, and App re-renders on every
+    // ~4 Hz progress tick).
+    let library = use_state(|| std::rc::Rc::new(Library::default()));
     let queue = use_state(QueueSnapshot::default);
     let pstate = use_state(PlaybackState::default);
     let track = use_state(|| None::<Track>);
@@ -148,6 +151,10 @@ pub fn app() -> Html {
     // Bumped on every song search so a slow, stale response can't overwrite the
     // results of a newer one (the invokes race; last *arrival* would win).
     let search_gen = use_mut_ref(|| 0u64);
+    // Bumped on every artist/album/song page navigation so a slow, stale
+    // response can't overwrite the page for a newer navigation (the invokes
+    // race; last *arrival* would win — the same problem search's token solves).
+    let page_gen = use_mut_ref(|| 0u64);
 
     // Subscribe to backend events and load the initial snapshot, once.
     {
@@ -173,7 +180,7 @@ pub fn app() -> Html {
                 let library = library.clone();
                 api::listen_event::<Library>(
                     events::LIBRARY,
-                    Callback::from(move |v| library.set(v)),
+                    Callback::from(move |v| library.set(std::rc::Rc::new(v))),
                 );
             }
             {
@@ -240,7 +247,7 @@ pub fn app() -> Html {
             spawn_local(async move {
                 match api::invoke::<Bootstrap>("bootstrap", &json!({})).await {
                     Ok(b) => {
-                        library.set(b.library);
+                        library.set(std::rc::Rc::new(b.library));
                         queue.set(b.queue);
                         pstate.set(b.state);
                         track.set(b.track);
@@ -283,10 +290,18 @@ pub fn app() -> Html {
     use_effect_with((), move |_| {
         let document = web_sys::window().unwrap().document().unwrap();
         let handler = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
+            // Ignore the shortcut while a text field or another focused control
+            // is being used, so Space doesn't also re-activate a just-clicked
+            // button (e.g. a focused Delete) while toggling playback.
             let typing = web_sys::window()
                 .and_then(|w| w.document())
                 .and_then(|d| d.active_element())
-                .map(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA"))
+                .map(|el| {
+                    matches!(
+                        el.tag_name().as_str(),
+                        "INPUT" | "TEXTAREA" | "BUTTON" | "SELECT"
+                    )
+                })
                 .unwrap_or(false);
             if typing {
                 return;
@@ -342,13 +357,28 @@ pub fn app() -> Html {
         let album_page = album_page.clone();
         let toast = toast.clone();
         let toast_gen = toast_gen.clone();
+        let page_gen = page_gen.clone();
         use_effect_with((*view).clone(), move |v| {
+            // A fresh navigation supersedes any in-flight page fetch; each arm
+            // captures this token and drops its result if a newer navigation has
+            // since bumped it (mirrors search's `search_gen`).
+            let token = {
+                let mut g = page_gen.borrow_mut();
+                *g += 1;
+                *g
+            };
             match v {
                 View::Artist(id) => {
                     artist_page.set(None);
                     let id = id.clone();
+                    let page_gen = page_gen.clone();
                     spawn_local(async move {
-                        match api::invoke::<ArtistPage>("get_artist", &json!({ "id": id })).await {
+                        let result =
+                            api::invoke::<ArtistPage>("get_artist", &json!({ "id": id })).await;
+                        if *page_gen.borrow() != token {
+                            return; // superseded by a newer navigation
+                        }
+                        match result {
                             Ok(p) => artist_page.set(Some(p)),
                             Err(e) => show_toast(toast, toast_gen, e, 6000),
                         }
@@ -363,13 +393,17 @@ pub fn app() -> Html {
                         let artist_songs = artist_songs.clone();
                         let toast = toast.clone();
                         let toast_gen = toast_gen.clone();
+                        let page_gen = page_gen.clone();
                         spawn_local(async move {
-                            match api::invoke::<Vec<Track>>(
+                            let result = api::invoke::<Vec<Track>>(
                                 "get_artist_songs",
                                 &json!({ "id": id.clone() }),
                             )
-                            .await
-                            {
+                            .await;
+                            if *page_gen.borrow() != token {
+                                return; // superseded by a newer navigation
+                            }
+                            match result {
                                 Ok(t) => artist_songs.set(Some((id, t))),
                                 Err(e) => show_toast(toast, toast_gen, e, 6000),
                             }
@@ -379,8 +413,14 @@ pub fn app() -> Html {
                 View::Album(id) => {
                     album_page.set(None);
                     let id = id.clone();
+                    let page_gen = page_gen.clone();
                     spawn_local(async move {
-                        match api::invoke::<AlbumPage>("get_album", &json!({ "id": id })).await {
+                        let result =
+                            api::invoke::<AlbumPage>("get_album", &json!({ "id": id })).await;
+                        if *page_gen.borrow() != token {
+                            return; // superseded by a newer navigation
+                        }
+                        match result {
                             Ok(p) => album_page.set(Some(p)),
                             Err(e) => show_toast(toast, toast_gen, e, 6000),
                         }
@@ -685,14 +725,16 @@ pub fn app() -> Html {
     // state handles, so the app keeps running underneath. Release builds
     // compile the placeholder path out entirely.
     //
-    // `library` is borrowed, not cloned: App re-renders on every progress tick
-    // (~4x/s while playing) and a deep Library clone each time is pure churn.
-    // (track/queue were already cloned per render; progress/pstate are Copy.)
+    // The library is shared via Rc so App can re-render on every progress tick
+    // (~4x/s while playing) without deep-cloning it for each view.
     #[cfg(debug_assertions)]
-    let preview_lib = (*preview).then(preview_library);
+    let library: std::rc::Rc<Library> = if *preview {
+        std::rc::Rc::new(preview_library())
+    } else {
+        (*library).clone()
+    };
     #[cfg(not(debug_assertions))]
-    let preview_lib: Option<Library> = None;
-    let library: &Library = preview_lib.as_ref().unwrap_or(&library);
+    let library: std::rc::Rc<Library> = (*library).clone();
 
     #[cfg(debug_assertions)]
     let (track, queue, progress, pstate) = if *preview {
@@ -776,6 +818,21 @@ pub fn app() -> Html {
             .filter(|id| downloads.downloading.contains(*id))
             .count();
 
+        // Tracks in this collection that are pinned by a *different* fully-
+        // downloaded playlist can't be removed here without breaking that
+        // playlist's offline copy (the collection-level mirror of the per-row
+        // guard). When the collection itself is that playlist, its own pinning
+        // doesn't count — the "Downloaded" button is how you un-download it.
+        let own_playlist = source.as_deref().and_then(|s| s.strip_prefix("playlist:"));
+        let blocked: HashSet<String> = library
+            .playlists
+            .iter()
+            .filter(|p| Some(p.id.as_str()) != own_playlist)
+            .filter(|p| playlist_fully_downloaded(p, &downloads.downloaded))
+            .flat_map(|p| p.tracks.iter().map(|t| t.id.clone()))
+            .collect();
+        let has_pinned = ids.iter().any(|id| blocked.contains(id));
+
         // Whether this collection is the one currently loaded in the player, so
         // the Play button can reflect (and toggle) its playback state instead of
         // always offering to start it over.
@@ -820,16 +877,25 @@ pub fn app() -> Html {
                 </button>
             }
         } else if n_done == total {
-            let remove = {
-                let ids = ids.clone();
-                Callback::from(move |_: MouseEvent| {
-                    api::fire("remove_downloads", json!({ "ids": ids.clone() }));
-                })
-            };
-            html! {
-                <button class="head-btn downloaded" title="Remove downloads" onclick={remove}>
-                    { icon("check-circle") }<span>{ "Downloaded" }</span>
-                </button>
+            if has_pinned {
+                html! {
+                    <button class="head-btn downloaded" disabled=true
+                            title="Some songs are kept offline by another playlist — remove them from that playlist first">
+                        { icon("check-circle") }<span>{ "Downloaded" }</span>
+                    </button>
+                }
+            } else {
+                let remove = {
+                    let ids = ids.clone();
+                    Callback::from(move |_: MouseEvent| {
+                        api::fire("remove_downloads", json!({ "ids": ids.clone() }));
+                    })
+                };
+                html! {
+                    <button class="head-btn downloaded" title="Remove downloads" onclick={remove}>
+                        { icon("check-circle") }<span>{ "Downloaded" }</span>
+                    </button>
+                }
             }
         } else {
             let download = {
@@ -859,8 +925,8 @@ pub fn app() -> Html {
     let main = match &*view {
         View::Home => {
             let recent: Vec<Track> = library.recently_played.iter().take(12).cloned().collect();
-            // Clicking a row plays just that song (with radio fill), like the
-            // old cards did — not the whole recently-played list.
+            // Clicking a row plays just that song — not the whole
+            // recently-played list.
             let play_recent = {
                 let tracks = recent.clone();
                 let on_play_single = on_play_single.clone();
@@ -874,7 +940,7 @@ pub fn app() -> Html {
                 <TrackList ctx={ctx.clone()} tracks={recent} on_play={play_recent} />
             };
             html! {
-                <HomeView library={(*library).clone()} on_nav={on_nav.clone()}
+                <HomeView library={library.clone()} on_nav={on_nav.clone()}
                           on_rename_playlist={on_rename_playlist.clone()}
                           on_delete_playlist={on_delete_playlist.clone()}
                           recent={recent_list} />

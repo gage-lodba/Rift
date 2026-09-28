@@ -1,4 +1,5 @@
-//! JSON-persisted app settings (currently just playback volume).
+//! JSON-persisted app settings: playback volume, Discord Rich Presence,
+//! crossfade overlap, the yt-dlp binary path, and update notifications.
 
 use std::path::{Path, PathBuf};
 
@@ -70,7 +71,11 @@ impl SettingsStore {
                 ephemeral: true,
             };
         }
-        let data = crate::util::load_json(&path);
+        let mut data: Settings = crate::util::load_json(&path);
+        // A hand-edited settings.json can carry out-of-range values; clamp here
+        // so the volume slider and crossfade logic see sane bounds every launch.
+        data.volume = data.volume.clamp(0.0, 1.0);
+        data.crossfade = data.crossfade.clamp(0.0, MAX_CROSSFADE);
         Self {
             path,
             data,
@@ -130,6 +135,23 @@ mod tests {
         SettingsStore::load(&dir).set_volume(0.42);
         let restored = SettingsStore::load(&dir).data.volume;
         assert!((restored - 0.42).abs() < 1e-6, "got {restored}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped_on_load() {
+        let dir = std::env::temp_dir().join(format!("rift-test-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"volume": 5.0, "crossfade": 999.0}"#,
+        )
+        .unwrap();
+
+        let s = SettingsStore::load(&dir).data;
+        assert_eq!(s.volume, 1.0);
+        assert_eq!(s.crossfade, MAX_CROSSFADE);
 
         std::fs::remove_dir_all(&dir).ok();
     }

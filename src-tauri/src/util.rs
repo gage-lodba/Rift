@@ -94,3 +94,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
+
+/// Check network connectivity with a lightweight HTTP request. Used to skip
+/// retries when the machine is offline (e.g. laptop woke up without Wi-Fi),
+/// so a kept-offline playlist doesn't spin through backoff delays for minutes.
+pub(crate) async fn is_online(http: &reqwest::Client) -> bool {
+    // A HEAD request to the service Rift actually streams from (rather than an
+    // unrelated third-party host); 2s timeout so we don't block long.
+    http.head("https://www.youtube.com/")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}

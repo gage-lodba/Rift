@@ -41,6 +41,11 @@ const HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// Rift's Discord application ID (Developer Portal → General Information). It
 /// sets the app name shown as "Listening to Rift" and hosts uploaded art.
+///
+/// **Forks:** you need your own Discord application for Rich Presence to work.
+/// Create one at <https://discord.com/developers/applications>, copy its
+/// Application ID here, and upload a logo under Rich Presence → Art Assets
+/// (keyed as [`LOGO_ASSET`]) if you want the badge.
 const APP_ID: &str = "1504731045847634042";
 
 /// Asset key of a logo uploaded under the app's Rich Presence → Art Assets,

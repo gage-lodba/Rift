@@ -238,6 +238,24 @@ fn start_downloads_attempt(
             delay.as_secs(),
             attempt + 2
         );
+        // Skip the wait and retry entirely when offline: a kept-offline playlist
+        // whose tracks vanished (e.g. removed from YouTube) would otherwise spin
+        // through ~7.5 minutes of backoff on a machine with no network.
+        if !crate::util::is_online(&player.http).await {
+            warn!(
+                "offline; giving up on {} kept-offline download(s)",
+                failed.len()
+            );
+            for t in &failed {
+                downloads.mark_failed(&t.id);
+            }
+            emit_downloads(&app, &downloads.state());
+            let _ = app.emit(
+                events::ERROR,
+                "Couldn't download — you appear to be offline. Reconnect and retry from a track's menu.",
+            );
+            return;
+        }
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
