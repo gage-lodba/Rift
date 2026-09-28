@@ -16,6 +16,10 @@ target
 # Trunk build output
 /dist
 
+# Runtime logs (a redirected launch keeps these open for as long as the app runs,
+# so they can't be deleted while testing)
+*.log
+
 # rustypipe cache/reports
 rustypipe_reports/
 /CLAUDE.md
