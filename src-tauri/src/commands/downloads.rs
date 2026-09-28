@@ -149,7 +149,7 @@ fn start_downloads_attempt(
         let mut failed: Vec<Track> = Vec::new();
         for track in pending {
             let dest = downloads.path(&track.id);
-            let err = match rift::fetch::fetch_bytes(&player.rp, &player.http, &track.id).await {
+            let err = match rift::fetch::fetch_bytes(&track.id).await {
                 Ok((data, _)) => {
                     // Temp file + rename: a crash mid-write must not leave a
                     // truncated .m4a, which the next launch's directory scan

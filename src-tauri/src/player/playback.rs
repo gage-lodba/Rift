@@ -3,8 +3,7 @@
 
 use std::sync::Mutex;
 
-use rift_types::{events, ArtistRef, PlaybackState, Progress, Track};
-use rustypipe::client::RustyPipe;
+use rift_types::{events, PlaybackState, Progress, Track};
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, error, info};
 
@@ -76,7 +75,7 @@ pub(crate) fn start_playback(app: &AppHandle, index: usize) {
     emit_queue(&app, &shared);
 
     tauri::async_runtime::spawn(async move {
-        match rift::fetch::fetch_track(&shared.rp, &shared.http, &downloads.dir, &track.id).await {
+        match rift::fetch::fetch_track(&downloads.dir, &track.id).await {
             Ok((data, duration)) => {
                 {
                     let mut core = shared.core.lock_safe();
@@ -146,37 +145,26 @@ pub(crate) fn start_playback(app: &AppHandle, index: usize) {
 /// Backfill per-artist credits (with channel IDs) for a track saved before
 /// they were stored. Returns `true` if anything changed. Tracks that already
 /// have credits, or whose lookup fails, are left untouched.
-async fn enrich_track(rp: &RustyPipe, track: &mut Track) -> bool {
+async fn enrich_track(yt: &rift_ytmusic::Client, track: &mut Track) -> bool {
     if !track.artists.is_empty() {
         return false;
     }
-    let details = match rp.query().music_details(&track.id).await {
-        Ok(d) => d,
+    let (artists, album, album_id) = match yt.track_credits(&track.id).await {
+        Ok(c) => c,
         Err(e) => {
             debug!("could not enrich {}: {e}", track.id);
             return false;
         }
     };
-    let item = details.track;
-    let artists: Vec<ArtistRef> = item
-        .artists
-        .iter()
-        .map(|a| ArtistRef {
-            id: a.id.clone(),
-            name: a.name.clone(),
-        })
-        .collect();
     if artists.is_empty() {
         return false;
     }
     track.artists = artists;
     if track.album_id.is_none() {
-        if let Some(al) = item.album {
-            if track.album.is_none() {
-                track.album = Some(al.name);
-            }
-            track.album_id = Some(al.id);
+        if track.album.is_none() {
+            track.album = album;
         }
+        track.album_id = album_id;
     }
     true
 }
@@ -195,7 +183,7 @@ async fn announce_track(
 ) {
     app.state::<AppState>().media.set_track(&track, dur);
 
-    if enrich_track(&shared.rp, &mut track).await {
+    if enrich_track(&shared.yt, &mut track).await {
         {
             let mut core = shared.core.lock_safe();
             if let Some(slot) = core.queue.get_mut(index) {
@@ -247,7 +235,7 @@ pub(crate) fn begin_crossfade(app: &AppHandle) {
         let Some(track) = shared.core.lock_safe().queue.get(index).cloned() else {
             return;
         };
-        match rift::fetch::fetch_track(&shared.rp, &shared.http, &downloads.dir, &track.id).await {
+        match rift::fetch::fetch_track(&downloads.dir, &track.id).await {
             Ok((data, duration)) => {
                 let dur = {
                     let mut core = shared.core.lock_safe();

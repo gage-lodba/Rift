@@ -3,9 +3,7 @@
 
 use rift_types::{events, PlaybackState, Progress, Track};
 use tauri::{AppHandle, Emitter, State};
-use tracing::warn;
 
-use super::convert::{convert, is_audio_track};
 use crate::audio::AudioCmd;
 use crate::player;
 use crate::util::LockExt;
@@ -40,8 +38,8 @@ pub async fn play_tracks(
     Ok(())
 }
 
-/// Play a single track. With `radio`, the queue is then filled with YouTube
-/// Music's related-tracks radio for endless playback.
+/// Play a single track. (`radio` is accepted for frontend compatibility but
+/// the related-tracks radio queue is not implemented by the current client.)
 #[tauri::command(rename_all = "snake_case")]
 pub async fn play_track(
     track: Track,
@@ -54,45 +52,16 @@ pub async fn play_track(
     if crate::settings::preview_mode() {
         return Ok(());
     }
-    let epoch = {
+    let _ = radio;
+    {
         let mut core = state.player.core.lock_safe();
-        core.queue = vec![track.clone()];
+        core.queue = vec![track];
         core.source = None;
         core.shuffle_history.clear();
         core.shuffle_cursor = 0;
         core.epoch += 1;
-        core.epoch
-    };
-    player::play_index(&app, 0);
-
-    if radio {
-        let shared = state.player.clone();
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            match shared.rp.query().music_radio_track(&track.id).await {
-                Ok(paginator) => {
-                    {
-                        let mut core = shared.core.lock_safe();
-                        if core.epoch != epoch {
-                            return; // queue was replaced meanwhile
-                        }
-                        let have: std::collections::HashSet<String> =
-                            core.queue.iter().map(|t| t.id.clone()).collect();
-                        core.queue.extend(
-                            paginator
-                                .items
-                                .into_iter()
-                                .filter(is_audio_track)
-                                .map(convert)
-                                .filter(|t| !have.contains(&t.id)),
-                        );
-                    }
-                    player::emit_queue(&app, &shared);
-                }
-                Err(e) => warn!("radio fill failed: {e}"),
-            }
-        });
     }
+    player::play_index(&app, 0);
     Ok(())
 }
 

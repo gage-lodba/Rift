@@ -3,7 +3,7 @@ resolver = "2"
 members = ["types", "ui", "src-tauri", "crates/ytmusic"]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 

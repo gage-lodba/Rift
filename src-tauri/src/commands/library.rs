@@ -6,7 +6,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tracing::{info, warn};
 
-use super::convert::{convert, is_audio_track, MAX_FETCH_TRACKS};
+use super::convert::{is_audio_track, MAX_FETCH_TRACKS};
 use super::downloads::start_downloads;
 use crate::util::LockExt;
 use crate::AppState;
@@ -75,32 +75,25 @@ pub async fn import_yt_playlist(
         .ok_or_else(|| "Couldn't find a playlist ID in that link.".to_string())?;
     info!("importing playlist {id}");
 
-    let q = state.player.rp.query();
-    let mut pl = q
-        .music_playlist(&id)
+    let pl = state
+        .player
+        .yt
+        .playlist(&id, MAX_FETCH_TRACKS)
         .await
         .map_err(|e| format!("could not load playlist: {e}"))?;
-    // Pull beyond the first page so long playlists import in full (bounded).
-    // A continuation failure still imports what loaded, but shouldn't be silent.
-    if let Err(e) = pl.tracks.extend_limit(&q, MAX_FETCH_TRACKS).await {
-        warn!("playlist continuation failed; importing a partial list: {e}");
-    }
 
-    let tracks: Vec<Track> = pl
-        .tracks
-        .items
-        .into_iter()
-        .filter(is_audio_track)
-        .map(convert)
-        .collect();
+    let Playlist {
+        name, mut tracks, ..
+    } = pl;
+    tracks.retain(is_audio_track);
     if tracks.is_empty() {
         return Err("That playlist has no playable songs.".into());
     }
 
-    let name = if pl.name.trim().is_empty() {
+    let name = if name.trim().is_empty() {
         "Imported playlist".to_string()
     } else {
-        pl.name
+        name
     };
     let playlist = {
         let mut lib = state.library.lock_safe();

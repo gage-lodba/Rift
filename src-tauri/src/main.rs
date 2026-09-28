@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use downloads::Downloads;
 use library::LibraryStore;
 use player::{PlayerCore, PlayerShared};
-use rustypipe::client::RustyPipe;
 use settings::SettingsStore;
 use tauri::Manager;
 use tracing_subscriber::EnvFilter;
@@ -37,7 +36,7 @@ fn main() {
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 // The binary crate is `rift_music`; the library is `rift`.
-                .unwrap_or_else(|_| EnvFilter::new("rift=debug,rift_music=debug,rustypipe=info")),
+                .unwrap_or_else(|_| EnvFilter::new("rift=debug,rift_music=debug")),
         )
         .init();
 
@@ -60,7 +59,7 @@ fn main() {
             std::fs::create_dir_all(&data_dir)?;
             tracing::info!("data dir: {}", data_dir.display());
 
-            let rp = RustyPipe::builder().storage_dir(&data_dir).build()?;
+            let yt = rift_ytmusic::Client::new()?;
             let library = Arc::new(Mutex::new(LibraryStore::load(&data_dir)));
             let downloads = Arc::new(Downloads::load(data_dir.join("downloads")));
             let settings = SettingsStore::load(&data_dir);
@@ -108,7 +107,7 @@ fn main() {
             let player = Arc::new(PlayerShared {
                 core: Mutex::new(core),
                 audio: audio_tx,
-                rp,
+                yt,
                 http: reqwest::Client::new(),
                 playback_path,
                 persist: util::Persister::spawn(),

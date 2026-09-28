@@ -1,35 +1,26 @@
 //! Search and catalog-browsing commands (tracks, artists, albums).
 
+use std::collections::HashMap;
+
 use rift_types::{AlbumPage, AlbumSummary, ArtistPage, ArtistSummary, Track};
 use tauri::State;
-use tracing::{info, warn};
+use tracing::info;
 
-use super::convert::{
-    album_type_label, convert, convert_album_item, convert_artists, is_audio_track, join_artists,
-    thumb, MAX_FETCH_TRACKS,
-};
+use super::convert::{is_audio_track, MAX_FETCH_TRACKS};
 use crate::AppState;
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn search(query: String, state: State<'_, AppState>) -> Result<Vec<Track>, String> {
     info!("searching: {query}");
-    let result = state
+    let tracks = state
         .player
-        .rp
-        .query()
-        .music_search_tracks(&query)
+        .yt
+        .search_tracks(&query)
         .await
         .map_err(|e| format!("search failed: {e}"))?;
-    // Keep official YouTube Music audio tracks only: drop music videos and
-    // podcast episodes by type, then also drop entries that slip through typed
-    // as tracks but are titled as the "Official Video" upload.
-    Ok(result
-        .items
-        .items
-        .into_iter()
-        .filter(is_audio_track)
-        .map(convert)
-        .collect())
+    // Keep audio tracks only: drop "Official Video" uploads that slip through
+    // typed as plain tracks.
+    Ok(tracks.into_iter().filter(is_audio_track).collect())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -37,24 +28,12 @@ pub async fn search_artists(
     query: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ArtistSummary>, String> {
-    let result = state
+    state
         .player
-        .rp
-        .query()
-        .music_search_artists(&query)
+        .yt
+        .search_artists(&query)
         .await
-        .map_err(|e| format!("artist search failed: {e}"))?;
-    Ok(result
-        .items
-        .items
-        .into_iter()
-        .map(|a| ArtistSummary {
-            avatar: thumb(&a.avatar),
-            id: a.id,
-            name: a.name,
-            subscribers: a.subscriber_count,
-        })
-        .collect())
+        .map_err(|e| format!("artist search failed: {e}"))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -62,144 +41,68 @@ pub async fn search_albums(
     query: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<AlbumSummary>, String> {
-    let result = state
+    state
         .player
-        .rp
-        .query()
-        .music_search_albums(&query)
+        .yt
+        .search_albums(&query)
         .await
-        .map_err(|e| format!("album search failed: {e}"))?;
-    Ok(result
-        .items
-        .items
-        .into_iter()
-        .map(convert_album_item)
-        .collect())
+        .map_err(|e| format!("album search failed: {e}"))
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_artist(id: String, state: State<'_, AppState>) -> Result<ArtistPage, String> {
-    let artist = state
+    let mut page = state
         .player
-        .rp
-        .query()
-        .music_artist(&id, false)
+        .yt
+        .artist(&id)
         .await
         .map_err(|e| format!("could not load artist: {e}"))?;
-
-    // Drop "Official Video" uploads so Top songs shows audio tracks, not the
-    // duplicate music-video versions (which the artist endpoint mixes in).
-    let mut tracks: Vec<Track> = artist
-        .tracks
-        .into_iter()
-        .filter(is_audio_track)
-        .map(convert)
-        .collect();
-
-    // Artist-page top tracks come back without durations (rustypipe only
-    // populates `duration` from search/album/playlist endpoints). Backfill them
-    // from the artist's tracks playlist, which does carry durations.
-    if tracks.iter().any(|t| t.duration.is_none()) {
-        if let Some(pl_id) = &artist.tracks_playlist_id {
-            if let Ok(pl) = state.player.rp.query().music_playlist(pl_id).await {
-                let durations: std::collections::HashMap<String, u32> = pl
-                    .tracks
-                    .items
-                    .into_iter()
-                    .filter_map(|t| t.duration.map(|d| (t.id, d)))
-                    .collect();
-                for t in tracks.iter_mut().filter(|t| t.duration.is_none()) {
-                    t.duration = durations.get(&t.id).copied();
-                }
-            }
-        }
-    }
-
-    Ok(ArtistPage {
-        image: thumb(&artist.header_image),
-        id: artist.id,
-        name: artist.name,
-        description: artist.description,
-        subscribers: artist.subscriber_count,
-        tracks,
-        albums: artist.albums.into_iter().map(convert_album_item).collect(),
-        tracks_playlist_id: artist.tracks_playlist_id,
-    })
+    page.tracks.retain(is_audio_track);
+    Ok(page)
 }
 
-/// Load an artist's full song catalog (the list behind "Show all songs"),
-/// filtered the same way as the artist page so it stays audio-tracks-only.
-///
-/// The catalog playlist YouTube Music exposes carries no per-track album, so we
-/// rebuild it in two cheap-to-expensive passes:
-///   1. Fetch the artist's albums concurrently and map each track ID to its
-///      album — one album page covers ~a dozen songs, so this resolves the bulk.
-///   2. For the stragglers (singles, collabs where the artist is featured,
-///      soundtrack/bonus cuts whose IDs don't match an album page) fall back to
-///      per-track `music_details`, which always reports an album.
+/// Load an artist's full song catalog (the "Show all songs" view), filtered
+/// audio-only. Album attribution is backfilled in two passes.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_artist_songs(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Track>, String> {
-    let shared = state.player.clone();
-    let artist = shared
-        .rp
-        .query()
-        .music_artist(&id, false)
+    let page = state
+        .player
+        .yt
+        .artist(&id)
         .await
         .map_err(|e| format!("could not load artist: {e}"))?;
-    let pl_id = artist
+    let pl_id = page
         .tracks_playlist_id
         .ok_or_else(|| "artist has no songs list".to_string())?;
-
-    let q = shared.rp.query();
-    let mut pl = q
-        .music_playlist(&pl_id)
+    let mut songs = state
+        .player
+        .yt
+        .playlist(&pl_id, MAX_FETCH_TRACKS)
         .await
-        .map_err(|e| format!("could not load songs: {e}"))?;
-    // Pull past the first page so prolific artists' catalogs aren't truncated.
-    if let Err(e) = pl.tracks.extend_limit(&q, MAX_FETCH_TRACKS).await {
-        warn!("catalog continuation failed; showing a partial list: {e}");
-    }
-    let mut songs: Vec<Track> = pl
-        .tracks
-        .items
-        .into_iter()
-        .filter(is_audio_track)
-        .map(convert)
-        .collect();
+        .map_err(|e| format!("could not load songs: {e}"))?
+        .tracks;
+    songs.retain(is_audio_track);
 
-    let mut album_of: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
-    // Seed from the artist's top tracks, which already carry albums — catches
-    // singles/EPs that aren't in the main albums list.
-    for t in &artist.tracks {
-        if let Some(al) = &t.album {
+    // Pass 1: album pages. The artist page lists their albums, and one album
+    // page covers ~a dozen songs, so this attributes most of the catalog for a
+    // handful of requests.
+    let mut album_of: HashMap<String, (String, String)> = HashMap::new();
+    let album_ids: Vec<String> = page.albums.iter().map(|a| a.id.clone()).collect();
+    let pages = bounded_for_each(album_ids, |id| {
+        let yt = state.player.yt.clone();
+        async move { yt.album(&id).await.ok() }
+    })
+    .await;
+    for album in pages.into_iter().flatten() {
+        for t in &album.tracks {
             album_of
                 .entry(t.id.clone())
-                .or_insert_with(|| (al.name.clone(), al.id.clone()));
+                .or_insert_with(|| (album.name.clone(), album.id.clone()));
         }
     }
-
-    // Pass 1: fetch each album page and index track ID -> (album, id). Bounded
-    // so we don't fire dozens of requests at once (YouTube rate-limits, which
-    // would silently drop album coverage).
-    let album_ids = artist.albums.into_iter().map(|a| a.id);
-    bounded_for_each(album_ids, |id| {
-        let shared = shared.clone();
-        async move { shared.rp.query().music_album(&id).await.ok() }
-    })
-    .await
-    .into_iter()
-    .flatten()
-    .for_each(|al| {
-        for t in al.tracks {
-            album_of
-                .entry(t.id)
-                .or_insert_with(|| (al.name.clone(), al.id.clone()));
-        }
-    });
     for s in songs.iter_mut().filter(|s| s.album.is_none()) {
         if let Some((name, album_id)) = album_of.get(&s.id) {
             s.album = Some(name.clone());
@@ -207,39 +110,52 @@ pub async fn get_artist_songs(
         }
     }
 
-    // Pass 2: resolve whatever the album pages didn't cover via per-track
-    // details (one request each, only for the songs still missing an album),
-    // bounded the same way.
-    let missing: Vec<String> = songs
+    // Pass 2: ask the catalog itself about whatever is still unattributed —
+    // singles, features, and anything else that no album page lists. Each
+    // straggler costs one `/next` request, so this is bounded; the remainder
+    // keeps a `None` album, which the UI already renders without one.
+    let stragglers: Vec<(usize, String)> = songs
         .iter()
-        .filter(|s| s.album.is_none())
-        .map(|s| s.id.clone())
+        .enumerate()
+        .filter(|(_, s)| s.album.is_none())
+        .map(|(i, s)| (i, s.id.clone()))
+        .take(MAX_CREDIT_LOOKUPS)
         .collect();
-    bounded_for_each(missing, |id| {
-        let shared = shared.clone();
-        async move {
-            let album = shared
-                .rp
-                .query()
-                .music_details(&id)
-                .await
-                .ok()
-                .and_then(|d| d.track.album);
-            album.map(|al| (id, al.name, al.id))
-        }
+    if !stragglers.is_empty() {
+        info!(
+            "backfilling album for {} song(s) via track credits",
+            stragglers.len()
+        );
+    }
+    let credits = bounded_for_each(stragglers, |(index, video_id)| {
+        let yt = state.player.yt.clone();
+        async move { (index, yt.track_credits(&video_id).await.ok()) }
     })
-    .await
-    .into_iter()
-    .flatten()
-    .for_each(|(id, name, album_id)| {
-        if let Some(s) = songs.iter_mut().find(|s| s.id == id && s.album.is_none()) {
-            s.album = Some(name);
-            s.album_id = Some(album_id);
+    .await;
+    for (index, credit) in credits {
+        let Some((artists, album, album_id)) = credit else {
+            continue;
+        };
+        let Some(song) = songs.get_mut(index) else {
+            continue;
+        };
+        song.album = album;
+        song.album_id = album_id;
+        // A playlist row carries one flattened artist string; the credits carry
+        // each artist as a linkable reference, which is what the UI needs to
+        // offer per-artist navigation.
+        if !artists.is_empty() {
+            song.artists = artists;
         }
-    });
+    }
 
     Ok(songs)
 }
+
+/// Cap on per-track credits lookups when backfilling an artist's catalog. Each
+/// lookup is one request, so this bounds the worst case for an artist whose
+/// back catalogue mostly misses their own album pages.
+const MAX_CREDIT_LOOKUPS: usize = 40;
 
 /// Run an async `task` over each item with at most [`MAX_INFLIGHT`] in flight at
 /// once, collecting the results (order not preserved). Keeps fan-out network
@@ -272,51 +188,12 @@ where
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_album(id: String, state: State<'_, AppState>) -> Result<AlbumPage, String> {
-    let album = state
+    let mut page = state
         .player
-        .rp
-        .query()
-        .music_album(&id)
+        .yt
+        .album(&id)
         .await
         .map_err(|e| format!("could not load album: {e}"))?;
-
-    let cover = thumb(&album.cover);
-    let album_artist = join_artists(&album.artists);
-    let artist_id = album
-        .artist_id
-        .clone()
-        .or_else(|| album.artists.iter().find_map(|a| a.id.clone()));
-
-    // Album track items often omit the cover (and sometimes artists);
-    // inherit them from the album.
-    let tracks = album
-        .tracks
-        .into_iter()
-        .map(|item| {
-            let mut t = convert(item);
-            if t.cover.is_empty() {
-                t.cover = cover.clone();
-            }
-            if t.artists.is_empty() && !album.by_va {
-                t.artist = album_artist.clone();
-                t.artists = convert_artists(&album.artists);
-            }
-            if t.album.is_none() {
-                t.album = Some(album.name.clone());
-                t.album_id = Some(album.id.clone());
-            }
-            t
-        })
-        .collect();
-
-    Ok(AlbumPage {
-        id: album.id,
-        name: album.name,
-        cover,
-        artist: album_artist,
-        artist_id,
-        year: album.year,
-        album_type: album_type_label(album.album_type),
-        tracks,
-    })
+    page.tracks.retain(is_audio_track);
+    Ok(page)
 }

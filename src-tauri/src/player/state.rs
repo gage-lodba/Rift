@@ -5,7 +5,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 use rift_types::{events, PlaybackState, QueueSnapshot, RepeatMode, Track};
-use rustypipe::client::RustyPipe;
+use rift_ytmusic::Client;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio::AudioCmd;
@@ -78,7 +78,7 @@ impl Default for PlayerCore {
 pub struct PlayerShared {
     pub core: Mutex<PlayerCore>,
     pub audio: Sender<AudioCmd>,
-    pub rp: RustyPipe,
+    pub yt: Client,
     pub http: reqwest::Client,
     /// Where the queue snapshot is persisted so the session is restored on the
     /// next launch.
