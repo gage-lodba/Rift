@@ -2,8 +2,8 @@
 
 > **Status (2026-09-29):** every item below has been triaged and marked
 > **fixed**, **retracted**, or **deferred** with a one-line reason, in
-> `<blockquote>` notes under each heading. The work landed as seven commits,
-> `7df0c81..7ddd789`. Test count went 65 → 101; the four required checks
+> `<blockquote>` notes under each heading. The work landed as eleven commits,
+> `7df0c81..c0e108f`. Test count went 65 → 107; the four required checks
 > (`cargo fmt --all -- --check`, both clippy passes, and
 > `cargo test --workspace --exclude rift-ui --locked`) are clean.
 >
@@ -15,10 +15,20 @@
 > panic and `fetch_track` dedup bug, and the `artist.json` "Singles & EPs"
 > downgrade, stand as recorded at the bottom.
 >
+> **Three defects were introduced by these fixes and then caught**, which is its
+> own finding about how the review verified things. M6's ACL work was "verified"
+> by reading the generated artifacts rather than running the resolution, and
+> shipped a capability that granted *nothing* — the app started with an empty
+> library and the only clue was `bootstrap not allowed` in a console the review
+> never looked at. The `play_track` call-site breakage was the same shape:
+> certified once by hand, invalidated by a later local change. Both now have
+> tests that run the real machinery (`acl_covers_commands.rs`,
+> `ipc_contract.rs`). The third, in my own SHA-256, was caught by a test written
+> for it.
+>
 > **Deferred, with reasons:** L7 (regex caching), L10 (typed UGC signal), M10
-> (shuffle-history remapping), and the `with_extension` shape in M9. Each is a
-> behaviour or performance change rather than a defect, and each is noted at its
-> item.
+> (shuffle-history remapping), L16's `rust-version`, the `with_extension` shape
+> in M9, and L17's `client.rs` transport tests. Each is noted at its item.
 
 Scope: every tracked source file (`src-tauri/`, `crates/ytmusic/`, `types/`, `ui/`,
 `docs/`, `.github/`, manifests). HEAD `a4b8d30` plus the uncommitted player diff.
@@ -271,7 +281,30 @@ empty query, so clearing the box leaves the old results rendered under
 
 ### M6. `withGlobalTauri` + app commands outside the ACL is a wide surface
 
-> **FIXED** (`f323ed1`). `build.rs` declares an app ACL manifest listing all 47 commands, which � confirmed against the Tauri source � is what *enables* enforcement for app commands; `capabilities/default.json` grants them via `permissions/default.toml`. Cross-checked programmatically against `invoke_handler`. `set_yt_dlp_path` validates through `validate_ytdlp_override` (absolute, canonicalized, regular file). One correction: the review's suggested remedy does not match the code � the path comes from a free-text field, not the native dialog, so "require a file chosen through the dialog" would have meant rewriting the Settings control.
+> **FIXED** (`f323ed1`) — **then found broken and fixed again** (`c0e108f`). `build.rs` declares
+> an app ACL manifest listing all 47 commands, which (confirmed against the Tauri source) is what
+> *enables* enforcement for app commands; `capabilities/default.json` grants them. `set_yt_dlp_path`
+> validates through `validate_ytdlp_override` (absolute, canonicalized, regular file). One correction: the
+> review's suggested remedy does not match the code — the path comes from a free-text field, not the
+> native dialog, so "require a file chosen through the dialog" would have meant rewriting the Settings
+> control.
+>
+> **The regression is worth recording in full, because the verification method was itself the bug.**
+> `permissions/default.toml` was written as `[[set]] identifier = "default"`, which populates
+> `Manifest::permission_sets`. Tauri resolves the literal identifier `default` by consulting *only*
+> `Manifest::default_permission` (`tauri-utils/src/acl/resolved.rs`, `get_permissions`), so "default"
+> in the capability resolved to **zero** permissions and all 46 commands were rejected at runtime. The
+> user reported it as "all my playlists are gone", because `bootstrap` was among them and the UI never
+> received the library. It failed silently: `tauri-build` validates that the permission *name* exists, and
+> a permission set named `default` does exist, so the build was clean and the capability read as correct.
+>
+> I had "verified" this by reading the generated artifacts — `acl-manifests.json` showing the set with
+> all 46 entries, `capabilities.json` showing "default" granted. Both were true, and neither says
+> anything about what the *resolution* produces. **Reading the artifacts is not running the code.** It was
+> checkable only by calling `Resolved::resolve`, which is what Tauri does at startup;
+> `src-tauri/tests/acl_covers_commands.rs` now does that and is verified to catch the original bug. The
+> lesson generalises: anywhere this document describes a check as "read the config and confirmed", the
+> check is weaker than it reads.
 `src-tauri/tauri.conf.json:19`, `src-tauri/build.rs:1-3`, `commands/ytdlp.rs:21-32`
 
 `withGlobalTauri: true` is required by `ui/src/api.rs:12`, so it is intentional.
@@ -694,17 +727,19 @@ Issues this session surfaced that were not in the original review. None is
 currently a defect in shipped behaviour; they are recorded so the next pass
 starts from the code rather than from scratch.
 
-- **The "IPC contract: PASS" above is no longer a re-read, and it caught
-  something.** Removing `play_track`'s unused `radio` parameter (L4) left the
-  frontend sending `"radio": false`; both sides compiled and the command would
-  have failed at runtime for every single-track play. The check is now
-  `src-tauri/tests/ipc_contract.rs` (3 tests, `f8e8f0d`): it reads both sides as
-  text, since nothing in the type system connects a `json!({...})` key to a
-  command parameter name. Re-derived from scratch it found that one mismatch and
-  nothing else — all 42 frontend commands are registered and every argument key
-  matches. This is the argument for automating a check the review otherwise
-  performed by hand: it was certified correct once and a later local change
-  invalidated it silently.
+- **Two checks in this document were validated by reading artifacts rather than
+  running code, and one of them shipped a broken build.** The ACL above is the
+  case in point; the `play_track` call-site breakage is the same shape. Both now
+  have tests that execute the real machinery:
+  `src-tauri/tests/acl_covers_commands.rs` (3 tests, `c0e108f`) resolves the ACL
+  exactly as Tauri does at startup, and `src-tauri/tests/ipc_contract.rs`
+  (3 tests, `f8e8f0d`) reads both sides of the IPC seam. Between them they found
+  two real regressions; neither was visible to the compiler.
+- **`bootstrap not allowed` was reported by a user, not by CI — and could have
+  been.** Everything about that failure was detectable from `cargo test`: the
+  generated artifacts are on disk after a build, and the resolution is a library
+  call. The gap was that nothing asserted the *runtime* consequence of the ACL,
+  only that its inputs looked right.
 - **`uploader`/`channel`-style rows are still filtered by title substring**
   (`commands/convert.rs`) — see the deferred L10 above. The blocker is that the
   typed signal does not travel with imported playlists.
@@ -717,6 +752,8 @@ starts from the code rather than from scratch.
   are in Yew components and carry no test, for this reason. `wasm-bindgen-test`
   plus a headless runner in CI is the missing piece, and it would also let the
   focus and keyboard work in Phase 5 be asserted rather than built-and-eyeballed.
+  Note this is also why the ACL failure looked like a data-loss bug to the user
+  rather than a config bug: nothing exercised the frontend against the backend.
 - **The `ui` clippy pass needs `wasm32-unknown-unknown`; `trunk build` needs
   `NO_COLOR` set to a value trunk accepts.** Trunk 0.21 rejects `NO_COLOR=1`
   ("invalid value '1' for '--no-color'"). CI does not set it, so this only bites
@@ -726,4 +763,9 @@ starts from the code rather than from scratch.
   session (it compiles the release profile with LTO). The flag is present in the
   installed CLI and the config parses under `generate_context!`, but the first
   CI run is what actually exercises it.
+- **A stale generated permission file survives a command removal.**
+  `src-tauri/permissions/autogenerated/queue_add_tracks.toml` is still on disk
+  after the command was deleted (L5); it is harmless because nothing grants it,
+  and it is gitignored, but `verify` never prunes files for commands that no
+  longer exist. Worth a `git clean`-style note in the build docs.
 
