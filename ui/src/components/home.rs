@@ -26,11 +26,11 @@ pub fn home_view(props: &HomeProps) -> Html {
         let on_nav = props.on_nav.clone();
         let v = view.clone();
         html! {
-            <div class="card" onclick={Callback::from(move |_| on_nav.emit(v.clone()))}>
+            <button class="card" onclick={Callback::from(move |_| on_nav.emit(v.clone()))}>
                 { cover(cover_url, "card-cover") }
                 <div class="card-name">{ name }</div>
                 <div class="card-sub">{ format!("{count} songs") }</div>
-            </div>
+            </button>
         }
     };
 
@@ -68,18 +68,20 @@ pub fn home_view(props: &HomeProps) -> Html {
                         },
                     ];
                     html! {
-                        <div class="card" onclick={Callback::from(move |_| on_nav.emit(v.clone()))}>
+                        <button class="card" onclick={Callback::from(move |_| on_nav.emit(v.clone()))}>
                             { cover(cover_url, "card-cover") }
                             <div class="card-foot">
                                 <div class="card-text">
                                     <div class="card-name">{ &p.name }</div>
                                     <div class="card-sub">{ format!("{} songs", p.tracks.len()) }</div>
                                 </div>
-                                <div class="card-menu">
+                                // The kebab is its own button; stop the click
+                                // from bubbling into the card's navigation.
+                                <div class="card-menu" onclick={|e: MouseEvent| e.stop_propagation()}>
                                     <MenuButton actions={actions} align_right=true />
                                 </div>
                             </div>
-                        </div>
+                        </button>
                     }
                 }) }
             </div>

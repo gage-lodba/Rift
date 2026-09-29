@@ -147,6 +147,8 @@ pub fn player_bar(props: &PlayerBarProps) -> Html {
                 <input class="seek" type="range" min="0" step="1"
                        max={format!("{}", duration as u64)}
                        value={format!("{}", seek_pos as u64)}
+                       aria-label="Seek"
+                       aria-valuetext={format!("{} of {}", fmt_pos(seek_pos), fmt_pos(dur))}
                        oninput={seek_input} onchange={seek_commit} />
                 <span class="time">{ fmt_pos(dur) }</span>
             </div>
@@ -186,6 +188,8 @@ pub fn player_bar(props: &PlayerBarProps) -> Html {
                     { icon("volume") }
                     <input class="vol-slider" type="range" min="0" max="100"
                            value={format!("{}", (props.volume * 100.0) as u32)}
+                           aria-label="Volume"
+                           aria-valuetext={format!("{}%", (props.volume * 100.0) as u32)}
                            oninput={set_volume} onchange={save_volume} />
                 </div>
             </div>

@@ -122,20 +122,36 @@ struct TrackRowProps {
 #[function_component(TrackRow)]
 fn track_row(props: &TrackRowProps) -> Html {
     let menu_open = use_state(|| false);
+    // Where Escape returns focus after the right-click/kebab menu closes.
+    let row = use_node_ref();
     let t = &props.track;
     let i = props.index;
     // Offline, a track that isn't downloaded can't be streamed: grey it out and
     // make the row inert for playback.
     let available = props.online || props.downloaded;
 
-    let play = {
+    // The row is a role="button" rather than a real `<button>`: it contains its
+    // own buttons (like, kebab, download) and a draggable reorder handle, and
+    // nesting interactive elements inside a button is invalid. A role plus
+    // `tabindex` gets the same keyboard behaviour with Enter/Space activation.
+    let activate = {
         let cb = props.on_play.clone();
-        Callback::from(move |_: MouseEvent| {
+        Callback::from(move |_: ()| {
             if available {
                 cb.emit(i);
             }
         })
     };
+    let play = {
+        let activate = activate.clone();
+        Callback::from(move |_: MouseEvent| activate.emit(()))
+    };
+    let onkeydown = Callback::from(move |e: KeyboardEvent| {
+        if e.key() == "Enter" || e.key() == " " {
+            e.prevent_default();
+            activate.emit(());
+        }
+    });
     let context = {
         let menu_open = menu_open.clone();
         Callback::from(move |e: MouseEvent| {
@@ -309,7 +325,9 @@ fn track_row(props: &TrackRowProps) -> Html {
     html! {
         <div class={classes!("trow", props.playing.then_some("playing"), (*menu_open).then_some("menu-open"), (!available).then_some("unavailable"))}
              title={(!available).then_some("Unavailable offline — not downloaded")}
-             onclick={play} oncontextmenu={context}>
+             role="button" tabindex="0" ref={row.clone()}
+             aria-disabled={(!available).to_string()}
+             onclick={play} onkeydown={onkeydown} oncontextmenu={context}>
             { cover(&t.cover, "trow-cover") }
             <div class="trow-meta">
                 <div class="trow-title">{ &t.title }</div>
@@ -319,7 +337,10 @@ fn track_row(props: &TrackRowProps) -> Html {
             </div>
             <div class="trow-album">
                 if let (Some(album), Some(open_album)) = (t.album.clone(), open_album) {
-                    <span class="link" onclick={open_album}>{ album }</span>
+                    // A real button so the album is reachable and activatable
+                    // by keyboard; the row's own activation is suppressed by
+                    // `stop_propagation` in `open_album`.
+                    <button class="link" onclick={open_album}>{ album }</button>
                 } else {
                     { t.album.clone().unwrap_or_default() }
                 }
@@ -358,7 +379,8 @@ fn track_row(props: &TrackRowProps) -> Html {
                         onclick={like}>{ icon(if props.liked { "heart" } else { "heart-outline" }) }</button>
                 <div class="menu-anchor">
                     <button class="ibtn" title="More" onclick={toggle_menu}>{ icon("kebab") }</button>
-                    <Menu open={*menu_open} on_close={close_menu} actions={actions} align_right=true />
+                    <Menu open={*menu_open} on_close={close_menu} actions={actions} align_right=true
+                          anchor={Some(row)} />
                 </div>
             </div>
         </div>

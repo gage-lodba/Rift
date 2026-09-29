@@ -125,15 +125,58 @@ pub fn sidebar(props: &SidebarProps) -> Html {
             *resizing.borrow_mut() = true;
         })
     };
+    // Keyboard resizing: the handle is a separator, so arrow keys move it and
+    // Home/End jump to the bounds. Persisted on every step, so the width sticks
+    // the same way a completed drag does.
+    let resize_key = {
+        let width = width.clone();
+        let width_ref = width_ref.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            let step = if e.shift_key() { 32.0 } else { 8.0 };
+            let current = *width_ref.borrow();
+            let next = match e.key().as_str() {
+                "ArrowLeft" => (current - step).max(SIDEBAR_MIN_W),
+                "ArrowRight" => (current + step).min(SIDEBAR_MAX_W),
+                "Home" => SIDEBAR_MIN_W,
+                "End" => SIDEBAR_MAX_W,
+                _ => return,
+            };
+            e.prevent_default();
+            *width_ref.borrow_mut() = next;
+            width.set(next);
+            if let Some(s) = local_storage() {
+                let _ = s.set_item(SIDEBAR_W_KEY, &next.to_string());
+            }
+        })
+    };
 
     let nav = |view: View| {
         let on_nav = props.on_nav.clone();
         Callback::from(move |_: MouseEvent| on_nav.emit(view.clone()))
     };
+    // Same navigation, reachable from the keyboard.
+    let nav_key = |view: View| {
+        let on_nav = props.on_nav.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" || e.key() == " " {
+                e.prevent_default();
+                on_nav.emit(view.clone());
+            }
+        })
+    };
 
     let start_create = {
         let creating = creating.clone();
         Callback::from(move |_: MouseEvent| creating.set(true))
+    };
+    let create_key = {
+        let creating = creating.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" || e.key() == " " {
+                e.prevent_default();
+                creating.set(true);
+            }
+        })
     };
     // Read the draft name and create the playlist if it isn't blank.
     let submit_create = {
@@ -171,6 +214,28 @@ pub fn sidebar(props: &SidebarProps) -> Html {
     let start_import = {
         let importing = importing.clone();
         Callback::from(move |_: MouseEvent| importing.set(true))
+    };
+    let import_key = {
+        let importing = importing.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" || e.key() == " " {
+                e.prevent_default();
+                importing.set(true);
+            }
+        })
+    };
+    let import_file = {
+        let cb = props.on_import_file.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
+    let import_file_key = {
+        let cb = props.on_import_file.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" || e.key() == " " {
+                e.prevent_default();
+                cb.emit(());
+            }
+        })
     };
     // Read the pasted link/ID and kick off the import if it isn't blank.
     let submit_import = {
@@ -222,12 +287,20 @@ pub fn sidebar(props: &SidebarProps) -> Html {
 
     html! {
         <nav class="sidebar" style={format!("width:{}px", *width)}>
-            <div class="side-resizer" onmousedown={start_resize}></div>
+            // The resize handle is drag-only for pointer users; for keyboard
+            // users it is a separator that Left/Right (and Home/End) move.
+            <div class="side-resizer" role="separator" tabindex="0"
+                 aria-orientation="vertical" aria-label="Resize sidebar"
+                 aria-valuemin={SIDEBAR_MIN_W.to_string()} aria-valuemax={SIDEBAR_MAX_W.to_string()}
+                 aria-valuenow={width.round().to_string()}
+                 onmousedown={start_resize} onkeydown={resize_key}></div>
             <div class="side-scroll">
-                <div class={item_class(props.view == View::Home)} onclick={nav(View::Home)}>
+                <div class={item_class(props.view == View::Home)} role="button" tabindex="0"
+                     onclick={nav(View::Home)} onkeydown={nav_key(View::Home)}>
                     { icon("home") }<span>{ "Home" }</span>
                 </div>
-                <div class={item_class(props.view == View::Liked)} onclick={nav(View::Liked)}>
+                <div class={item_class(props.view == View::Liked)} role="button" tabindex="0"
+                     onclick={nav(View::Liked)} onkeydown={nav_key(View::Liked)}>
                     { lead("liked", "heart") }<span class="side-name">{ "Liked Songs" }</span>
                 </div>
 
@@ -271,7 +344,8 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                         </button>
                     </div>
                 } else {
-                    <div class="side-item side-new" onclick={start_create}>
+                    <div class="side-item side-new" role="button" tabindex="0"
+                         onclick={start_create} onkeydown={create_key}>
                         { icon("plus") }<span>{ "New playlist" }</span>
                     </div>
                 }
@@ -293,21 +367,21 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                     </button>
                 </div>
             } else {
-                <div class="side-item side-new" onclick={start_import}>
+                <div class="side-item side-new" role="button" tabindex="0"
+                     onclick={start_import} onkeydown={import_key}>
                     { icon("download") }<span>{ "Import playlist" }</span>
                 </div>
             }
 
-            <div class="side-item side-new" onclick={
-                let cb = props.on_import_file.clone();
-                Callback::from(move |_: MouseEvent| cb.emit(()))
-            }>
+            <div class="side-item side-new" role="button" tabindex="0"
+                 onclick={import_file} onkeydown={import_file_key}>
                 { icon("album") }<span>{ "Import from file" }</span>
             </div>
 
-            <div class="side-divider" />
+            <div class="side-divider" role="separator" />
             <div class={classes!("side-item", "side-settings", (props.view == View::Settings).then_some("active"))}
-                 onclick={nav(View::Settings)}>
+                 role="button" tabindex="0"
+                 onclick={nav(View::Settings)} onkeydown={nav_key(View::Settings)}>
                 { icon("settings") }<span>{ "Settings" }</span>
             </div>
         </nav>
@@ -344,6 +418,16 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
         let cb = props.on_nav.clone();
         let id = props.id.clone();
         Callback::from(move |_: MouseEvent| cb.emit(View::Playlist(id.clone())))
+    };
+    let nav_key = {
+        let cb = props.on_nav.clone();
+        let id = props.id.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" || e.key() == " " {
+                e.prevent_default();
+                cb.emit(View::Playlist(id.clone()));
+            }
+        })
     };
     let context = {
         let menu_open = menu_open.clone();
@@ -406,13 +490,15 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
     html! {
         <div class={classes!("side-item", props.active.then_some("active"), (*menu_open).then_some("menu-open"), props.dragging.then_some("dragging"))}
              style={props.shift.clone()}
-             draggable="true" onclick={nav} oncontextmenu={context}
+             role="button" tabindex="0" aria-current={props.active.then_some("true")}
+             draggable="true" onclick={nav} onkeydown={nav_key} oncontextmenu={context}
              ondragstart={props.on_dragstart.clone()} ondragend={props.on_dragend.clone()}>
             { lead }
             <span class="side-name">{ &props.name }</span>
             <span class="side-count">{ props.count }</span>
             <div class="menu-anchor side-kebab">
-                <button class="ibtn" title="More" onclick={toggle}>{ icon("kebab") }</button>
+                <button class="ibtn" title="More" aria-haspopup="menu" aria-expanded={menu_open.to_string()}
+                        onclick={toggle}>{ icon("kebab") }</button>
                 <Menu open={*menu_open} on_close={close} actions={actions} align_right=true />
             </div>
         </div>

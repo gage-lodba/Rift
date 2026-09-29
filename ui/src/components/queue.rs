@@ -23,10 +23,20 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
     // the empty-queue early return below — a hook called after it would be
     // skipped on the first (empty) render and then demanded on the next one,
     // which trips Yew's hook-order assertion.
-    let toggle = {
+    let flip = {
         let collapsed = collapsed.clone();
-        Callback::from(move |_: MouseEvent| collapsed.set(!*collapsed))
+        Callback::from(move |_: ()| collapsed.set(!*collapsed))
     };
+    let toggle = {
+        let flip = flip.clone();
+        Callback::from(move |_: MouseEvent| flip.emit(()))
+    };
+    let toggle_key = Callback::from(move |e: KeyboardEvent| {
+        if e.key() == "Enter" || e.key() == " " {
+            e.prevent_default();
+            flip.emit(());
+        }
+    });
     // Drag-to-reorder for the queue (shared with the sidebar playlists).
     let reorder = use_reorder(
         props.queue.tracks.iter().map(|t| t.id.clone()).collect(),
@@ -46,7 +56,10 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
 
     html! {
         <section class="queue-panel">
-            <div class="queue-head" onclick={toggle}
+            // The header toggles collapse on click; give it the same keyboard
+            // path rather than leaving the panel mouse-only.
+            <div class="queue-head" role="button" tabindex="0" aria-expanded={(!*collapsed).to_string()}
+                 onclick={toggle} onkeydown={toggle_key}
                  title={if *collapsed { "Expand queue" } else { "Collapse queue" }}>
                 <span class="queue-title">
                     <span class={classes!("queue-caret", (*collapsed).then_some("collapsed"))}>
@@ -62,16 +75,30 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
                      ondragover={reorder.dragover.clone()} ondrop={reorder.drop.clone()}
                      onmousemove={reorder.calm_clear.clone()}>
                     { for props.queue.tracks.iter().enumerate().map(|(i, t)| {
-                        let jump = { let cb = props.on_jump.clone(); Callback::from(move |_| cb.emit(i)) };
+                        let jump = { let cb = props.on_jump.clone(); Callback::from(move |_: ()| cb.emit(i)) };
+                        let onclick = {
+                            let jump = jump.clone();
+                            Callback::from(move |_: MouseEvent| jump.emit(()))
+                        };
+                        let onkeydown = Callback::from(move |e: KeyboardEvent| {
+                            if e.key() == "Enter" || e.key() == " " {
+                                e.prevent_default();
+                                jump.emit(());
+                            }
+                        });
                         let remove = {
                             let cb = props.on_remove.clone();
                             Callback::from(move |e: MouseEvent| { e.stop_propagation(); cb.emit(i); })
                         };
                         let current = props.queue.current == Some(i);
                         html! {
+                            // role/tabindex rather than a real <button>: the row
+                            // carries its own remove button and is a drag
+                            // handle, and nesting those in a button is invalid.
                             <div class={classes!("qrow", current.then_some("current"), reorder.dragging(i).then_some("dragging"))}
                                  style={reorder.shift(i)}
-                                 draggable="true" onclick={jump}
+                                 role="button" tabindex="0" aria-current={current.then_some("true")}
+                                 draggable="true" onclick={onclick} onkeydown={onkeydown}
                                  ondragstart={reorder.dragstart(i)} ondragend={reorder.dragend()}>
                                 { cover(&t.cover, "qrow-cover") }
                                 <div class="trow-meta">

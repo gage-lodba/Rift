@@ -13,6 +13,10 @@
   --accent-dim: #6d28d9;
   /* Failed-download / error affordances. */
   --danger: #e5484d;
+  /* Keyboard focus ring. Bright enough to read against every surface in the
+     theme, and offset so it is visible on elements that sit flush against a
+     card or a row's own background. */
+  --focus: #c4a0ff;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -510,6 +514,14 @@ input[type="range"] { accent-color: var(--accent); }
   border-radius: 8px;
   padding: 10px;
   background: transparent;
+  /* `.card` is a `<button>` (so it is keyboard-reachable); reset the UA's
+     button chrome. `color: inherit` matters — a button does not inherit the
+     page colour, so without it every card's text would fall back to black. */
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  width: 100%;
   transition: background 0.15s;
 }
 .card:hover { background: var(--bg-raised); }
@@ -1019,3 +1031,40 @@ input[type="range"] { accent-color: var(--accent); }
 ::-webkit-scrollbar-thumb { background: #2a2a30; border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: #3a3a42; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ===== keyboard focus =====
+   There was no focus style anywhere in the app and four blanket
+   `outline: none` declarations, so a keyboard user could not see where they
+   were. `:focus-visible` restores an indicator for keyboard navigation while
+   leaving mouse users the clean look the `outline: none`s were for. The
+   element-level rules below are only needed where a component sets its own
+   `outline: none`, since that would otherwise win on specificity ties. */
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Inputs suppress the outline because the wrapper draws the focus ring; keep
+   that intent but make the wrapper show it. */
+.searchbox:focus-within {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 1px var(--focus);
+}
+.searchbox input:focus-visible,
+.side-new-input:focus-visible,
+.rename-input:focus-visible,
+.ytdlp-input:focus-visible {
+  outline: none;
+}
+
+/* Rows and cards are focusable containers; an inset ring reads better than one
+   that bleeds into the neighbouring row. */
+.trow:focus-visible,
+.qrow:focus-visible,
+.side-item:focus-visible,
+.card:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}

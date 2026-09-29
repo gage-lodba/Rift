@@ -34,11 +34,13 @@ pub fn album_grid(albums: &[AlbumSummary], on_open: Callback<String>) -> Html {
                 let cb = on_open.clone();
                 let id = a.id.clone();
                 html! {
-                    <div class="card" onclick={Callback::from(move |_| cb.emit(id.clone()))}>
+                    // A real button, so it is focusable and Enter/Space work
+                    // without a role/tabindex/onkeydown trio to keep in step.
+                    <button class="card" onclick={Callback::from(move |_| cb.emit(id.clone()))}>
                         { cover(&a.cover, "card-cover") }
                         <div class="card-name">{ &a.name }</div>
                         <div class="card-sub">{ album_subtitle(a) }</div>
-                    </div>
+                    </button>
                 }
             }) }
         </div>
@@ -52,11 +54,11 @@ pub fn artist_grid(artists: &[ArtistSummary], on_open: Callback<String>) -> Html
                 let cb = on_open.clone();
                 let id = a.id.clone();
                 html! {
-                    <div class="card card-artist" onclick={Callback::from(move |_| cb.emit(id.clone()))}>
+                    <button class="card card-artist" onclick={Callback::from(move |_| cb.emit(id.clone()))}>
                         { cover(&a.avatar, "card-cover round") }
                         <div class="card-name">{ &a.name }</div>
                         <div class="card-sub">{ a.subscribers.map(format_subs).unwrap_or_default() }</div>
-                    </div>
+                    </button>
                 }
             }) }
         </div>
