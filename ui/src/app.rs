@@ -600,9 +600,9 @@ pub fn app() -> Html {
         })
     };
 
-    // Play one track by itself (no radio fill).
+    // Play one track by itself (replacing the queue).
     let on_play_single = Callback::from(|t: Track| {
-        api::fire("play_track", json!({ "track": t, "radio": false }));
+        api::fire("play_track", json!({ "track": t }));
     });
 
     // Play a full list starting at an index, tagged with where it came from.
