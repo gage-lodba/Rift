@@ -32,18 +32,15 @@ pub async fn play_tracks(
         core.source = source;
         core.shuffle_history.clear();
         core.shuffle_cursor = 0;
-        core.epoch += 1;
     }
     player::play_index(&app, start);
     Ok(())
 }
 
-/// Play a single track. (`radio` is accepted for frontend compatibility but
-/// the related-tracks radio queue is not implemented by the current client.)
+/// Play a single track, replacing the queue with it.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn play_track(
     track: Track,
-    radio: bool,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
@@ -52,14 +49,12 @@ pub async fn play_track(
     if crate::settings::preview_mode() {
         return Ok(());
     }
-    let _ = radio;
     {
         let mut core = state.player.core.lock_safe();
         core.queue = vec![track];
         core.source = None;
         core.shuffle_history.clear();
         core.shuffle_cursor = 0;
-        core.epoch += 1;
     }
     player::play_index(&app, 0);
     Ok(())
@@ -153,14 +148,9 @@ pub fn toggle_shuffle(app: AppHandle, state: State<'_, AppState>) {
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn cycle_repeat(app: AppHandle, state: State<'_, AppState>) {
-    use rift_types::RepeatMode::*;
     {
         let mut core = state.player.core.lock_safe();
-        core.repeat = match core.repeat {
-            Off => All,
-            All => One,
-            One => Off,
-        };
+        crate::player::cycle_repeat(&mut core);
     }
     player::emit_queue(&app, &state.player);
 }

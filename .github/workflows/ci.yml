@@ -18,9 +18,16 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      # Actions are pinned to a commit SHA, with the version in a comment: a tag
+      # is mutable, so `@v5` is a moving target that can be repointed at
+      # arbitrary code without this file changing. Dependabot understands the
+      # comment form and will keep the SHAs current.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
+          # Explicit, and mirrored in rust-toolchain.toml: without it this action
+          # installs whatever `stable` is and CI silently drifts from release.
+          toolchain: 1.98.0
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -35,7 +42,7 @@ jobs:
         # proc-macro-error-attr host dylib (pulled in transitively by yew).
         os: [ubuntu-22.04, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # Tauri v2's Linux build dependencies (note: webkit2gtk 4.1, not 4.0).
       # macOS and Windows ship the needed webview + audio backends already.
@@ -54,17 +61,18 @@ jobs:
             patchelf \
             file
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
+          toolchain: 1.98.0
           components: clippy
           targets: wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       # Prebuilt trunk binary via taiki-e/install-action (a composite action, so
       # no deprecated Node runtime); pinned to a specific trunk version.
       - name: Install trunk
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: trunk@0.21.14
 
@@ -82,3 +90,22 @@ jobs:
 
       - name: Test (backend)
         run: cargo test --workspace --exclude rift-ui --locked
+
+      # Two major versions of the same crate in one binary means duplicated
+      # types, two TLS stacks, and a bigger install for no reason. The script
+      # narrows `cargo tree -d` to genuinely distinct versions (it also reports
+      # one version split across feature sets) and compares against the
+      # recorded baseline, because `cargo tree -d` exits 0 either way.
+      - name: Check for duplicate dependency versions
+        run: .github/scripts/check-duplicate-deps.sh
+
+      # Compile the packaged artifact. Clippy already links the crate, so a
+      # broken tauri.conf.json is caught there — but the release profile
+      # (lto/codegen-units) and the bundle inputs the *linker* does not read
+      # (icons, mainBinaryName, NSIS/WiX prerequisites) are otherwise exercised
+      # only on a tag push, which surfaces a malformed icon or a bad
+      # `targets: "all"` at release time on the wrong commit. `--no-bundle`
+      # keeps it to a compile, so no packaging toolchain is needed.
+      - name: Build the app (no bundle)
+        working-directory: src-tauri
+        run: cargo tauri build --no-bundle

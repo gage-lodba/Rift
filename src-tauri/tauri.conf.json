@@ -47,6 +47,10 @@
       "icons/icon.ico"
     ],
     "category": "Music",
-    "shortDescription": "An ad-free YouTube Music player"
+    "shortDescription": "An ad-free YouTube Music player",
+    "longDescription": "Rift is an ad-free desktop player for YouTube Music, with an offline library, playlists, crossfade, shuffle and Discord Rich Presence.",
+    "publisher": "Gage Lodba",
+    "copyright": "Copyright © 2026 Gage Lodba",
+    "licenseFile": "../LICENSE"
   }
 }

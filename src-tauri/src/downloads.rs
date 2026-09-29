@@ -124,15 +124,19 @@ impl Downloads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::testing::TempDir;
 
-    fn temp_downloads() -> Downloads {
-        let dir = std::env::temp_dir().join(format!("rift-dl-{:016x}", rand::random::<u64>()));
-        Downloads::load(dir)
+    /// `dir` must outlive the store: the guard deletes the directory on drop, so
+    /// the test owns it and the helper only borrows it. Every test therefore
+    /// starts by making one.
+    fn temp_downloads(dir: &TempDir) -> Downloads {
+        Downloads::load(dir.path().to_path_buf())
     }
 
     #[test]
     fn begin_claims_once_so_concurrent_calls_dont_double_fetch() {
-        let d = temp_downloads();
+        let dir = TempDir::new("downloads");
+        let d = temp_downloads(&dir);
         assert!(d.begin("a"), "first claim succeeds");
         assert!(!d.begin("a"), "second claim is rejected");
         assert!(d.is_downloading("a"));
@@ -140,7 +144,8 @@ mod tests {
 
     #[test]
     fn finish_moves_from_in_flight_to_downloaded() {
-        let d = temp_downloads();
+        let dir = TempDir::new("downloads");
+        let d = temp_downloads(&dir);
         d.begin("a");
         d.finish("a");
         assert!(!d.is_downloading("a"));
@@ -151,7 +156,8 @@ mod tests {
 
     #[test]
     fn fail_releases_the_claim_without_marking_downloaded() {
-        let d = temp_downloads();
+        let dir = TempDir::new("downloads");
+        let d = temp_downloads(&dir);
         d.begin("a");
         d.fail("a");
         assert!(!d.is_downloading("a"));
@@ -160,7 +166,8 @@ mod tests {
 
     #[test]
     fn remove_deletes_the_file_and_clears_state() {
-        let d = temp_downloads();
+        let dir = TempDir::new("downloads");
+        let d = temp_downloads(&dir);
         std::fs::write(d.path("a"), b"audio").unwrap();
         d.finish("a");
         assert!(d.is_downloaded("a"));
@@ -173,7 +180,8 @@ mod tests {
 
     #[test]
     fn mark_failed_records_and_is_cleared_by_a_retry_or_success() {
-        let d = temp_downloads();
+        let dir = TempDir::new("downloads");
+        let d = temp_downloads(&dir);
         d.begin("a");
         d.mark_failed("a");
         assert!(!d.is_downloading("a"), "the in-flight claim is dropped");
@@ -197,7 +205,8 @@ mod tests {
 
     #[test]
     fn load_discovers_existing_offline_files() {
-        let d = temp_downloads();
+        let dir = TempDir::new("downloads");
+        let d = temp_downloads(&dir);
         std::fs::write(d.dir.join("song.m4a"), b"x").unwrap();
         std::fs::write(d.dir.join("notes.txt"), b"x").unwrap();
         let reloaded = Downloads::load(d.dir.clone());

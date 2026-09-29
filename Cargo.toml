@@ -6,6 +6,12 @@ members = ["types", "ui", "src-tauri", "crates/ytmusic"]
 version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
+authors = ["Gage Lodba"]
+repository = "https://github.com/gage-lodba/Rift"
+# No `rust-version`: the toolchain is *pinned* by rust-toolchain.toml (and
+# mirrored in the workflows), and declaring a minimum supported version nobody
+# has actually built against would be a guess presented as a guarantee. Add one
+# once an older toolchain has been verified in CI.
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

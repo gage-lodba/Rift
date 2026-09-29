@@ -1,0 +1,12 @@
+# Pins the Rust toolchain for local builds, CI, and release.
+#
+# Without this, `dtolnay/rust-toolchain@stable` follows whatever `stable` is that
+# week, so CI and the released installers could be built by different compilers
+# from the same commit. `rustup` honours this file automatically, so a plain
+# `cargo build` in this repo also gets the pinned version.
+#
+# Keep in step with the `toolchain:` input in .github/workflows/*.yml.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

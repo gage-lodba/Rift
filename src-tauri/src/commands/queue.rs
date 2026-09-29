@@ -25,16 +25,6 @@ pub fn queue_add(track: Track, app: AppHandle, state: State<'_, AppState>) {
     apply_add(outcome, &app, &state);
 }
 
-/// Append a whole collection (album/playlist/...) to the end of the queue.
-#[tauri::command(rename_all = "snake_case")]
-pub fn queue_add_tracks(tracks: Vec<Track>, app: AppHandle, state: State<'_, AppState>) {
-    let outcome = {
-        let mut core = state.player.core.lock_safe();
-        player::append_tracks(&mut core, tracks)
-    };
-    apply_add(outcome, &app, &state);
-}
-
 /// Insert tracks right after the current one so they play next.
 #[tauri::command(rename_all = "snake_case")]
 pub fn queue_play_next(tracks: Vec<Track>, app: AppHandle, state: State<'_, AppState>) {
@@ -89,7 +79,6 @@ pub fn queue_clear(app: AppHandle, state: State<'_, AppState>) {
         core.shuffle_history.clear();
         core.shuffle_cursor = 0;
         core.pending_next = None;
-        core.epoch += 1;
     }
     player::stop(&app);
     player::emit_queue(&app, &state.player);

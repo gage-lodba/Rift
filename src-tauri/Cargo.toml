@@ -20,7 +20,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 anyhow = "1.0.102"
 rand = "0.10.1"
-reqwest = "0.12"
+reqwest = "0.13"
 rift-types = { path = "../types" }
 rift-ytmusic = { path = "../crates/ytmusic" }
 rodio = "0.22.2"

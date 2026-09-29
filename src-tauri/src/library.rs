@@ -181,15 +181,14 @@ mod tests {
         }
     }
 
-    fn temp_store() -> LibraryStore {
-        let dir = std::env::temp_dir().join(format!("rift-lib-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        LibraryStore::load(&dir)
+    fn temp_store(dir: &crate::util::testing::TempDir) -> LibraryStore {
+        LibraryStore::load(dir.path())
     }
 
     #[test]
     fn like_toggles_and_persists_across_reload() {
-        let mut lib = temp_store();
+        let dir = crate::util::testing::TempDir::new("library");
+        let mut lib = temp_store(&dir);
         let path = lib.path.clone();
         lib.toggle_like(track("a"));
         assert_eq!(lib.data.liked.len(), 1);
@@ -204,7 +203,8 @@ mod tests {
 
     #[test]
     fn recently_played_dedups_caps_and_orders_newest_first() {
-        let mut lib = temp_store();
+        let dir = crate::util::testing::TempDir::new("library");
+        let mut lib = temp_store(&dir);
         lib.push_recent(track("a"));
         lib.push_recent(track("b"));
         lib.push_recent(track("a")); // re-play moves "a" to front, no duplicate
@@ -225,7 +225,8 @@ mod tests {
 
     #[test]
     fn playlist_add_is_idempotent_and_remove_works() {
-        let mut lib = temp_store();
+        let dir = crate::util::testing::TempDir::new("library");
+        let mut lib = temp_store(&dir);
         let pl = lib.create_playlist("Mix".into());
         lib.add_to_playlist(&pl.id, track("a"));
         lib.add_to_playlist(&pl.id, track("a")); // duplicate ignored
@@ -240,7 +241,8 @@ mod tests {
 
     #[test]
     fn backfill_copies_credits_onto_creditless_copies() {
-        let mut lib = temp_store();
+        let dir = crate::util::testing::TempDir::new("library");
+        let mut lib = temp_store(&dir);
         lib.toggle_like(track("a")); // stored without artist credits
 
         let mut enriched = track("a");

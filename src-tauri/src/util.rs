@@ -165,20 +165,49 @@ fn came_from_youtube(status: u16, header: impl Fn(&str) -> Option<String>) -> bo
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod testing {
+    use std::path::{Path, PathBuf};
 
-    /// A unique scratch directory per test, so parallel tests don't collide and
-    /// a leftover directory from a failed run can't change the result.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rift-util-{tag}-{}-{:016x}",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A scratch directory that deletes itself when dropped.
+    ///
+    /// The test helpers used to create `%TEMP%\rift-*` directories and remove
+    /// them on the last line, so every assertion failure — which is exactly when
+    /// a developer runs the suite repeatedly — left one behind. `Drop` runs
+    /// during unwinding, so a failing test cleans up like a passing one.
+    pub struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rift-{tag}-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Join a name onto the directory.
+        pub fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
     }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::TempDir;
+    use super::*;
 
     #[test]
     fn a_200_without_youtube_headers_is_a_captive_portal() {
@@ -208,7 +237,7 @@ mod tests {
 
     #[test]
     fn json_round_trips_through_disk() {
-        let dir = scratch("round-trip");
+        let dir = TempDir::new("util-round-trip");
         let path = dir.join("round-trip.json");
 
         #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
@@ -230,13 +259,11 @@ mod tests {
         // A missing file is not an error, just a default.
         let absent: State = load_json(&dir.join("never-written.json"));
         assert_eq!(absent, State::default());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_corrupt_file_is_backed_up_rather_than_lost() {
-        let dir = scratch("corrupt");
+        let dir = TempDir::new("util-corrupt");
         let path = dir.join("library.json");
         std::fs::write(&path, b"{ this is not json").expect("seed corrupt file");
 
@@ -247,13 +274,11 @@ mod tests {
             path.with_extension("json.bad").exists(),
             "the user's data must survive as a .json.bad backup"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn atomic_write_replaces_the_target_and_leaves_no_temp_behind() {
-        let dir = scratch("atomic");
+        let dir = TempDir::new("util-atomic");
         let path = dir.join("playback.json");
 
         atomic_write(&path, b"first").expect("write");
@@ -268,7 +293,5 @@ mod tests {
             !path.with_extension("tmp").exists(),
             "the temp file must be renamed away, not left behind"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

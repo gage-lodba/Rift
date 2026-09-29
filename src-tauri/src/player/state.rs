@@ -34,8 +34,6 @@ pub struct PlayerCore {
     pub shuffle_cursor: usize,
     /// Bumped on every play request; stale downloads check it and bail.
     pub generation: u64,
-    /// Bumped whenever the queue is replaced; stale radio fills check it.
-    pub epoch: u64,
     /// Consecutive auto-play failures. Lets a queue of unplayable tracks stop
     /// instead of skipping forever; reset on any successful playback or a fresh
     /// user-initiated jump.
@@ -67,7 +65,6 @@ impl Default for PlayerCore {
             shuffle_history: Vec::new(),
             shuffle_cursor: 0,
             generation: 0,
-            epoch: 0,
             failures: 0,
             crossfade: 0.0,
             crossfade_armed_for: None,

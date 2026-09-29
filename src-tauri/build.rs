@@ -41,7 +41,6 @@ fn main() {
             "cycle_repeat",
             // Queue
             "queue_add",
-            "queue_add_tracks",
             "queue_play_next",
             "queue_move",
             "queue_remove",

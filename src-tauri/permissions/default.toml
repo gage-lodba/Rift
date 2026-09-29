@@ -39,7 +39,6 @@ permissions = [
   "allow-cycle-repeat",
 
   "allow-queue-add",
-  "allow-queue-add-tracks",
   "allow-queue-play-next",
   "allow-queue-move",
   "allow-queue-remove",

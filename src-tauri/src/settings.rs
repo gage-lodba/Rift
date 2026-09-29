@@ -122,37 +122,33 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::testing::TempDir;
 
     #[test]
     fn volume_survives_a_reload() {
-        let dir = std::env::temp_dir().join(format!("rift-test-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("settings-volume");
+        let dir = dir.path();
 
         // A fresh store defaults to full volume.
-        assert_eq!(SettingsStore::load(&dir).data.volume, 1.0);
+        assert_eq!(SettingsStore::load(dir).data.volume, 1.0);
 
         // Saving and reloading round-trips the value (as a relaunch would).
-        SettingsStore::load(&dir).set_volume(0.42);
-        let restored = SettingsStore::load(&dir).data.volume;
+        SettingsStore::load(dir).set_volume(0.42);
+        let restored = SettingsStore::load(dir).data.volume;
         assert!((restored - 0.42).abs() < 1e-6, "got {restored}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn out_of_range_values_are_clamped_on_load() {
-        let dir = std::env::temp_dir().join(format!("rift-test-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("settings-clamp");
         std::fs::write(
             dir.join("settings.json"),
             r#"{"volume": 5.0, "crossfade": 999.0}"#,
         )
         .unwrap();
 
-        let s = SettingsStore::load(&dir).data;
+        let s = SettingsStore::load(dir.path()).data;
         assert_eq!(s.volume, 1.0);
         assert_eq!(s.crossfade, MAX_CROSSFADE);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,8 +1,10 @@
 name: Release
 
 # Build platform bundles and attach them to a GitHub Release when a version
-# tag is pushed (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
-# `workflow_dispatch` allows a manual run for testing the build (still a draft).
+# tag is pushed (e.g. `git tag v0.5.0 && git push origin v0.5.0`).
+#
+# `workflow_dispatch` allows a manual run for testing the build; that path
+# produces a *draft*, so a test run can't be mistaken for a release.
 on:
   push:
     tags:
@@ -41,7 +43,26 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # The tag names the artifacts and is what `check_update` compares against
+      # the running version, so a tag that disagrees with the manifests both
+      # mislabels every installer and makes the app report a phantom update
+      # forever (it would see `v1.0.0` while running 0.5.0, and never reach it).
+      # Failing here is much cheaper than explaining that after the fact.
+      - name: Verify the tag matches the manifest versions
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          conf_version=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "tag=$tag  Cargo.toml=$cargo_version  tauri.conf.json=$conf_version"
+          if [ "$tag" != "$cargo_version" ] || [ "$tag" != "$conf_version" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml ($cargo_version) / tauri.conf.json ($conf_version)"
+            exit 1
+          fi
 
       # Tauri v2's Linux build dependencies (webkit2gtk 4.1, not 4.0). macOS and
       # Windows ship the needed webview + audio backends already.
@@ -60,11 +81,15 @@ jobs:
             patchelf \
             file
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
+          # Pinned and mirrored in rust-toolchain.toml: the released installers
+          # should be built by a known compiler, not by whatever `stable` is that
+          # week. Without an explicit `toolchain` this action installs the latter.
+          toolchain: 1.98.0
           targets: ${{ matrix.rust-targets }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           # Keep per-platform caches separate.
           key: ${{ matrix.platform }}
@@ -73,19 +98,23 @@ jobs:
       # no deprecated Node runtime). The Tauri build invokes `trunk build
       # --release` via beforeBuildCommand.
       - name: Install trunk
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: trunk@0.21.14
 
       - name: Build and release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseName: Rift ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseBody: 'Download the installer for your platform from the assets below.'
-          # Published as a draft so you can review/edit the notes before release.
-          releaseDraft: true
+          # A tag push is a deliberate release, so it publishes: `check_update`
+          # queries `releases/latest`, which by GitHub's definition **excludes
+          # drafts**, so a draft-only workflow means the in-app update banner can
+          # never fire. A manual `workflow_dispatch` run stays a draft, since
+          # that path exists to test the build.
+          releaseDraft: ${{ github.event_name == 'workflow_dispatch' }}
           prerelease: false
           args: ${{ matrix.args }}

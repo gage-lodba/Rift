@@ -158,7 +158,6 @@ fn main() {
             commands::toggle_shuffle,
             commands::cycle_repeat,
             commands::queue_add,
-            commands::queue_add_tracks,
             commands::queue_play_next,
             commands::queue_move,
             commands::queue_remove,
