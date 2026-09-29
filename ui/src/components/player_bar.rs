@@ -9,6 +9,12 @@ use yew::prelude::*;
 use super::icons::{artist_links, cover, fmt_pos, icon};
 use crate::api;
 
+/// Identity of the track a set of progress values describes. `None` (nothing
+/// loaded) is its own identity, so stopping clears the bar too.
+fn track_key(track: &Option<Track>) -> Option<String> {
+    track.as_ref().map(|t| t.id.clone())
+}
+
 #[derive(Properties, PartialEq)]
 pub struct PlayerBarProps {
     pub track: Option<Track>,
@@ -34,14 +40,30 @@ pub fn player_bar(props: &PlayerBarProps) -> Html {
     // Live position/duration, seeded from the prop and updated by PROGRESS
     // ticks. Kept local so the 4 Hz ticks re-render only this bar, not the app.
     let live = use_state(|| props.progress);
+    // Which track the currently-rendered `live` values belong to. `track_changed`
+    // is true during the one render between the new track arriving and the
+    // re-seed effect below running — the only window in which `live` still
+    // describes the previous track.
+    let rendered_track = use_state(|| track_key(&props.track));
+    let key = track_key(&props.track);
+    let track_changed = *rendered_track != key;
     {
-        // Re-seed when the prop seed changes: bootstrap resolving, or the
-        // preview override arriving. A new track resets via a PROGRESS{0,dur}
-        // the backend emits, so that flows through the subscription below (the
-        // prop stays put, so this effect doesn't fight it).
+        // Re-seed when the prop seed changes (bootstrap resolving, or the
+        // preview override arriving) *and* when the track changes.
+        //
+        // The track id is part of the dependency on purpose. `props.progress`
+        // never moves after bootstrap — `App` deliberately does not subscribe to
+        // PROGRESS — so without it this effect never re-runs on a track change,
+        // and the bar keeps showing the *previous* track's elapsed time and
+        // slider `max` for the whole fetch window. The backend only emits its
+        // corrective `PROGRESS {0.0, duration}` once the stream resolves
+        // (`playback.rs`), i.e. after a network fetch.
         let live = live.clone();
-        use_effect_with(props.progress, move |p| {
-            live.set(*p);
+        let rendered_track = rendered_track.clone();
+        let key = key.clone();
+        use_effect_with((props.progress, key.clone()), move |(seed, _)| {
+            rendered_track.set(key);
+            live.set(*seed);
             || ()
         });
     }
@@ -104,9 +126,19 @@ pub fn player_bar(props: &PlayerBarProps) -> Html {
 
     let loading = props.state == PlaybackState::Loading;
     let playing = props.state == PlaybackState::Playing;
-    let duration = live.duration.max(1.0);
+    // While `live` still belongs to the track that just ended, fall back to the
+    // new track's own metadata: its known length for the slider's range, and a
+    // zeroed position. Otherwise the seek bar briefly spans the *previous*
+    // track's length and its thumb sits at that track's elapsed time.
+    let track_duration = props.track.as_ref().and_then(|t| t.duration).unwrap_or(0) as f64;
+    let (pos, dur) = if track_changed {
+        (0.0, track_duration)
+    } else {
+        (live.position, live.duration)
+    };
+    let duration = dur.max(1.0);
     // Show the dragged position while scrubbing, otherwise the live position.
-    let seek_pos = scrubbing.unwrap_or(live.position);
+    let seek_pos = scrubbing.unwrap_or(pos);
 
     html! {
         <footer class="player">
@@ -116,7 +148,7 @@ pub fn player_bar(props: &PlayerBarProps) -> Html {
                        max={format!("{}", duration as u64)}
                        value={format!("{}", seek_pos as u64)}
                        oninput={seek_input} onchange={seek_commit} />
-                <span class="time">{ fmt_pos(live.duration) }</span>
+                <span class="time">{ fmt_pos(dur) }</span>
             </div>
             <div class="player-row">
                 <div class="now-playing">

@@ -39,6 +39,19 @@ const POLL: Duration = Duration::from_secs(1);
 /// re-send is otherwise a no-op (Discord dedups an unchanged activity).
 const HEARTBEAT: Duration = Duration::from_secs(60);
 
+/// Ceiling on a single IPC exchange with Discord.
+///
+/// `DiscordIpcClient`'s reads block with no timeout of their own, and the client
+/// is not `Send` (it holds a `File` on Windows), so it cannot be moved into
+/// `spawn_blocking` and an async timeout on its own thread cannot interrupt it.
+/// Every socket operation therefore runs on a dedicated worker thread that
+/// applies this deadline itself; the event loop only ever waits on a channel.
+/// Without that, one unanswered read would stall the loop outright — commands
+/// would stop coalescing, the heartbeat would stop firing, and the unbounded
+/// command channel would grow for the rest of the session. Comfortably under
+/// [`POLL`] so a slow exchange cannot eat a whole tick.
+const IPC_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Rift's Discord application ID (Developer Portal → General Information). It
 /// sets the app name shown as "Listening to Rift" and hosts uploaded art.
 ///
@@ -214,7 +227,9 @@ fn fold(cmd: DiscordCmd, now: &mut Option<Now>, enabled: &mut bool) {
 }
 
 async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
-    let mut client = DiscordIpcClient::new(APP_ID);
+    // Every socket operation goes through this worker; see [`IpcWorker`]. Held as
+    // an `Option` so a stall can abandon the worker and start a fresh one.
+    let mut ipc = None;
     // Whether the IPC socket is currently connected. Discord may be closed when
     // Rift starts (or restarted later), so we connect lazily and reconnect on
     // the next push if one fails.
@@ -256,7 +271,7 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
             // Loading snapshot is skipped (the previous track stays up), so if it
             // reset `last_send` the real Playing push moments later would be held
             // for a whole MIN_INTERVAL — the new song wouldn't show for ~15s.
-            if apply(&mut client, &mut connected, enabled, now.as_ref()) {
+            if apply(&mut ipc, &mut connected, enabled, now.as_ref()).await {
                 last_send = Instant::now();
             }
             dirty = false;
@@ -269,8 +284,8 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
 /// failure so the next update retries. Returns whether an IPC operation was
 /// attempted, so the caller only paces the interval on a real push (a skipped
 /// Loading frame must not consume the send slot).
-fn apply(
-    client: &mut DiscordIpcClient,
+async fn apply(
+    ipc: &mut Option<IpcWorker>,
     connected: &mut bool,
     enabled: bool,
     now: Option<&Now>,
@@ -290,9 +305,13 @@ fn apply(
         );
     if !show {
         if *connected {
-            match client.clear_activity() {
-                Ok(()) => drain(client, connected),
-                Err(_) => *connected = false,
+            let req = IpcRequest::Clear;
+            match dispatch(ipc, req).await {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("discord clear failed, reconnecting next tick: {e}");
+                    *connected = false;
+                }
             }
             return true;
         }
@@ -300,32 +319,10 @@ fn apply(
     }
     let Some(n) = now else { return false };
 
-    if !*connected {
-        if let Err(e) = client.connect() {
-            debug!("discord not available: {e}");
-            // A connect attempt is paced so a closed Discord isn't probed every
-            // poll; the heartbeat retries it.
-            return true;
-        }
-        debug!("discord connected");
-        *connected = true;
-    }
-
-    if let Err(e) = client.set_activity(build_activity(n)) {
-        // The socket likely went away (Discord closed); retry on the next tick.
-        warn!("discord set_activity failed: {e}");
-        *connected = false;
-        return true;
-    }
-    // Drain Discord's response to this command. The library's set_activity only
-    // writes and never reads the reply, so left unread the pipe's buffer backs
-    // up until Discord stalls applying our updates — writes keep returning Ok
-    // while the presence freezes on an old track. Reading it also surfaces
-    // rate-limit ERROR replies and detects a dead pipe (recv Err -> reconnect).
-    match client.recv() {
-        Ok((_, val)) => {
-            if val.get("evt").and_then(|e| e.as_str()) == Some("ERROR") {
-                warn!("discord rejected activity: {val}");
+    match dispatch(ipc, IpcRequest::Push(activity_payload(build_activity(n)))).await {
+        Ok(Some(reply)) => {
+            if reply.get("evt").and_then(|e| e.as_str()) == Some("ERROR") {
+                warn!("discord rejected activity: {reply}");
             } else {
                 debug!(
                     "discord push: \"{}\" state={:?} bar={}",
@@ -334,21 +331,179 @@ fn apply(
                     n.anchor.is_some()
                 );
             }
+            *connected = true;
         }
+        // The worker ran the request but the socket was unusable (Discord not
+        // running, or the pipe broke). Reconnect on the next paced attempt.
+        Ok(None) => *connected = false,
         Err(e) => {
-            warn!("discord recv failed, reconnecting next tick: {e}");
+            warn!("discord ipc stalled ({e}); starting a fresh worker");
+            // The abandoned worker is parked on a blocking read we cannot
+            // interrupt; `dispatch` spawns a replacement on the next request.
+            *ipc = None;
             *connected = false;
         }
     }
     true
 }
 
-/// Read and discard one response frame (after a `clear_activity`), dropping the
-/// connection on a broken pipe so the next push reconnects.
-fn drain(client: &mut DiscordIpcClient, connected: &mut bool) {
-    if client.recv().is_err() {
-        *connected = false;
+/// Run one request on the worker, spawning a replacement first if the previous
+/// one was abandoned.
+async fn dispatch(
+    ipc: &mut Option<IpcWorker>,
+    req: IpcRequest,
+) -> Result<Option<serde_json::Value>, String> {
+    let worker = ipc.get_or_insert_with(IpcWorker::spawn);
+    worker.call(req).await
+}
+
+/// One socket operation for the IPC worker. Carries its own reply channel so the
+/// worker never needs a second queue.
+enum IpcRequest {
+    /// Connect if needed, push `activity`, then read Discord's reply frame.
+    /// The reply is that frame, or `None` when Discord sent nothing.
+    ///
+    /// The activity travels as an already-serialized object because it borrows
+    /// from [`Now`] and so cannot outlive this call, while the worker is a
+    /// `'static` thread.
+    Push(serde_json::Value),
+    /// Clear the presence, then read and discard the reply frame.
+    Clear,
+}
+
+/// Owns the IPC socket on its own thread and answers requests.
+///
+/// `DiscordIpcClient` is not `Send` (it holds a `File` on Windows) and its reads
+/// block with no timeout of their own, so it cannot live in `spawn_blocking` and
+/// an async timeout cannot interrupt it from the loop's thread. Isolating it here
+/// is what keeps the event loop responsive: a wedged socket stalls only this
+/// worker, not command coalescing, the heartbeat, or the command channel.
+///
+/// Each request is answered or times out within [`IPC_TIMEOUT`]. A worker that
+/// misses that deadline is **abandoned** rather than awaited — its thread stays
+/// parked on the blocking read (there is no way to interrupt it safely: closing
+/// the handle underneath a read is the one thing that would be worse than a
+/// leak), so `IpcWorker::call` drops it and the next call spawns a fresh worker
+/// with a fresh socket. That bounds the leak to one parked thread per stall.
+struct IpcWorker {
+    tx: UnboundedSender<(
+        IpcRequest,
+        tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
+    )>,
+}
+
+impl IpcWorker {
+    /// Spawn a worker with a fresh, unconnected client.
+    fn spawn() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("rift-discord-ipc".into())
+            .spawn(move || serve(rx))
+            .expect("failed to spawn discord ipc thread");
+        Self { tx }
     }
+
+    /// Run one request, bounded by [`IPC_TIMEOUT`].
+    async fn call(&self, req: IpcRequest) -> Result<Option<serde_json::Value>, String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send((req, reply_tx))
+            .map_err(|_| "discord ipc worker is gone".to_owned())?;
+        match tokio::time::timeout(IPC_TIMEOUT, reply_rx).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err("discord ipc worker dropped the request".to_owned()),
+            Err(_) => Err(format!(
+                "discord ipc timed out after {}ms",
+                IPC_TIMEOUT.as_millis()
+            )),
+        }
+    }
+}
+
+/// The worker's thread body: connect lazily, run requests until the loop drops
+/// its sender (app shutdown), then close the socket.
+fn serve(
+    mut rx: UnboundedReceiver<(
+        IpcRequest,
+        tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
+    )>,
+) {
+    let mut client = DiscordIpcClient::new(APP_ID);
+    let mut connected = false;
+    while let Some((req, reply)) = rx.blocking_recv() {
+        // A dropped receiver means `call` already timed out and abandoned us.
+        let _ = reply.send(run_request(&mut client, &mut connected, req));
+    }
+    if connected {
+        let _ = client.close();
+    }
+}
+
+/// Execute one request against the socket. `None` means the socket is not usable
+/// (Discord isn't running, or the pipe broke), which the loop treats as "retry
+/// later". Replies are dropped rather than propagated: the caller never acts on
+/// a connect or write error differently from any other push failure.
+fn run_request(
+    client: &mut DiscordIpcClient,
+    connected: &mut bool,
+    req: IpcRequest,
+) -> Option<serde_json::Value> {
+    if !*connected {
+        if let Err(e) = client.connect() {
+            debug!("discord not available: {e}");
+            return None;
+        }
+        debug!("discord connected");
+        *connected = true;
+    }
+
+    let send = match &req {
+        IpcRequest::Push(activity) => client.send(set_activity_frame(activity.clone()), 1),
+        IpcRequest::Clear => client.clear_activity(),
+    };
+    if let Err(e) = send {
+        // The socket likely went away (Discord closed); the next request
+        // reconnects from scratch.
+        warn!("discord write failed, dropping the connection: {e}");
+        *connected = false;
+        return None;
+    }
+
+    // Read Discord's reply. The library's `set_activity`/`clear_activity` only
+    // write and never read it, so left unread the pipe's buffer backs up until
+    // Discord stalls applying our updates — writes keep returning Ok while the
+    // presence freezes on an old track. Reading it also surfaces rate-limit
+    // ERROR replies and detects a dead pipe (a read error drops the connection).
+    match client.recv() {
+        Ok((_, val)) => Some(val),
+        Err(e) => {
+            warn!("discord read failed, dropping the connection: {e}");
+            *connected = false;
+            None
+        }
+    }
+}
+
+/// Serialize an activity into an owned JSON object, so it can be handed to the
+/// IPC thread. Equivalent to what the library's own `set_activity` serializes;
+/// the only change is that the data no longer borrows from [`Now`].
+fn activity_payload(activity: Activity<'_>) -> serde_json::Value {
+    serde_json::to_value(activity).unwrap_or(serde_json::Value::Null)
+}
+
+/// Wrap a serialized activity in the `SET_ACTIVITY` command frame.
+///
+/// This mirrors the library's `set_activity` exactly, including the `pid` that
+/// tells Discord which process owns the presence. It exists only because the
+/// library's version takes a borrowing `Activity`, which cannot cross a thread
+/// boundary. The `nonce` the library sends is omitted: Discord does not require
+/// it, and `set_activity`'s own reply is read positionally rather than matched
+/// against it.
+fn set_activity_frame(activity: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "cmd": "SET_ACTIVITY",
+        "args": { "pid": std::process::id(), "activity": activity },
+    })
 }
 
 fn build_activity(n: &Now) -> Activity<'_> {

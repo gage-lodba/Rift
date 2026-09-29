@@ -111,6 +111,29 @@ fn playlist_kept_offline(
     })
 }
 
+/// Split the failed batch into the tracks still worth retrying and the ids to
+/// give up on.
+///
+/// Pure, so the requeue rule is testable without a running app. Returning the
+/// dropped ids (rather than filtering them away) is the point: each one still
+/// holds an in-flight claim that nothing else will ever release, so the caller
+/// must `mark_failed` it.
+fn partition_retryable(
+    failed: Vec<Track>,
+    is_kept_offline: impl Fn(&str) -> bool,
+) -> (Vec<Track>, Vec<String>) {
+    let mut retry = Vec::with_capacity(failed.len());
+    let mut dropped = Vec::new();
+    for t in failed {
+        if is_kept_offline(&t.id) {
+            retry.push(t);
+        } else {
+            dropped.push(t.id);
+        }
+    }
+    (retry, dropped)
+}
+
 /// Spawn a background job that downloads `tracks`, skipping ones already on disk
 /// or in flight. Shared by the explicit Download action and the automatic
 /// "keep a fully-downloaded playlist offline" path.
@@ -262,10 +285,23 @@ fn start_downloads_attempt(
         // The playlist may have been un-marked or edited during the wait; keep
         // only the tracks it still depends on.
         let batch = failed.clone();
-        let retry: Vec<Track> = failed
-            .into_iter()
-            .filter(|t| kept_offline(&app, &t.id, &batch))
-            .collect();
+        let (retry, dropped) = partition_retryable(failed, |t| kept_offline(&app, t, &batch));
+        // A dropped track still holds the in-flight claim `downloads.fail` left
+        // on it (that claim is only released by the requeue below), so its row
+        // would sit on a spurious "downloading" spinner with no retry affordance
+        // for the rest of the session. Give it up explicitly instead, so the row
+        // offers the manual retry the user needs — the playlist was edited out
+        // from under it, and nothing else will ever revisit it.
+        if !dropped.is_empty() {
+            for id in &dropped {
+                downloads.mark_failed(id);
+            }
+            emit_downloads(&app, &downloads.state());
+            info!(
+                "gave up on {} kept-offline download(s) whose playlist no longer needs them",
+                dropped.len()
+            );
+        }
         if retry.is_empty() {
             return;
         }
@@ -284,7 +320,7 @@ pub fn remove_downloads(ids: Vec<String>, app: AppHandle, state: State<'_, AppSt
 
 #[cfg(test)]
 mod tests {
-    use super::playlist_kept_offline;
+    use super::{partition_retryable, playlist_kept_offline};
     use rift_types::{Playlist, Track};
 
     fn track(id: &str) -> Track {
@@ -346,5 +382,34 @@ mod tests {
         let downloaded = |_: &str| true;
         let in_batch = |t: &str| t == "z";
         assert!(!playlist_kept_offline(&pls, downloaded, "z", in_batch));
+    }
+
+    /// The regression guard for the leaked in-flight claim. A track dropped from
+    /// the retry set must be *reported* as dropped, because each one still holds
+    /// the claim `downloads.fail` left on it — the caller releases it there, and
+    /// without that the row spins on "downloading" forever with no retry offered.
+    #[test]
+    fn a_track_dropped_from_the_retry_set_is_reported_so_its_claim_can_be_released() {
+        let failed = vec![track("keep"), track("drop")];
+        let (retry, dropped) = partition_retryable(failed, |id| id == "keep");
+
+        assert_eq!(
+            retry.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["keep"],
+            "the still-kept-offline track is requeued"
+        );
+        assert_eq!(
+            dropped,
+            ["drop"],
+            "the abandoned track must be handed back, not silently filtered away"
+        );
+    }
+
+    #[test]
+    fn partition_retryable_keeps_everything_when_nothing_was_dropped() {
+        let failed = vec![track("a"), track("b")];
+        let (retry, dropped) = partition_retryable(failed, |_| true);
+        assert_eq!(retry.len(), 2);
+        assert!(dropped.is_empty(), "nothing to give up on");
     }
 }
