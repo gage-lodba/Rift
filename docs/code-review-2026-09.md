@@ -639,6 +639,14 @@ Recorded because these are the places a reviewer expects trouble:
   `remove_from_playlist`/`track_id`, `queue_move`/`from,to`,
   `import_yt_playlist`/`url`). No runtime "command not found"/"invalid args" from
   this code.
+
+  > **Was correct, then a later change broke it and this check did not notice.**
+  > Removing `play_track`'s unused `radio` parameter left the frontend sending
+  > `"radio": false`, which would have failed at runtime for every single-track
+  > play. Re-derived from scratch as a script, it found that one mismatch and
+  > nothing else. The check is now a test
+  > (`src-tauri/tests/ipc_contract.rs`, 3 tests, `f8e8f0d`) rather than a
+  > hand-verification.
 - **Lock discipline.** `bootstrap.rs:17` documents the non-reentrancy trap and
   avoids it; `add_to_playlist` releases the library lock before calling
   `start_downloads`, avoiding the deadlock the naive version would have.
@@ -686,6 +694,17 @@ Issues this session surfaced that were not in the original review. None is
 currently a defect in shipped behaviour; they are recorded so the next pass
 starts from the code rather than from scratch.
 
+- **The "IPC contract: PASS" above is no longer a re-read, and it caught
+  something.** Removing `play_track`'s unused `radio` parameter (L4) left the
+  frontend sending `"radio": false`; both sides compiled and the command would
+  have failed at runtime for every single-track play. The check is now
+  `src-tauri/tests/ipc_contract.rs` (3 tests, `f8e8f0d`): it reads both sides as
+  text, since nothing in the type system connects a `json!({...})` key to a
+  command parameter name. Re-derived from scratch it found that one mismatch and
+  nothing else — all 42 frontend commands are registered and every argument key
+  matches. This is the argument for automating a check the review otherwise
+  performed by hand: it was certified correct once and a later local change
+  invalidated it silently.
 - **`uploader`/`channel`-style rows are still filtered by title substring**
   (`commands/convert.rs`) — see the deferred L10 above. The blocker is that the
   typed signal does not travel with imported playlists.
