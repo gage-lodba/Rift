@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use crate::context::HOME;
+use crate::context::home;
 use crate::error::{Error, Result};
 
 /// Google's consent cookie sent with anonymous requests.
@@ -66,7 +66,7 @@ pub fn ban(id: &str) {
 
 async fn fetch(http: &reqwest::Client, user_agent: &str) -> Result<String> {
     let resp = http
-        .get(HOME)
+        .get(home())
         .header(reqwest::header::USER_AGENT, user_agent)
         .header(reqwest::header::COOKIE, CONSENT_COOKIE)
         .send()
@@ -99,6 +99,21 @@ fn visitor_data_from_html(html: &str) -> Option<String> {
     re.captures(html)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
+}
+
+/// Make `id` the only visitor the pool will hand out, and un-ban it.
+///
+/// Replaces the pool rather than appending: a test that needs a *specific*
+/// visitor on the first request can only get that if it is the sole candidate,
+/// and the pool outlives individual tests. Evicting everything else also means
+/// a ban left behind by another test cannot make this one fail for the wrong
+/// reason.
+#[cfg(test)]
+pub(crate) fn seed_pool_for_test(id: &str) {
+    let mut p = lock_pool();
+    p.ids.clear();
+    p.ids.push(id.to_owned());
+    p.banned.remove(id);
 }
 
 #[cfg(test)]

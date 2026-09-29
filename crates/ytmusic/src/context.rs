@@ -12,6 +12,32 @@ pub const CLIENT_NAME_ID: &str = "67";
 /// YouTube Music home / origin URL.
 pub const HOME: &str = "https://music.youtube.com";
 
+/// The base URL to talk to, which is [`HOME`] everywhere except under test.
+///
+/// The loopback seam is compile-time gated rather than an environment variable
+/// on purpose: an env override would ship in the release binary, and "silently
+/// send every metadata request somewhere else" is not a capability a music
+/// player should have. As a `#[cfg(test)]` substitution it does not exist in
+/// anything a user runs.
+#[cfg(test)]
+static TEST_HOME: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn home() -> &'static str {
+    #[cfg(test)]
+    if let Some(url) = TEST_HOME.get() {
+        return url.as_str();
+    }
+    HOME
+}
+
+/// Point [`home`] at `url` for the rest of the process. Test-only; the first
+/// call wins, because the visitor-data and client-version caches are keyed to
+/// one host for the process lifetime.
+#[cfg(test)]
+pub(crate) fn set_home_for_test(url: &str) {
+    let _ = TEST_HOME.set(url.to_owned());
+}
+
 /// Last-resort client version when the home page can't be scraped.
 const FALLBACK_VERSION: &str = "1.20240101.01.00";
 
@@ -72,7 +98,7 @@ fn resolve_client_version(
 
 async fn scrape(http: &reqwest::Client, user_agent: &str) -> Option<String> {
     let body = http
-        .get(HOME)
+        .get(home())
         .header(reqwest::header::USER_AGENT, user_agent)
         .send()
         .await

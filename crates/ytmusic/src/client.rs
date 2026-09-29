@@ -6,7 +6,7 @@ use reqwest::header;
 use rift_types::{AlbumPage, AlbumSummary, ArtistPage, ArtistRef, ArtistSummary, Playlist, Track};
 use serde_json::{json, Value};
 
-use crate::context::{self, CLIENT_NAME_ID, HOME};
+use crate::context::{self, CLIENT_NAME_ID};
 use crate::error::{Error, Result};
 use crate::identity;
 use crate::params::SearchFilter;
@@ -173,16 +173,17 @@ impl Client {
                 );
             }
 
+            let base = context::home();
             let resp = self
                 .inner
                 .http
-                .post(format!("{HOME}/youtubei/v1/{endpoint}?prettyPrint=false"))
+                .post(format!("{base}/youtubei/v1/{endpoint}?prettyPrint=false"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("X-YouTube-Client-Name", CLIENT_NAME_ID)
                 .header("X-YouTube-Client-Version", &version)
                 .header("X-Goog-EOM-Visitor-Id", &vdata)
-                .header(header::ORIGIN, HOME)
-                .header(header::REFERER, HOME)
+                .header(header::ORIGIN, base)
+                .header(header::REFERER, base)
                 .header(header::COOKIE, identity::CONSENT_COOKIE)
                 .json(&body)
                 .send()
@@ -215,5 +216,643 @@ impl Client {
             status: 403,
             message: "forbidden after rotating visitor data".to_owned(),
         })
+    }
+}
+
+/// `client.rs` transport tests, against a real HTTP server on loopback.
+///
+/// A `std::net::TcpListener` on 127.0.0.1 serving canned responses exercises the
+/// whole request path, so these need no mock-HTTP crate and no network. What
+/// they reach that the parser fixtures cannot: the 403 retry and its visitor-id
+/// rotation (H1), the request that actually gets built, pagination and its stop
+/// conditions, and error mapping.
+///
+/// Two pieces of process-global state make these need care, and both are worth
+/// knowing before adding another test here:
+///
+/// * `context::home()` is substituted once per process, so every test in this
+///   module talks to the one server below.
+/// * the visitor pool outlives a test. A test that needs a *specific* visitor on
+///   its first request seeds the pool (`seed_visitor`) rather than trying to
+///   arrange ordering, and holds [`visitor_gate`] so no concurrent test's
+///   request is affected by that seeding.
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::context;
+    use crate::identity;
+
+    /// The visitor the fake server rejects, so the retry's rotation is visible.
+    const REJECTED_VISITOR: &str = "visitor-that-gets-403";
+    /// The visitor the fake home page hands out, which the client caches after
+    /// fetching it. Tests that do not seed the pool get this one.
+    const HOME_VISITOR: &str = "visitor-from-home-cookie";
+    /// Queries that make the fake search endpoint answer with a fixed status,
+    /// so "only a 403 is retried" and "a permanent 403 gives up" are testable
+    /// without depending on the seeded visitor.
+    const ALWAYS_429: &str = "__always_429__";
+    const ALWAYS_403: &str = "__always_403__";
+
+    struct Request {
+        method: String,
+        path: String,
+        headers: HashMap<String, String>,
+        body: Value,
+    }
+
+    impl Request {
+        fn header(&self, name: &str) -> &str {
+            self.headers.get(name).map(String::as_str).unwrap_or("")
+        }
+        /// `/youtubei/v1/<endpoint>?...` -> `<endpoint>`.
+        fn endpoint(&self) -> &str {
+            self.path
+                .split("/youtubei/v1/")
+                .nth(1)
+                .and_then(|rest| rest.split('?').next())
+                .unwrap_or("")
+        }
+        fn query(&self) -> &str {
+            self.body.get("query").and_then(Value::as_str).unwrap_or("")
+        }
+        fn browse_id(&self) -> &str {
+            self.body
+                .get("browseId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        }
+        fn continuation(&self) -> &str {
+            self.body
+                .get("continuation")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        }
+    }
+
+    struct Response {
+        status: u16,
+        /// Extra headers, e.g. the `Set-Cookie` carrying visitor data.
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl Response {
+        fn json(body: Value) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body: body.to_string(),
+            }
+        }
+        fn error(status: u16) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: json!({ "error": { "message": "rejected by the test server" } }).to_string(),
+            }
+        }
+    }
+
+    type Handler = Box<dyn Fn(&Request) -> Response + Send + Sync>;
+
+    /// Loopback HTTP server, routed by path.
+    struct FakeYt {
+        addr: String,
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
+
+    /// Bind a server, move its state into the accept thread, and hand back the
+    /// handle tests use to inspect what was sent.
+    fn spawn(routes: HashMap<String, Handler>) -> FakeYt {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = format!("http://{}", listener.local_addr().expect("local addr"));
+        let requests: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let (log, routes) = (requests.clone(), Arc::new(routes));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let _ = serve(stream, &mut log.lock().unwrap(), &routes);
+            }
+        });
+
+        FakeYt { addr, requests }
+    }
+
+    /// Read one request, write one response. Always answers, so a test cannot
+    /// hang waiting on a connection that was never replied to.
+    fn serve(
+        mut stream: TcpStream,
+        log: &mut Vec<Request>,
+        routes: &HashMap<String, Handler>,
+    ) -> std::io::Result<()> {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line)?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_owned();
+        let path = parts.next().unwrap_or("").to_owned();
+
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+            }
+        }
+
+        let mut raw = String::new();
+        if let Some(len) = headers.get("content-length").and_then(|v| v.parse().ok()) {
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf)?;
+            raw = String::from_utf8_lossy(&buf).into_owned();
+        }
+
+        let request = Request {
+            method,
+            path,
+            headers,
+            body: serde_json::from_str(&raw).unwrap_or(Value::Null),
+        };
+        let route = request.path.split('?').next().unwrap_or("").to_owned();
+
+        let response = match routes.get(&route) {
+            Some(handler) => handler(&request),
+            None => Response {
+                status: 500,
+                headers: Vec::new(),
+                body: json!({ "error": { "message": format!("no route for {route}") } })
+                    .to_string(),
+            },
+        };
+        log.push(request);
+
+        let reason = match response.status {
+            200 => "OK",
+            403 => "Forbidden",
+            429 => "Too Many Requests",
+            _ => "Error",
+        };
+        let mut head = format!(
+            "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            response.status,
+            response.body.len()
+        );
+        for (name, value) in &response.headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(response.body.as_bytes())?;
+        stream.flush()
+    }
+
+    /// The version the fake home page advertises; asserted on the innertube
+    /// headers, so a change here is visible in one place.
+    const CLIENT_VERSION: &str = "1.20250901.00.00";
+
+    fn home_html() -> String {
+        format!(
+            r#"<script>window["ytcfg"].set({{"INNERTUBE_CONTEXT_CLIENT_VERSION":"{CLIENT_VERSION}"}});</script>"#
+        )
+    }
+
+    /// One `musicResponsiveListItemRenderer` row.
+    fn track_row(id: &str, title: &str, artist: &str) -> Value {
+        json!({
+            "musicResponsiveListItemRenderer": {
+                "playlistItemData": { "videoId": id },
+                "flexColumns": [
+                    { "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": { "runs": [{ "text": title }] } } },
+                    { "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": { "runs": [
+                            { "text": "Song" }, { "text": " • " },
+                            { "text": artist, "navigationEndpoint": { "browseEndpoint": { "browseId": "UCartist" } } },
+                            { "text": " • " }, { "text": "3:00" }
+                        ] } } }
+                ],
+                "fixedColumns": [{ "musicResponsiveListItemFixedColumnRenderer": {
+                    "text": { "runs": [{ "text": "3:00" }] } } }]
+            }
+        })
+    }
+
+    /// A playlist page: a named header, some rows, and optionally a continuation
+    /// token. Rows and a token coexist on a real page — the shape the guard in
+    /// `playlist` exists for is a page with a token but *no* rows, expressed by
+    /// passing an empty `rows`.
+    fn playlist_page(name: &str, rows: Vec<Value>, continuation: Option<&str>) -> Value {
+        let mut section = json!({
+            "contents": [{ "musicPlaylistShelfRenderer": { "contents": rows } }]
+        });
+        if let Some(token) = continuation {
+            section["continuations"] =
+                json!([{ "nextContinuationData": { "continuation": token } }]);
+        }
+        json!({
+            "header": { "musicResponsiveHeaderRenderer": { "title": { "runs": [{ "text": name }] } } },
+            "contents": { "twoColumnBrowseResultsRenderer": { "tabs": [{ "tabRenderer": {
+                "content": { "sectionListRenderer": section } } }] } }
+        })
+    }
+
+    /// A per-call id, so each `playlist` invocation gets its own story. Cargo
+    /// runs tests concurrently and the browse route is shared, so two tests
+    /// following "the" pagination path would otherwise interleave.
+    fn tx() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// Three pages of rows, tied together by `tx` so the ids are unique to the
+    /// call that asked for them.
+    fn paginated_playlist(tx: u128) -> Value {
+        let row = |n: usize| track_row(&format!("p{tx}-{n}"), &format!("Track {n}"), "A");
+        playlist_page(
+            "Pagination Test",
+            vec![row(1), row(2)],
+            Some(&format!("{tx}:page-2")),
+        )
+    }
+
+    fn paginated_playlist_continuation(tx: u128, token: &str) -> Value {
+        let row = |n: usize| track_row(&format!("p{tx}-{n}"), &format!("Track {n}"), "A");
+        if token.ends_with("page-2") {
+            playlist_page(
+                "Pagination Test",
+                vec![row(3), row(4), row(5)],
+                Some(&format!("{tx}:page-3")),
+            )
+        } else {
+            playlist_page("Pagination Test", vec![row(6), row(7)], None)
+        }
+    }
+
+    /// The server every client test in this process talks to.
+    ///
+    /// One instance, because the client-version cache and the visitor pool are
+    /// process-global: pointing them at a second host mid-run would be wrong.
+    fn server() -> &'static FakeYt {
+        static SERVER: OnceLock<FakeYt> = OnceLock::new();
+        SERVER.get_or_init(|| {
+            let mut routes: HashMap<String, Handler> = HashMap::new();
+
+            routes.insert(
+                "/".to_owned(),
+                Box::new(|_: &Request| Response {
+                    status: 200,
+                    // `identity::fetch` reads visitor data from this cookie
+                    // before scraping the HTML, so it is what fills the pool.
+                    headers: vec![(
+                        "Set-Cookie".to_owned(),
+                        format!("__Secure-YEC={HOME_VISITOR}; Path=/; Secure"),
+                    )],
+                    body: home_html(),
+                }),
+            );
+
+            routes.insert(
+                "/youtubei/v1/search".to_owned(),
+                Box::new(|req: &Request| match req.query() {
+                    ALWAYS_429 => Response::error(429),
+                    ALWAYS_403 => Response::error(403),
+                    _ if req.header("x-goog-eom-visitor-id") == REJECTED_VISITOR => {
+                        Response::error(403)
+                    }
+                    _ => Response::json(json!({
+                        "contents": { "tabbedSearchResultsRenderer": { "tabs": [{ "tabRenderer": {
+                            "content": { "sectionListRenderer": { "contents": [{
+                                "itemSectionRenderer": { "contents": [
+                                    track_row("s1", "Blinding Lights", "The Weeknd")
+                                ] }
+                            }] } } } }] } }
+                    })),
+                }),
+            );
+
+            routes.insert(
+                "/youtubei/v1/browse".to_owned(),
+                Box::new(|req: &Request| {
+                    let id = req.browse_id();
+                    let token = req.continuation();
+
+                    // A page that offers a continuation but yields no rows. The
+                    // same route serves the continuation, so a regression in the
+                    // guard would loop rather than quietly pass.
+                    if id.contains("degenerate") || token == "loop" {
+                        return Response::json(playlist_page("Degenerate", Vec::new(), Some("loop")));
+                    }
+                    // `playlist()` requests `VL<id>`, so the prefix is stripped
+                    // before matching.
+                    if let Some(tx) = id
+                        .strip_prefix("VL")
+                        .unwrap_or(id)
+                        .strip_prefix("PLtest_pagination_")
+                    {
+                        return Response::json(paginated_playlist(tx.parse().unwrap_or(0)));
+                    }
+                    // Continuations carry no browseId, so the transaction is
+                    // parsed back out of the token this test handed out.
+                    if token.contains("page-") {
+                        let tx = token
+                            .split(':')
+                            .next()
+                            .and_then(|t| t.parse().ok())
+                            .unwrap_or(0);
+                        return Response::json(paginated_playlist_continuation(tx, token));
+                    }
+                    if id.starts_with("MPREb_") {
+                        return Response::json(json!({
+                            "header": { "musicResponsiveHeaderRenderer": {
+                                "title": { "runs": [{ "text": "Test Album" }] } } },
+                            "contents": { "twoColumnBrowseResultsRenderer": {
+                                "secondaryContents": { "sectionListRenderer": { "contents": [{
+                                    "musicShelfRenderer": { "contents": [
+                                        track_row("a1", "Album Song", "A")
+                                    ] } }] } } } }
+                        }));
+                    }
+                    Response::json(json!({
+                        "header": { "musicImmersiveHeaderRenderer": {
+                            "title": { "runs": [{ "text": "Test Artist" }] } } },
+                        "contents": { "singleColumnBrowseResultsRenderer": { "tabs": [{ "tabRenderer": {
+                            "content": { "sectionListRenderer": { "contents": [{
+                                "musicShelfRenderer": { "contents": [
+                                    track_row("ar1", "Artist Song", "A")
+                                ] }
+                            }] } } } }] } }
+                    }))
+                }),
+            );
+
+            let fake = spawn(routes);
+            // Point the client at it. `set_home_for_test` takes the first value
+            // it is given, so this stays consistent for the process.
+            context::set_home_for_test(&fake.addr);
+            fake
+        })
+    }
+
+    /// Make `id` the visitor the next request goes out with.
+    ///
+    /// Seeding the pool rather than overriding the lookup: the retry path is
+    /// exactly what these tests are about, and an override would bypass it.
+    fn seed_visitor(id: &str) {
+        identity::seed_pool_for_test(id);
+    }
+
+    /// Serialises tests that depend on *which* visitor id goes out.
+    ///
+    /// The visitor pool is process-global, so a test that seeds it cannot run
+    /// concurrently with a test that asserts on the sent id. Cargo runs tests in
+    /// parallel threads by default, so this is not hypothetical. Blocks rather
+    /// than fails: these tests are independent, they just each need the shared
+    /// state to themselves for a moment.
+    async fn visitor_gate() -> tokio::sync::MutexGuard<'static, ()> {
+        static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    fn client() -> Client {
+        server();
+        Client::new().expect("client")
+    }
+
+    /// H1's regression guard, end to end: the first 403 must produce a *second*
+    /// request carrying a different visitor id, and that request must succeed.
+    ///
+    /// Before the fix, `ban` left the id in the pool *and* `visitor_data` handed
+    /// out a pooled id without consulting `banned`, so the retry re-selected the
+    /// id it had just banned and the whole metadata surface died for the life of
+    /// the process. `identity.rs` has unit tests for the eviction itself; this
+    /// one proves the retry loop actually recovers.
+    ///
+    /// Note the two halves mask each other: reverting *either* alone leaves this
+    /// test passing, because eviction alone stops a banned id being handed back
+    /// and the `banned` filter alone does too. It takes both to reproduce the
+    /// original defect, which is the honest scope of the guard — verified by
+    /// reverting both and watching this report
+    /// `["visitor-that-gets-403", "visitor-that-gets-403"]`.
+    #[tokio::test]
+    async fn a_rejected_visitor_is_rotated_and_the_request_retried() {
+        let _gate = visitor_gate().await;
+        let fake = server();
+        let c = client();
+
+        seed_visitor(REJECTED_VISITOR);
+        // No un-seeding afterwards: the client bans this id on the 403 and
+        // fetches a fresh one, which is the behaviour under test.
+        let outcome = c.search_tracks("rotation").await;
+
+        let sent: Vec<String> = fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.endpoint() == "search" && r.query() == "rotation")
+            .map(|r| r.header("x-goog-eom-visitor-id").to_owned())
+            .collect();
+        // Asserted as one value so a failure reports the whole sequence.
+        assert_eq!(
+            (
+                sent,
+                outcome
+                    .as_ref()
+                    .map(|t| t.len())
+                    .map_err(ToString::to_string)
+            ),
+            (
+                vec![REJECTED_VISITOR.to_owned(), HOME_VISITOR.to_owned()],
+                Ok(1)
+            ),
+            "expected the seeded id, then a freshly fetched one"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_carries_the_context_object_and_innertube_headers() {
+        let _gate = visitor_gate().await;
+        let fake = server();
+        let c = client();
+        seed_visitor("visitor-for-context-test");
+
+        c.search_tracks("blinding lights").await.expect("search");
+
+        let reqs = fake.requests.lock().unwrap();
+        let search = reqs
+            .iter()
+            .rev()
+            .find(|r| r.endpoint() == "search")
+            .expect("a search request");
+
+        assert_eq!(search.method, "POST");
+        assert_eq!(search.header("content-type"), "application/json");
+        assert_eq!(search.header("x-youtube-client-name"), CLIENT_NAME_ID);
+        assert_eq!(
+            search.header("x-youtube-client-version"),
+            CLIENT_VERSION,
+            "the version scraped from the home page"
+        );
+        assert_eq!(
+            search.header("x-goog-eom-visitor-id"),
+            "visitor-for-context-test"
+        );
+        assert!(search.header("origin").starts_with("http://127.0.0.1"));
+        assert!(search.header("referer").starts_with("http://127.0.0.1"));
+        assert!(
+            search.header("cookie").contains("SOCS="),
+            "the consent cookie must be sent"
+        );
+
+        let client_ctx = search
+            .body
+            .pointer("/context/client")
+            .expect("context.client");
+        assert_eq!(client_ctx["clientName"], context::CLIENT_NAME);
+        assert_eq!(client_ctx["visitorData"], "visitor-for-context-test");
+        assert_eq!(client_ctx["hl"], "en");
+        assert_eq!(search.body["query"], "blinding lights");
+        assert!(
+            search.body["params"].is_string(),
+            "a filtered search must send params"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_403_is_retried() {
+        let fake = server();
+        let c = client();
+
+        let err = c
+            .search_tracks(ALWAYS_429)
+            .await
+            .expect_err("a 429 must not be treated as success");
+        match err {
+            Error::Api { status, .. } => assert_eq!(status, 429),
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+
+        let attempts = fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.endpoint() == "search" && r.query() == ALWAYS_429)
+            .count();
+        assert_eq!(attempts, 1, "only a 403 is retried");
+    }
+
+    #[tokio::test]
+    async fn a_403_on_every_attempt_reports_forbidden() {
+        let fake = server();
+        let c = client();
+
+        let err = c
+            .search_tracks(ALWAYS_403)
+            .await
+            .expect_err("a permanent 403 must fail");
+        match err {
+            Error::Api { status, message } => {
+                assert_eq!(status, 403);
+                assert!(
+                    message.contains("rotating"),
+                    "the give-up path should say the rotation was exhausted: {message}"
+                );
+            }
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+
+        let attempts = fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.endpoint() == "search" && r.query() == ALWAYS_403)
+            .count();
+        assert_eq!(attempts, 2, "the retry budget is one extra attempt");
+    }
+
+    #[tokio::test]
+    async fn playlist_pagination_follows_continuations_up_to_the_limit() {
+        let c = client();
+        let tx = tx();
+        let playlist = c
+            .playlist(&format!("PLtest_pagination_{tx}"), 7)
+            .await
+            .expect("playlist");
+
+        assert_eq!(playlist.name, "Pagination Test");
+        let expected: Vec<String> = (1..=7).map(|n| format!("p{tx}-{n}")).collect();
+        assert_eq!(
+            playlist
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "three pages followed, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_pagination_truncates_at_the_limit() {
+        let c = client();
+        let tx = tx();
+        let playlist = c
+            .playlist(&format!("PLtest_pagination_{tx}"), 3)
+            .await
+            .expect("playlist");
+        let expected: Vec<String> = (1..=3).map(|n| format!("p{tx}-{n}")).collect();
+        assert_eq!(
+            playlist
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "stops mid-page at the limit rather than taking the whole page"
+        );
+    }
+
+    #[tokio::test]
+    async fn playlist_pagination_stops_when_a_page_yields_no_tracks() {
+        let c = client();
+        let playlist = c.playlist("PLtest_degenerate", 50).await.expect("playlist");
+        assert!(
+            playlist.tracks.is_empty(),
+            "a token with no rows must stop the walk, not spin: {:?}",
+            playlist.tracks
+        );
+    }
+
+    #[tokio::test]
+    async fn album_and_artist_pages_route_to_browse_and_parse() {
+        let c = client();
+
+        let album = c.album("MPREb_test").await.expect("album");
+        assert_eq!(album.name, "Test Album");
+        assert_eq!(album.tracks.len(), 1);
+
+        let artist = c.artist("UCtest").await.expect("artist");
+        assert_eq!(artist.name, "Test Artist");
     }
 }
