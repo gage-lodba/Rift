@@ -1,5 +1,25 @@
 # Rift — full code review
 
+> **Status (2026-09-29):** every item below has been triaged and marked
+> **fixed**, **retracted**, or **deferred** with a one-line reason, in
+> `<blockquote>` notes under each heading. The work landed as seven commits,
+> `7df0c81..7ddd789`. Test count went 65 → 101; the four required checks
+> (`cargo fmt --all -- --check`, both clippy passes, and
+> `cargo test --workspace --exclude rift-ui --locked`) are clean.
+>
+> Two claims are retracted, both because the defect does not exist in the code
+> as written: **L1** (the crossfade fade-out already reads the live master
+> volume) and part of **L13** (`match_all.first()` is unreachable — the regex
+> always matches in practice, so `first()` cannot panic; the padded-base64
+> limitation is real but harmless). The previously retracted `shuffle_cursor`
+> panic and `fetch_track` dedup bug, and the `artist.json` "Singles & EPs"
+> downgrade, stand as recorded at the bottom.
+>
+> **Deferred, with reasons:** L7 (regex caching), L10 (typed UGC signal), M10
+> (shuffle-history remapping), and the `with_extension` shape in M9. Each is a
+> behaviour or performance change rather than a defect, and each is noted at its
+> item.
+
 Scope: every tracked source file (`src-tauri/`, `crates/ytmusic/`, `types/`, `ui/`,
 `docs/`, `.github/`, manifests). HEAD `a4b8d30` plus the uncommitted player diff.
 
@@ -13,6 +33,10 @@ Verification performed on this checkout:
 | Tests | `cargo test --workspace --exclude rift-ui --locked` | 65 passed, 0 failed |
 | Path semantics | isolated `rustc` program printing `with_extension` results | confirmed L2 |
 
+*(As of the fixes: the same four commands are clean and the test count is 101.
+Two further checks were added to CI — `cargo tauri build --no-bundle`, and
+`.github/scripts/check-duplicate-deps.sh`.)*
+
 Overall this is an unusually well-documented, well-tested codebase for its size.
 Comments explain *why*; the panic surface in the backend is tiny (4 non-test
 `unwrap`/`expect`, all on thread spawn or an already-proven `OnceLock`); the
@@ -25,6 +49,13 @@ capability set is admirably narrow. The findings below are ordered by severity.
 
 ### C1. `use_state` after an early return — the queue panel violates hook order
 `ui/src/components/queue.rs:21-30`
+
+> **FIXED** (`7df0c81`). The callback is hoisted above the early return. Audited
+> the other three `return html!` sites in `ui/src` (`app.rs:808`, `icons.rs:66`,
+> `menu.rs:54`): all are inside plain closures or after every hook, so this was
+> the only instance. No test — nothing drives the Yew renderer, and adding a
+> wasm harness is its own CI-shaped change; the invariant is documented at the
+> call site instead.
 
 ```rust
 let collapsed = use_state(|| false);                    // :21
@@ -61,6 +92,12 @@ if props.queue.tracks.is_empty() { return html! {}; }
 ## High
 
 ### H1. A banned visitor id is immediately reused — one 403 permanently 403s the session
+
+> **FIXED** (`5ab2a7d`). `ban` now evicts the id from `ids`, so the retry fetches
+> a fresh one. Selection is split into `reusable_id` and tested; both tests fail
+> if the eviction is removed (verified). L12's `lock().unwrap()` on the same pool
+> is fixed with a poison-recovering helper.
+
 `crates/ytmusic/src/identity.rs:25-35`, with `client.rs:186-189`
 
 ```rust
@@ -78,6 +115,8 @@ The control flow also makes `banned` nearly pointless — the `continue` can nev
 yield a different id. Fix: drop the id on ban (`p.ids.retain(|i| i != id)`).
 
 ### H2. A stale client version is cached for the whole process
+
+> **FIXED** (`7df0c81`). Only a successful scrape is cached; the fallback stays per-call. The caching rule is extracted as a synchronous helper so both branches are tested without a network. Writing that test found that `OnceLock::get_or_init` alone memoizes its closure's `None` too � the first implementation still cached the fallback.
 `crates/ytmusic/src/context.rs:15, 44-49`
 
 ```rust
@@ -93,6 +132,13 @@ every request fails with `innertube returned status 400` until restart. Fix: onl
 write the cache on a successful scrape; keep the fallback per-call.
 
 ### H3. No HTTP timeouts anywhere — a half-open connection wedges the app
+
+> **FIXED** (`7df0c81`). `.connect_timeout(5s).timeout(30s)` on both builders,
+> plus a bounded yt-dlp subprocess wait with `kill_on_drop`. One deviation: the
+> installer's asset download overrides the 30 s ceiling per-request (300 s),
+> because that one is a multi-megabyte binary and applying a status-call ceiling
+> to it would be a regression.
+
 `src-tauri/src/main.rs:111`, `crates/ytmusic/src/client.rs:35-39`
 
 Both `reqwest::Client`s use defaults, and reqwest's default is **no timeout**.
@@ -110,6 +156,8 @@ Fix: `.connect_timeout(5s).timeout(30s)` on both builders, plus a
 `tokio::time::timeout` around the yt-dlp subprocess wait (`fetch.rs:96`).
 
 ### H4. PlayerBar's live progress survives a track change
+
+> **FIXED** (`5ab2a7d`). The seeding effect is keyed on track identity as well as the seed, and the single render before it re-runs falls back to the new track's metadata duration with a zeroed position. No test: `ui` has no harness at all.
 `ui/src/components/player_bar.rs:36, 43-46, 107, 115-119`
 
 ```rust
@@ -129,6 +177,8 @@ the effect on track identity as well as the seed, falling back to
 `track.duration` while loading.
 
 ### H5. Menus are unreachable by keyboard and cannot be dismissed with Escape
+
+> **FIXED** (`e48476d`). Escape/Up/Down/Home/End/Left/Right, `role="menu"`/`menuitem`, focus on open, and focus restore to the trigger. The `outline: none` declarations are replaced with a `:focus-visible` ring (plus `:focus-within` on the input wrapper).
 `ui/src/components/menu.rs:53-66, 75`
 
 No `onkeydown`, no `role="menu"`/`menuitem`, no `tabindex`, no focus trap, no
@@ -146,6 +196,8 @@ the first item on open, and replace blanket `outline: none` with a
 ## Medium
 
 ### M1. Crossfade decode failure can leave the UI showing a track that isn't playing
+
+> **FIXED** (`2cc59da`). The audio thread decodes before clearing, and `AudioCmd::Play` carries an ack so `Playing` is committed only after a successful decode. The audio thread stays silent when an ack is outstanding, so exactly one path advances the queue.
 `src-tauri/src/player/playback.rs:85`, `audio.rs:108-130`
 
 `start_playback` sets `core.state = Playing` (line 85) before the audio thread
@@ -157,6 +209,8 @@ the UI reports Playing with an advancing bar; the state only corrects when the
 right — its comment is accurate.)
 
 ### M2. `is_online` returns *true* when it cannot reach the network
+
+> **FIXED** (`5ab2a7d`). A non-success status is offline, and the response must also carry YouTube's own `x-youtube-client-name` � a portal answers with a perfectly good 200. Split into a pure helper and tested without a round trip.
 `src-tauri/src/util.rs:101-110`
 
 ```rust
@@ -171,6 +225,8 @@ a non-success status as offline too, and check the response actually came from
 YouTube.
 
 ### M3. In-flight download claims are never released on the retry path
+
+> **FIXED** (`5ab2a7d`). Dropped tracks are `mark_failed`'d and emitted. The split is extracted as `partition_retryable` and tested, since the bug was precisely that the dropped ids were filtered away instead of reported.
 `src-tauri/src/commands/downloads.rs:264-272`
 
 ```rust
@@ -186,6 +242,8 @@ no retry affordance. Also, if the playlist is edited during the backoff the trac
 is silently abandoned. Fix: `mark_failed` the dropped ids and `emit_downloads`.
 
 ### M4. `api::fire` makes 41 of 55 IPC calls fire-and-forget
+
+> **FIXED** (`f323ed1`). `fire` reports failures to a sink `App` installs on mount, reusing the same toast the backend's `rift://error` events use � which also removes the inconsistency the review called the real problem.
 `ui/src/api.rs:33-39`, plus 41 call sites
 
 `fire` logs to `web_sys::console` and returns, so `Err` values not mirrored by a
@@ -197,6 +255,8 @@ that *do* emit `events::ERROR` toast correctly, which makes the inconsistency th
 real problem. Fix: give `fire` an error path into the existing toast.
 
 ### M5. Search failures are indistinguishable from empty results
+
+> **FIXED** (`f323ed1`). Both halves: search failures toast, and clearing the box drops the stale query (bumping the generation so an in-flight search for the deleted text cannot land afterwards) and leaves the results view.
 `ui/src/app.rs:473-480`, `ui/src/components/titlebar.rs:60`
 
 ```rust
@@ -210,6 +270,8 @@ empty query, so clearing the box leaves the old results rendered under
 `Results for "<old query>"` (`app.rs:979`).
 
 ### M6. `withGlobalTauri` + app commands outside the ACL is a wide surface
+
+> **FIXED** (`f323ed1`). `build.rs` declares an app ACL manifest listing all 47 commands, which � confirmed against the Tauri source � is what *enables* enforcement for app commands; `capabilities/default.json` grants them via `permissions/default.toml`. Cross-checked programmatically against `invoke_handler`. `set_yt_dlp_path` validates through `validate_ytdlp_override` (absolute, canonicalized, regular file). One correction: the review's suggested remedy does not match the code � the path comes from a free-text field, not the native dialog, so "require a file chosen through the dialog" would have meant rewriting the Settings control.
 `src-tauri/tauri.conf.json:19`, `src-tauri/build.rs:1-3`, `commands/ytdlp.rs:21-32`
 
 `withGlobalTauri: true` is required by `ui/src/api.rs:12`, so it is intentional.
@@ -229,6 +291,8 @@ explicitly granted, and validate the yt-dlp override (canonicalize; require a
 file chosen through the existing native dialog).
 
 ### M7. The one-click yt-dlp installer executes an unverified download
+
+> **FIXED** (`f323ed1`). `SHA2-256SUMS` is fetched from the same release first, the asset looked up, and the digest compared before the write or the chmod. SHA-256 is implemented in-tree rather than adding `sha2`, checked against the FIPS vectors and streaming/one-shot agreement.
 `src-tauri/src/fetch.rs:174-212`, `commands/ytdlp.rs:37-60`
 
 `github.com/yt-dlp/yt-dlp/releases/latest/download/<asset>` is fetched, written,
@@ -240,6 +304,8 @@ reproducible. Fix: fetch `SHA2-256SUMS` from the same release and verify before
 writing/chmod.
 
 ### M8. Persistent player state is written on the event loop
+
+> **FIXED** (`2cc59da`). Serialization moved to the persister's own thread, and an identical payload for the same path is dropped � which is exactly the double-emit case. The `Persister` doc now states the final-snapshot loss it previously only implied.
 `src-tauri/src/player/playback.rs:195`, `state.rs:101-117`
 
 `emit_queue` clones every `Track`, `serde_json::to_vec`s the snapshot and queues
@@ -250,6 +316,8 @@ inside a `tauri::async_runtime::spawn` task sharing the runtime with IPC. Fix:
 debounce, or skip the write when the snapshot is unchanged.
 
 ### M9. `atomic_write`'s temp name is correct only by accident, and the whole write path is untested
+
+> **FIXED (tests)** (`5ab2a7d`). `util.rs` has a round-trip, a corrupt-file-backup and an atomic-write test, the last pinning the temp-is-beside-the-target property the rename depends on. **DEFERRED:** the `with_extension` shape itself is unchanged � the review verified it is not a live bug, and the test now pins the behaviour rather than leaving it incidental.
 `src-tauri/src/util.rs:92-96`
 
 `path.with_extension("tmp")` is purely lexical, so `settings.json` →
@@ -263,6 +331,8 @@ snapshot is lost on quit — acceptable per the module doc, but it should be sta
 as a known loss.
 
 ### M10. Shuffle history is discarded on every queue edit
+
+> **DEFERRED.** The in-code rationale (indices shift) is sound and remapping through an edit is a behaviour change with its own design questions, not a defect. Left as recorded.
 `src-tauri/src/player/queue.rs:27-32, 106-108, 135-137`
 
 The in-code rationale (indices shift) is sound, but the user-visible effect is
@@ -271,6 +341,8 @@ tracks heard minutes ago become immediately eligible again. Remapping old indice
 through the edit would preserve the cycle.
 
 ### M11. `parse::tracks` uses the whole subtitle as the artist
+
+> **FIXED** (`226b537`), and `tests/fixtures.rs` no longer enshrines the defect. The rule is deliberately narrow � only structurally identifiable runs are dropped � because a bare year sits where a byline does on album rows and a band named "1975" or "2 Unlimited" would be a real name.
 `crates/ytmusic/src/parse.rs:223-228`
 
 `runs_all` concatenates every run of the subtitle column, which for an unlinked
@@ -280,6 +352,8 @@ row is `["Song", " • ", "3:22"]` → `"Song • 3:22"`. Verified against
 duration run before falling back.
 
 ### M12. `find_all(..).first()` is alphabetical, not document order
+
+> **FIXED** (`226b537`). Every known location is read by path with `find_all` kept as an explicit fallback, and `track_credits` matches the requested `videoId` � returning nothing when the response does not contain it, rather than another song's byline.
 `crates/ytmusic/src/parse.rs:11-28`, call sites `:395, 455, 472-478, 590-595, 611`
 
 `serde_json 1.0.151` is built without `preserve_order` (the lockfile shows no
@@ -294,6 +368,8 @@ known paths first and keep `find_all` as a fallback; match the video id in
 `track_credits`.
 
 ### M13. `parse_duration` drops bad segments and can overflow
+
+> **FIXED** (`226b537`). Every component parsed with `?`, sums checked, and a bare `"45"` is no longer read as a duration.
 `crates/ytmusic/src/parse.rs:174-179`
 
 `filter_map(|p| p.parse().ok())` turns `"1:2x:03"` into `[1, 3]` → 63 s, and the
@@ -303,6 +379,8 @@ sets no `overflow-checks`). Fix: parse every component with `?` and use
 `checked_mul`/`checked_add`.
 
 ### M14. `?` inside a reverse loop aborts the scan
+
+> **FIXED** (`226b537`). Both scans `continue`, matching how `duration` already worked.
 `crates/ytmusic/src/parse.rs:319` (`audience`), `:362` (`trailing_year`)
 
 `let text = run.get("text").and_then(Value::as_str)?;` inside
@@ -311,6 +389,8 @@ first run lacking a string `text`, instead of continuing like `duration`
 (`:279`) does — silently dropping a present year or subscriber count.
 
 ### M15. Packaged builds are never compiled or bundled in CI
+
+> **FIXED** (`7ddd789`). A `cargo tauri build --no-bundle` step, a tag-versus-manifest assertion in the release job (tested both ways), and tag pushes now publish � `releases/latest` excludes drafts, so a draft-only workflow meant the update banner could never fire.
 `.github/workflows/ci.yml`, `release.yml:84-100`
 
 CI runs `trunk build`, two clippy passes and the backend tests. Clippy links the
@@ -327,6 +407,8 @@ ever creates **drafts** — which that endpoint excludes, so the update banner c
 never fire.
 
 ### M16. Duplicate majors in one binary
+
+> **FIXED** (`7ddd789`). The direct `reqwest` is 0.13, matching what Tauri pulls in, so `reqwest` is gone from `cargo tree -d` entirely � as are `rand` and `zbus`. The CI guard is a script rather than bare `cargo tree -d`, which exits 0 either way and also flags same-version feature splits.
 `Cargo.lock` vs `src-tauri/Cargo.toml:23,26,29`, `crates/ytmusic/Cargo.toml:12`
 
 `reqwest 0.12.28` (direct) **and** `0.13.4` (via tauri 2.11.5); `rand 0.8.8`
@@ -339,62 +421,164 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
 
 ## Low / Nits
 
+> **Status:** L1 **retracted**; L2 folded into M9; L3, L4, L5, L6, L8, L9, L11,
+> L12, L14, L15, L16, L17, L18 **fixed**; L7, L10 **deferred** (below); L13
+> **partly retracted, partly folded into H1**.
+
 - **L1. `AudioCmd::Volume` ignores in-flight fade-outs** (`audio.rs:183-186`): the
   `fading` vec keeps ramping from the old `volume` captured at `:199`, so dragging
   the slider during a crossfade produces an audible level mismatch that resolves
   only when the fade ends.
+
+  > **RETRACTED — could not reproduce, no change made.** The fade-out gain is
+  > recomputed every loop iteration as `volume * (1.0 - t)`, reading the live
+  > master volume, and the `Volume` arm writes `volume` before that code runs.
+  > Dragging the slider mid-crossfade already retargets both players on the next
+  > 30 ms tick. There is no captured copy at `:199` to fix; `volume` appears in
+  > exactly four places, all in that loop.
+
 - **L2. `with_extension` trap** (see M9) — documented here for the record since I
   verified it empirically; no live caller is affected.
+
+  > **FIXED (pinned by test)** (`5ab2a7d`). The atomic-write test asserts the temp
+  > file's parent equals the target's, so the property the rename depends on is
+  > now pinned rather than incidental. The call itself is unchanged — see M9.
+
 - **L3. Offline playback returns `duration: 0.0`** (`fetch.rs:51-57`), which
   `start_playback` uses to overwrite `core.duration` with the metadata guess
   (`playback.rs:57`). The decoder corrects it a moment later, but the seek bar
   jumps.
+
+  > **FIXED** (`2cc59da`) via `preseed_duration`: use the track's own metadata
+  > length, and when there is none keep the length the bar already had rather
+  > than collapsing it to zero for the fetch window. Tested, including the
+  > `Some(0)` case.
+
 - **L4. `epoch` is dead code with a false comment** (`player/state.rs:36-37`): it is
   incremented in three places (`commands/playback.rs:35,62`,
   `commands/queue.rs:92`) and read nowhere. Its doc claims "stale radio fills
   check it" — the radio feature was removed, as `commands/playback.rs:41-42`
   itself says, and `play_track`'s `radio: bool` is accepted then discarded
   (`let _ = radio;`). Delete both.
+
+  > **FIXED** (`7ddd789`). Field, its false doc comment, all three increments, the
+  > discarded `radio` parameter and its comment are gone. The command keeps its
+  > name and `track` argument, so the frontend call site is unaffected.
+
 - **L5. `queue_add_tracks` is a registered command with no caller** (`main.rs:150`);
   the UI appends one track at a time.
+
+  > **FIXED** (`7ddd789`). Removed from `main.rs`, `build.rs`'s ACL manifest and
+  > `permissions/default.toml` — the three places that must agree. `append_tracks`
+  > stays (used by `queue_add`, covered by tests). Re-verified: 46 registered,
+  > 46 granted.
+
 - **L6. Silent parse degradation.** A renderer rename (e.g. YouTube moving off the
   legacy `nextContinuationData` that `playlist_page:589` reads — the fixture still
   uses it, so only a *new* capture would catch the migration) yields zero results
   with no error. Consider warning when a response contains
   `musicResponsiveListItemRenderer` nodes but nothing is extracted.
+
+  > **FIXED** (`226b537`). A response carrying rows that yield nothing logs a
+  > warning. (The parser also reads `nextContinuationData` by path now, with the
+  > document-order fallback, so a *moved* continuation is more likely to survive
+  > than to be reported.)
+
 - **L7. Regex compiled per request** (`identity.rs:73`, `context.rs:68`) inside the
   request path; cache in a `OnceLock`.
+
+  > **DEFERRED.** Two regexes compiled per request against a host that is already
+  > doing a network round trip; the cost is real but negligible next to that, and
+  > caching them adds a `OnceLock` plus an error path for a compile that cannot
+  > fail on a literal pattern. Worth doing if the request path ever gets hot for
+  > another reason.
+
 - **L8. `album_type` is an exact match on a server-controlled title**
   (`parse.rs:526-529`): `"Singles" => "Single", _ => "Album"`. I checked
   `tests/fixtures/artist.json` and it contains **no** Singles shelf at all (only
   "Albums", "Featured on", "Fans might also like"), so nothing pins this mapping
   and any rename silently degrades every card to "Album". Use `starts_with`.
+
+  > **FIXED** (`226b537`). Prefix matching, extracted as `album_type_from_shelf`
+  > and tested against "Singles", "Singles and EPs", "EPs" and the non-label
+  > titles. Confirmed the downgrade in the review: the fixture's shelf is titled
+  > "Singles & EPs", so nothing there pinned the old mapping.
+
 - **L9. `tracks_playlist_id` takes the first `VL…` id under *any* `bottomEndpoint`**
   (`parse.rs:494-508`), not the top-songs shelf's; the fixture's Videos carousel
   already carries one, so a layout change makes "Show all songs" load the wrong
   list with no error.
+
+  > **FIXED** (`226b537`). Reads the top-songs shelf's own link, with a
+  > document-order fallback, and is tested with a decoy `VL…` id under a key that
+  > sorts earlier — which is what the old value-order walk would have taken.
+
 - **L10. `is_audio_track` is a title substring filter** (`commands/convert.rs:19-35`).
   Fine as a heuristic, but the typed signal (`MUSIC_VIDEO_TYPE_UGC`, already parsed
   at `parse.rs:209`) is strictly more reliable.
+
+  > **DEFERRED.** The review itself calls the current filter fine as a heuristic,
+  > and the typed signal only travels with innertube rows — imported playlists and
+  > exported JSON do not carry it, so `is_audio_track` would still need its
+  > title-based fallback. Switching only the rows that have the signal would make
+  > the two paths disagree about the same track.
+
 - **L11. `parse_count` truncates** (`parse.rs:169`) — `.round()` would be correct.
+
+  > **FIXED** (`226b537`). Rounds, and maps non-finite input to `None` rather than
+  > relying on float-to-int saturation. Tested with "1.7K" and "infB".
+
 - **L12. `identity.rs` uses `lock().unwrap()`** (`:27,33,39`) where the rest of the
   codebase uses `lock_safe`; a panic in the critical section poisons the pool and
   turns every later call into a panic.
+
+  > **FIXED** (`5ab2a7d`). A `lock_pool` helper recovers the poisoned guard, with
+  > the same reasoning as `util::LockExt`.
+
 - **L13. `match_all.first()` risk in `identity::visitor_data`** is covered by H1; the
   regex at `:73` also excludes `=`, so a padded base64 `visitorData` could never be
   matched, and the bootstrap GET lacks `error_for_status()` (contrast
   `context.rs:59`).
+
+  > **PARTLY RETRACTED.** There is no `match_all` in `visitor_data` — the id comes
+  > from the `__Secure-YEC` cookie first and the regex second, so the `first()` on
+  > a possibly-empty collection does not exist. The padded-base64 limitation is
+  > real but harmless: `visitorData` is URL-encoded in practice, and a miss falls
+  > through to `Error::Bootstrap` rather than selecting the wrong id. The
+  > `error_for_status()` gap is subsumed by H3 (the client now has a timeout) and
+  > was left alone: a non-2xx body simply fails to yield visitor data, which is
+  > already an error.
+
 - **L14. Release actions float on mutable tags** (`tauri-apps/tauri-action@v0`,
   `dtolnay/rust-toolchain@stable`, `actions/checkout@v5`, `Swatinem/rust-cache@v2`)
   while the release job holds `contents: write` and builds the artifacts users
   install. SHA-pin them, and pin an explicit toolchain version (there is no
   `rust-toolchain.toml`, so CI and release can silently move).
+
+  > **FIXED** (`7ddd789`). All five actions pinned to commit SHAs with the version
+  > in a trailing comment (which Dependabot can still update), `rust-toolchain.toml`
+  > pins 1.98.0, and every workflow passes it explicitly. Note `@stable` there is a
+  > *moving branch*, not a tag — and with no `toolchain:` input it installed
+  > whatever `stable` was that week, so CI and the released installers could be
+  > built by different compilers from the same commit.
+
 - **L15. `src-tauri/gen/schemas/*.json` (~440 KB) is tracked** and not ignored;
   upstream's Tauri template ignores `/gen/schemas`. It churns on every dependency
   bump and can drift from the real plugin set. `git rm --cached -r src-tauri/gen`.
+
+  > **FIXED** (`f323ed1`). Untracked and ignored, along with the build-generated
+  > `permissions/autogenerated/`. The hand-written `permissions/default.toml` is
+  > tracked.
+
 - **L16. Missing package metadata**: no workspace `authors`/`repository`/`rust-version`,
   and no `bundle.publisher`/`copyright`/`licenseFile`, so `.deb` Maintainer and MSI
   Manufacturer fall back to defaults.
+
+  > **FIXED** (`7ddd789`), except `rust-version`: the toolchain is *pinned* by
+  > `rust-toolchain.toml`, and declaring a minimum nobody has built against would
+  > be a guess presented as a guarantee. Add one once an older toolchain is
+  > verified in CI.
+
 - **L17. No malformed-input tests.** `tests/fixtures.rs` covers only happy paths;
   nothing feeds missing `flexColumns`, `null` titles, wrong JSON types, empty
   arrays, a "no results" response or an error/consent body, and `client.rs`
@@ -402,8 +586,24 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
   `examples/prune_fixture.rs:415-436` proves the compacted document parses
   identically *to itself*, so the fixtures lock in current parser output rather
   than validating it — M11 is a case where a test codifies a defect.
+
+  > **FIXED (parser half)** (`226b537`). A malformed-input table covers missing
+  > `flexColumns`, `null` titles, wrong JSON types, empty arrays, a "no results"
+  > body, a consent body, an error body, a non-object root and pathological
+  > nesting — every parser asserted to return nothing rather than panic. Writing
+  > it found a real gap: a row with a valid `videoId` but no title column produced
+  > a blank, unclickable track. `prune_fixture.rs` now carries a comment stating
+  > that its check is an equivalence proof between the original and the compacted
+  > document, not a correctness proof. **Still open:** `client.rs` transport, the
+  > 403 retry and pagination remain untested — they need a mock HTTP server, which
+  > is a test-infrastructure decision rather than a parser fix.
+
 - **L18. Test litter**: `settings.rs` / `downloads.rs` / `library.rs` tests create
   `%TEMP%\rift-*` dirs and skip cleanup on failure.
+
+  > **FIXED** (`7ddd789`). A `TempDir` drop guard, which also runs while
+  > unwinding, so a failing test cleans up like a passing one. Verified by
+  > counting the directories across a run. (432 had accumulated here.)
 
 ---
 
@@ -470,3 +670,41 @@ Recorded because these are the places a reviewer expects trouble:
   unusually accurate (the exceptions are called out above: `state.rs:36`, and
   `reorder.rs` setting state during render, which converges because the values are
   unchanged).
+
+> **All of the above still holds after the fixes**, with one deliberate amendment:
+> `capabilities/default.json` no longer grants only `core:default` +
+> `core:window:allow-start-dragging`. It also grants `default`, the app's own
+> permission set (M6) — which is the change that puts Rift's own commands *under*
+> the ACL rather than outside it. The plugin grants are unchanged, and the CSP is
+> untouched.
+
+---
+
+## Follow-ups found while fixing
+
+Issues this session surfaced that were not in the original review. None is
+currently a defect in shipped behaviour; they are recorded so the next pass
+starts from the code rather than from scratch.
+
+- **`uploader`/`channel`-style rows are still filtered by title substring**
+  (`commands/convert.rs`) — see the deferred L10 above. The blocker is that the
+  typed signal does not travel with imported playlists.
+- **`client.rs` transport, the 403 retry and playlist pagination are untested.**
+  The parser now has a malformed-input table, but exercising the retry needs a
+  mock HTTP server. `crates/ytmusic` has `tokio` as a dev-dependency already, so
+  a `TcpListener` speaking canned responses would do it without a new crate; the
+  decision to be made is whether that belongs in this repo's test suite.
+- **No frontend test harness at all.** Three fixes this session (C1, H4, M5b)
+  are in Yew components and carry no test, for this reason. `wasm-bindgen-test`
+  plus a headless runner in CI is the missing piece, and it would also let the
+  focus and keyboard work in Phase 5 be asserted rather than built-and-eyeballed.
+- **The `ui` clippy pass needs `wasm32-unknown-unknown`; `trunk build` needs
+  `NO_COLOR` set to a value trunk accepts.** Trunk 0.21 rejects `NO_COLOR=1`
+  ("invalid value '1' for '--no-color'"). CI does not set it, so this only bites
+  a developer whose environment does — worth knowing before debugging a local
+  build failure that CI does not reproduce.
+- **`cargo tauri build --no-bundle` was added to CI but not run locally** in this
+  session (it compiles the release profile with LTO). The flag is present in the
+  installed CLI and the config parses under `generate_context!`, but the first
+  CI run is what actually exercises it.
+
