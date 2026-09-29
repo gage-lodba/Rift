@@ -121,6 +121,7 @@ fn main() {
                     .unwrap_or_default(),
                 playback_path,
                 persist: util::Persister::spawn(),
+                last_session: Mutex::new(None),
             });
 
             let media = media::spawn(app.handle().clone());

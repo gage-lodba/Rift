@@ -13,6 +13,30 @@ use crate::audio::AudioCmd;
 use crate::util::LockExt;
 use crate::AppState;
 
+/// How long to wait for the audio thread to acknowledge a decode.
+///
+/// Decoding is from memory, so this is milliseconds in practice; the bound only
+/// exists so a wedged audio thread cannot hang the playback task forever.
+const DECODE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The length to show for a track whose stream is still being fetched.
+///
+/// [`rift::fetch::fetch_track`] reports 0.0 when the length is unknown — it
+/// hands back the raw stream rather than probing the media, and the offline path
+/// short-circuits entirely — and a track whose metadata lacked a duration has
+/// `None`. Taking that zero at face value zeroes the seek bar's range until the
+/// decoder corrects it a moment later, which reads as the bar jumping on every
+/// offline track. Pure, so the rule is testable without a decoder.
+pub(crate) fn preseed_duration(track_duration: Option<u32>, previous: f64) -> f64 {
+    match track_duration {
+        Some(secs) => secs as f64,
+        // No metadata length either: keep the length the bar already had rather
+        // than collapsing it, and let the decoder's `AudioEvent::Duration`
+        // supply the authoritative value.
+        None => previous,
+    }
+}
+
 /// Start playing the track at `index`, treating it as a fresh anchor for the
 /// shuffle history. Used by direct jumps — clicking a track, starting a
 /// collection, resuming a stopped track. Sequential and shuffle Next/Previous
@@ -28,8 +52,7 @@ pub fn play_index(app: &AppHandle, index: usize) {
         // A deliberate jump is a fresh start: give the queue a full retry budget.
         core.failures = 0;
         if core.shuffle {
-            core.shuffle_history = vec![index];
-            core.shuffle_cursor = 0;
+            super::nav::seed_shuffle_anchor(&mut core, index);
         }
     }
     start_playback(app, index);
@@ -55,7 +78,7 @@ pub(crate) fn start_playback(app: &AppHandle, index: usize) {
         core.pending_next = None;
         core.state = PlaybackState::Loading;
         core.position = 0.0;
-        core.duration = track.duration.unwrap_or(0) as f64;
+        core.duration = preseed_duration(track.duration, core.duration);
         (track, core.generation)
     };
     let _ = shared.audio.send(AudioCmd::Stop);
@@ -78,19 +101,79 @@ pub(crate) fn start_playback(app: &AppHandle, index: usize) {
         match rift::fetch::fetch_track(&downloads.dir, &track.id).await {
             Ok((data, duration)) => {
                 {
-                    let mut core = shared.core.lock_safe();
+                    let core = shared.core.lock_safe();
                     if core.generation != generation {
                         debug!("discarding stale download for {}", track.id);
                         return;
                     }
+                }
+                // Hand the bytes to the audio thread and wait for it to decode
+                // them. `Playing` is announced only on a successful decode: the
+                // state used to flip here, before the audio thread had looked at
+                // the payload, so a decode failure left the UI reporting Playing
+                // with an advancing bar over silence until the tick noticed.
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                if shared
+                    .audio
+                    .send(AudioCmd::Play(data, Some(ack_tx)))
+                    .is_err()
+                {
+                    error!("audio thread is gone; cannot play {}", track.id);
+                    return;
+                }
+                // The audio thread decodes in-memory bytes, so this is a few
+                // milliseconds; the timeout only guards against a wedged thread.
+                let decoded = match tokio::time::timeout(DECODE_ACK_TIMEOUT, ack_rx).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err("audio thread dropped the decode request".to_owned()),
+                    Err(_) => Err(format!(
+                        "audio thread did not decode within {}s",
+                        DECODE_ACK_TIMEOUT.as_secs()
+                    )),
+                };
+
+                let stream_dur = match decoded {
+                    Ok(d) => d,
+                    Err(msg) => {
+                        // The bytes reached the audio thread and it refused them,
+                        // so there is nothing to play and nothing playing. Commit
+                        // Stopped (the fetch-failure path below cannot be reused:
+                        // auto-skipping here would race the audio thread's own
+                        // `DecodeFailed`, and with an ack outstanding the thread
+                        // deliberately stays quiet so only one path advances the
+                        // queue).
+                        error!("failed to play {}: {msg}", track.id);
+                        {
+                            let mut core = shared.core.lock_safe();
+                            if core.generation != generation {
+                                return;
+                            }
+                            core.state = PlaybackState::Stopped;
+                        }
+                        let _ = app.emit(
+                            events::ERROR,
+                            format!("Could not play \u{201c}{}\u{201d}: {msg}", track.title),
+                        );
+                        emit_state(&app, PlaybackState::Stopped);
+                        return;
+                    }
+                };
+
+                let dur = {
+                    let mut core = shared.core.lock_safe();
+                    if core.generation != generation {
+                        debug!("discarding stale decode for {}", track.id);
+                        return;
+                    }
                     core.state = PlaybackState::Playing;
                     core.failures = 0;
-                    if duration > 0.0 {
+                    if stream_dur > 0.0 {
+                        core.duration = stream_dur;
+                    } else if duration > 0.0 {
                         core.duration = duration;
                     }
-                }
-                let _ = shared.audio.send(AudioCmd::Play(data));
-                let dur = shared.core.lock_safe().duration;
+                    core.duration
+                };
                 // Refresh Discord with the accurate stream/decoder duration: the
                 // initial set_track (before Loading) only had the metadata guess,
                 // which may be 0 or slightly off. The OS media session gets the

@@ -11,11 +11,16 @@ use std::time::{Duration, Instant};
 use rodio::stream::DeviceSinkBuilder;
 use rodio::{Decoder, Player, Source};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 use tracing::{error, info};
 
 pub enum AudioCmd {
     /// Decode and play a full in-memory audio file, replacing whatever plays.
-    Play(Vec<u8>),
+    ///
+    /// The optional ack reports whether the bytes decoded, so the caller can
+    /// commit `Playing` only once there is actually audio — a decode failure
+    /// must never leave the UI advancing a progress bar over silence.
+    Play(Vec<u8>, Option<oneshot::Sender<Result<f64, String>>>),
     /// Decode and play a new track, fading it in over the given duration while
     /// the current track fades out over the same window (a crossfade).
     Crossfade(Vec<u8>, Duration),
@@ -104,12 +109,19 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
         };
         match rx.recv_timeout(timeout) {
             Ok(cmd) => match cmd {
-                AudioCmd::Play(data) => {
-                    player.clear();
-                    // A hard cut discards any in-progress crossfade.
-                    fading.clear();
+                AudioCmd::Play(data, ack) => {
+                    // Decode *before* touching the live player. Clearing first
+                    // would silence the outgoing audio (and discard any
+                    // crossfade) even when the new payload turns out not to
+                    // decode — leaving the UI reporting Playing with an
+                    // advancing bar over silence until the ~250 ms tick notices
+                    // `player.empty()`. The Crossfade arm below has always been
+                    // ordered this way; this matches it.
                     match decode(data) {
                         Ok(source) => {
+                            player.clear();
+                            // A hard cut discards any in-progress crossfade.
+                            fading.clear();
                             // Report the real length so the seek bar is
                             // accurate even when metadata duration is missing.
                             let dur = source.total_duration().map(|d| d.as_secs_f64());
@@ -120,12 +132,30 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                             if let Some(d) = dur.filter(|d| *d > 0.0) {
                                 let _ = events.send(AudioEvent::Duration(d));
                             }
+                            // The caller commits `Playing` on this, rather than
+                            // before it sent the command.
+                            if let Some(ack) = ack {
+                                let _ = ack.send(Ok(dur.unwrap_or(0.0)));
+                            }
                         }
                         Err(e) => {
+                            // The previous track is left exactly as it was —
+                            // still playing, still holding its crossfade — so
+                            // the UI and the audio never disagree.
                             error!("failed to decode audio: {e}");
                             active = false;
-                            let _ =
-                                events.send(AudioEvent::DecodeFailed(format!("decode error: {e}")));
+                            let msg = format!("decode error: {e}");
+                            match ack {
+                                // A caller is waiting on the outcome and owns
+                                // the skip/stop decision; reporting it here as
+                                // well would advance the queue twice.
+                                Some(ack) => {
+                                    let _ = ack.send(Err(msg));
+                                }
+                                None => {
+                                    let _ = events.send(AudioEvent::DecodeFailed(msg));
+                                }
+                            }
                         }
                     }
                 }

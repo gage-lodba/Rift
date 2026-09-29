@@ -19,6 +19,7 @@ mod state;
 mod tests;
 
 pub use events::event_loop;
+pub(crate) use nav::cycle_repeat;
 pub use nav::{play_next, play_prev, stop, toggle_playback};
 pub use playback::play_index;
 pub use queue::{

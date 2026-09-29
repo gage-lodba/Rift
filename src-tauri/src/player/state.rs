@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use rift_types::{events, PlaybackState, QueueSnapshot, RepeatMode, Track};
 use rift_ytmusic::Client;
 use tauri::{AppHandle, Emitter, Manager};
+use tracing::warn;
 
 use crate::audio::AudioCmd;
 use crate::util::{LockExt, Persister};
@@ -86,6 +87,13 @@ pub struct PlayerShared {
     /// Background writer for the playback snapshot (keeps disk I/O off the
     /// command/playback threads).
     pub persist: Persister,
+    /// The snapshot last handed to [`Persister`]. `emit_queue` is a broadcast
+    /// that runs after almost every queue mutation *and* from inside the
+    /// playback task, so several calls in a row carry an identical snapshot
+    /// (notably a track's first play, which emits once for the change and again
+    /// after credit enrichment). Comparing against this makes the repeats free
+    /// instead of a fresh write burst.
+    pub last_session: Mutex<Option<QueueSnapshot>>,
 }
 
 pub fn snapshot(core: &PlayerCore) -> QueueSnapshot {
@@ -108,12 +116,35 @@ pub fn emit_queue(app: &AppHandle, shared: &PlayerShared) {
     // Position isn't part of the snapshot, so progress ticks don't write.
     // Preview mode never persists, so a placeholder queue can't overwrite the
     // user's real restored session.
-    if !crate::settings::preview_mode() {
-        if let Ok(json) = serde_json::to_vec(&snap) {
-            shared.persist.write(shared.playback_path.clone(), json);
+    //
+    // Serialization is deferred to the persister's own thread: `snapshot` above
+    // clones every track (up to `MAX_FETCH_TRACKS`), and doing the JSON walk on
+    // this thread too would put both a large clone and a disk write in the path
+    // of every queue mutation.
+    if !crate::settings::preview_mode()
+        && session_changed(&mut shared.last_session.lock_safe(), &snap)
+    {
+        if let Err(e) = shared
+            .persist
+            .write(shared.playback_path.clone(), snap.clone(), |s| {
+                serde_json::to_vec(s).unwrap_or_default()
+            })
+        {
+            warn!("could not queue the playback snapshot: {e}");
         }
     }
     let _ = app.emit(events::QUEUE, &snap);
+}
+
+/// Record `snap` as the session to persist, reporting whether it differs from
+/// the last one recorded. Pure, so the "skip the redundant write" rule that
+/// keeps a track's first play from writing twice is testable on its own.
+pub(crate) fn session_changed(last: &mut Option<QueueSnapshot>, snap: &QueueSnapshot) -> bool {
+    if last.as_ref() == Some(snap) {
+        return false;
+    }
+    *last = Some(snap.clone());
+    true
 }
 
 /// Load a queue snapshot persisted by a previous session, if any.

@@ -14,6 +14,45 @@ fn rand_index(len: usize) -> usize {
     (rand::random::<u64>() as usize) % len
 }
 
+/// Step the repeat mode Off → All → One → Off, applying it to `core`. Pure so
+/// the transition and the crossfade bookkeeping it invalidates are testable.
+pub(crate) fn cycle_repeat(core: &mut PlayerCore) -> RepeatMode {
+    use RepeatMode::*;
+    let next = match core.repeat {
+        Off => All,
+        All => One,
+        One => Off,
+    };
+    core.repeat = next;
+    // A crossfade draws its target within `crossfade` seconds of the track's end
+    // and pins it in `pending_next`, which the end-of-track path reuses without
+    // consulting the repeat mode. Changing modes therefore invalidates the
+    // prefetch: under repeat-one it would drag playback onto another track and
+    // skip the repeat the user just asked for. Dropping the pick costs a hard cut
+    // instead of a crossfade (the same trade the other stale-pick paths make) and
+    // un-arms so a fresh one can be drawn under the new mode.
+    core.pending_next = None;
+    core.crossfade_armed_for = None;
+    next
+}
+
+/// Re-anchor the shuffle bookkeeping on a direct jump to `index` (a click, a
+/// collection start, a resume). The jumped-to track becomes the cursor, but the
+/// tracks already played this cycle stay in the history: dropping them would let
+/// a track heard a moment ago be drawn again before the cycle is out, and would
+/// leave Previous with nothing to walk back through. A track that already played
+/// is replayed by moving the cursor rather than appending a duplicate (which
+/// would otherwise strand the cursor on a repeat of the same index).
+pub(crate) fn seed_shuffle_anchor(core: &mut PlayerCore, index: usize) {
+    match core.shuffle_history.iter().position(|i| *i == index) {
+        Some(pos) => core.shuffle_cursor = pos,
+        None => {
+            core.shuffle_history.push(index);
+            core.shuffle_cursor = core.shuffle_history.len() - 1;
+        }
+    }
+}
+
 /// Decide the next queue index and advance the shuffle history. `manual` marks
 /// a user-initiated Next (wraps at the end and overrides repeat-one); automatic
 /// advancement respects repeat mode.
@@ -48,12 +87,16 @@ pub(crate) fn pick_next(core: &mut PlayerCore, manual: bool) -> Option<usize> {
             .filter(|i| !core.shuffle_history.contains(i))
             .collect();
         let pick = if pool.is_empty() {
-            // Every track has played this cycle.
+            // Every track has played this cycle. Repeat-all rolls into a fresh
+            // cycle, keeping the current track out of the running so it isn't
+            // repeated back-to-back, and a user-initiated Next wraps the same
+            // way (mirroring queue order). Repeat off ends the cycle here, so
+            // auto-advance stops exactly as it does in queue order — checking
+            // `manual` instead would loop the queue forever and make the repeat
+            // setting look ignored whenever shuffle is on.
             if !manual && core.repeat != RepeatMode::All {
                 return None;
             }
-            // Start a fresh cycle, keeping the current track out of the running
-            // so it isn't repeated back-to-back.
             core.shuffle_history.clear();
             let fresh: Vec<usize> = (0..len).filter(|i| *i != cur).collect();
             fresh[rand_index(fresh.len())]

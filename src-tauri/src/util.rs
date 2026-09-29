@@ -62,28 +62,60 @@ impl<T> LockExt<T> for Mutex<T> {
 /// or land out of order. Intended for state that's fine to lose on a crash
 /// (e.g. the playback snapshot used to restore the queue next launch) — not for
 /// durable user data, which is written synchronously elsewhere.
+///
+/// Two further things keep a high-frequency caller (the queue snapshot) from
+/// turning into a write burst: serialization happens *on the writer thread*,
+/// and a payload identical to the one last written for that path is dropped
+/// rather than written again.
+///
+/// Known loss: the final snapshot is still in flight when the process exits, so
+/// the last change before a quit may not be persisted. Acceptable for the
+/// playback snapshot (a restored queue is a convenience, not user data) — but
+/// it is a real window, not a guarantee.
 #[derive(Clone)]
-pub struct Persister(Sender<(PathBuf, Vec<u8>)>);
+pub struct Persister(Sender<Job>);
+
+type Job = (PathBuf, Box<dyn FnOnce() -> Vec<u8> + Send>);
 
 impl Persister {
     pub fn spawn() -> Self {
-        let (tx, rx) = mpsc::channel::<(PathBuf, Vec<u8>)>();
+        let (tx, rx) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("rift-persist".into())
             .spawn(move || {
-                while let Ok((path, bytes)) = rx.recv() {
+                // The payload last written per path, so a repeat of the same
+                // snapshot is skipped instead of hitting the disk again.
+                let mut last: std::collections::HashMap<PathBuf, Vec<u8>> =
+                    std::collections::HashMap::new();
+                while let Ok((path, serialize)) = rx.recv() {
+                    let bytes = serialize();
+                    if last.get(&path) == Some(&bytes) {
+                        continue;
+                    }
                     if let Err(e) = atomic_write(&path, &bytes) {
                         warn!("failed to persist {}: {e}", path.display());
+                        // Don't record it as written: a later identical snapshot
+                        // should get another chance at the disk.
+                        continue;
                     }
+                    last.insert(path, bytes);
                 }
             })
             .expect("failed to spawn persist thread");
         Self(tx)
     }
 
-    /// Queue `bytes` to be written to `path`. Returns immediately.
-    pub fn write(&self, path: PathBuf, bytes: Vec<u8>) {
-        let _ = self.0.send((path, bytes));
+    /// Queue `value` to be written to `path`, serialized on the writer thread.
+    /// Returns immediately. A payload equal to the one last written for this
+    /// path is dropped. `what` names the file in log messages.
+    pub fn write<T, F>(&self, path: PathBuf, value: T, serialize: F) -> std::io::Result<()>
+    where
+        T: Send + 'static,
+        F: FnOnce(&T) -> Vec<u8> + Send + 'static,
+    {
+        self.0
+            .send((path, Box::new(move || serialize(&value))))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "persister stopped"))
     }
 }
 
