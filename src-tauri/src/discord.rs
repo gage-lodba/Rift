@@ -493,17 +493,44 @@ fn activity_payload(activity: Activity<'_>) -> serde_json::Value {
 
 /// Wrap a serialized activity in the `SET_ACTIVITY` command frame.
 ///
-/// This mirrors the library's `set_activity` exactly, including the `pid` that
-/// tells Discord which process owns the presence. It exists only because the
+/// This mirrors the library's `set_activity` — the `pid` that tells Discord
+/// which process owns the presence, and a `nonce`. It exists only because the
 /// library's version takes a borrowing `Activity`, which cannot cross a thread
-/// boundary. The `nonce` the library sends is omitted: Discord does not require
-/// it, and `set_activity`'s own reply is read positionally rather than matched
-/// against it.
+/// boundary.
+///
+/// The `nonce` is **required**, not decorative. The first version of this
+/// omitted it on the assumption that Discord would not mind (the reply is read
+/// positionally rather than matched against it), and Discord rejected every
+/// push with `code 4000, "Payload requires a nonce"`. That was a claim about a
+/// third-party protocol made from reading the code rather than from running it.
 fn set_activity_frame(activity: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "cmd": "SET_ACTIVITY",
         "args": { "pid": std::process::id(), "activity": activity },
+        "nonce": random_nonce(),
     })
+}
+
+/// A v4-shaped random UUID, as the library's `set_activity` sends.
+///
+/// Deliberately not the `uuid` crate: this is the only value the app needs from
+/// it, Discord never echoes it back in a way that is checked, and the shape is
+/// four lines. Version and variant bits are set so the string is a well-formed
+/// UUID rather than 32 arbitrary hex digits.
+fn random_nonce() -> String {
+    let bytes: [u8; 16] = rand::random();
+    let mut b = bytes;
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 1
+    let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 fn build_activity(n: &Now) -> Activity<'_> {
@@ -536,4 +563,62 @@ fn unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{random_nonce, set_activity_frame};
+
+    /// Discord rejects a `SET_ACTIVITY` frame with no nonce
+    /// (`code 4000, "Payload requires a nonce"`), so the frame must always carry
+    /// one — that omission was a real bug found by running the app, not by
+    /// reading this code.
+    #[test]
+    fn the_activity_frame_carries_a_nonce_and_the_pid() {
+        let frame = set_activity_frame(serde_json::json!({ "details": "x" }));
+        let nonce = frame
+            .get("nonce")
+            .and_then(serde_json::Value::as_str)
+            .expect("nonce present and a string");
+        assert!(!nonce.is_empty(), "nonce must not be empty");
+        assert_eq!(
+            frame.get("cmd").and_then(|v| v.as_str()),
+            Some("SET_ACTIVITY")
+        );
+        assert_eq!(
+            frame
+                .pointer("/args/pid")
+                .and_then(serde_json::Value::as_u64),
+            Some(std::process::id() as u64)
+        );
+        // The activity itself is nested untouched.
+        assert_eq!(
+            frame
+                .pointer("/args/activity/details")
+                .and_then(|v| v.as_str()),
+            Some("x")
+        );
+    }
+
+    /// Well-formed v4 UUID, and different every call.
+    #[test]
+    fn the_nonce_is_a_fresh_v4_uuid() {
+        let a = random_nonce();
+        let b = random_nonce();
+        assert_ne!(a, b, "nonces must not repeat");
+        assert_eq!(a.len(), 36, "UUID string form: {a}");
+
+        let parts: Vec<&str> = a.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12],
+            "group lengths: {a}"
+        );
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_eq!(&a[14..15], "4", "version nibble: {a}");
+        assert!(
+            ["8", "9", "a", "b"].contains(&&a[19..20]),
+            "variant nibble: {a}"
+        );
+    }
 }
