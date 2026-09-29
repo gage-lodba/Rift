@@ -108,7 +108,17 @@ fn main() {
                 core: Mutex::new(core),
                 audio: audio_tx,
                 yt,
-                http: reqwest::Client::new(),
+                // Every request this client makes is small and latency-bound
+                // (update checks, the release-asset download, yt-dlp probing),
+                // so it needs a ceiling: reqwest's default is *no* timeout, and
+                // a stalled socket would otherwise wedge a command forever —
+                // including a download worker holding a `Downloads::begin`
+                // claim that is then never released.
+                http: reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_default(),
                 playback_path,
                 persist: util::Persister::spawn(),
             });

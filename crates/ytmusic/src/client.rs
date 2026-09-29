@@ -36,6 +36,12 @@ impl Client {
             .user_agent(USER_AGENT)
             .gzip(true)
             .brotli(true)
+            // reqwest's default is no timeout at all, which turns a half-open
+            // socket into a permanently hung metadata command (the UI's only
+            // affordance is a spinner with no cancel). Innertube responses are
+            // small, so a short ceiling costs nothing legitimate.
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self {
             inner: Arc::new(Inner { http }),

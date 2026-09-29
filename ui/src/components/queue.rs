@@ -19,6 +19,14 @@ pub struct QueuePanelProps {
 #[function_component(QueuePanel)]
 pub fn queue_panel(props: &QueuePanelProps) -> Html {
     let collapsed = use_state(|| false);
+    // Every hook must run on every render, so this callback is built *before*
+    // the empty-queue early return below — a hook called after it would be
+    // skipped on the first (empty) render and then demanded on the next one,
+    // which trips Yew's hook-order assertion.
+    let toggle = {
+        let collapsed = collapsed.clone();
+        Callback::from(move |_: MouseEvent| collapsed.set(!*collapsed))
+    };
     // Drag-to-reorder for the queue (shared with the sidebar playlists).
     let reorder = use_reorder(
         props.queue.tracks.iter().map(|t| t.id.clone()).collect(),
@@ -28,10 +36,6 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
     if props.queue.tracks.is_empty() {
         return html! {};
     }
-    let toggle = {
-        let collapsed = collapsed.clone();
-        Callback::from(move |_: MouseEvent| collapsed.set(!*collapsed))
-    };
     let clear = {
         let cb = props.on_clear.clone();
         Callback::from(move |e: MouseEvent| {

@@ -3,6 +3,7 @@
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
+use tracing::warn;
 
 /// InnerTube client name for the YouTube Music web client.
 pub const CLIENT_NAME: &str = "WEB_REMIX";
@@ -33,20 +34,40 @@ pub fn context_object(visitor_data: &str, client_version: &str) -> Value {
 }
 
 /// Fetch and cache the current `WEB_REMIX` client version from the home page.
-///
-/// The version is scraped from the page's own `INNERTUBE_CONTEXT_CLIENT_VERSION`
-/// and cached for the process lifetime; on failure it falls back to a
-/// date-shaped constant.
 pub async fn client_version(http: &reqwest::Client, user_agent: &str) -> String {
     if let Some(v) = CLIENT_VERSION.get() {
         return v.clone();
     }
-    let version = scrape(http, user_agent)
-        .await
-        .unwrap_or_else(|| FALLBACK_VERSION.to_owned());
-    // First writer wins; a concurrent scrape is harmless.
-    let _ = CLIENT_VERSION.set(version.clone());
-    version
+    let scraped = scrape(http, user_agent).await;
+    resolve_client_version(&CLIENT_VERSION, || scraped)
+}
+
+/// Resolve the client version, caching only a *successful* scrape.
+///
+/// A failed scrape must be retried rather than remembered: caching the fallback
+/// would pin a stale `clientVersion` for the process lifetime, and innertube
+/// rejects a stale version with 400 — which `Client::post` does not retry, since
+/// it rotates visitor data only on 403 — so every metadata command would fail
+/// until restart. Note that `OnceLock::get_or_init` alone is *not* enough here:
+/// it memoizes the init closure's `None` result too. The resolver is therefore
+/// only reachable once it has something worth caching.
+fn resolve_client_version(
+    cache: &OnceLock<String>,
+    try_scrape: impl FnOnce() -> Option<String>,
+) -> String {
+    match try_scrape() {
+        Some(scraped) => {
+            // First writer wins; a concurrent scrape is harmless.
+            cache.get_or_init(|| scraped).clone()
+        }
+        None => {
+            warn!(
+                "could not scrape the WEB_REMIX client version; using the fallback for this call \
+                 only (the next request will try again)"
+            );
+            FALLBACK_VERSION.to_owned()
+        }
+    }
 }
 
 async fn scrape(http: &reqwest::Client, user_agent: &str) -> Option<String> {
@@ -69,4 +90,77 @@ fn extract_client_version(html: &str) -> Option<String> {
     re.captures(html)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_client_version_reads_the_embedded_constant() {
+        let html = r#"<script>window["ytcfg"].set({"INNERTUBE_CONTEXT_CLIENT_VERSION":"1.20250101.00.00","X":"y"});</script>"#;
+        assert_eq!(
+            extract_client_version(html).as_deref(),
+            Some("1.20250101.00.00")
+        );
+    }
+
+    #[test]
+    fn extract_client_version_is_none_when_absent_or_blank() {
+        assert_eq!(extract_client_version("<html></html>"), None);
+        assert_eq!(
+            extract_client_version(r#""INNERTUBE_CONTEXT_CLIENT_VERSION":"""#),
+            None
+        );
+        // A version containing characters the character class rejects is not
+        // matched at all, rather than matched truncated.
+        assert_eq!(
+            extract_client_version(r#""INNERTUBE_CONTEXT_CLIENT_VERSION":"1.2/3""#),
+            None
+        );
+    }
+
+    /// The regression guard for H2. `resolve_client_version` holds the whole
+    /// caching rule and is synchronous, so it is exercised deterministically
+    /// here — no network, and no reliance on ordering against the process-wide
+    /// cache. (`client_version` short-circuits on `CLIENT_VERSION.get()` before
+    /// ever reaching this, which is the read path.)
+    #[test]
+    fn only_a_successful_scrape_is_cached() {
+        let cache = OnceLock::new();
+
+        // A failed scrape yields the fallback and stores nothing, so the next
+        // call scrapes again rather than pinning the fallback for the process.
+        let mut attempts = 0;
+        let mut failing = || {
+            attempts += 1;
+            None
+        };
+        assert_eq!(
+            resolve_client_version(&cache, &mut failing),
+            FALLBACK_VERSION
+        );
+        assert_eq!(
+            resolve_client_version(&cache, &mut failing),
+            FALLBACK_VERSION
+        );
+        assert_eq!(attempts, 2, "a failed scrape must not be memoized");
+        assert!(
+            cache.get().is_none(),
+            "the fallback must never enter the cache"
+        );
+
+        // A successful scrape *is* stored, so the read path short-circuits and
+        // the value survives later failures.
+        assert_eq!(
+            resolve_client_version(&cache, || Some("1.20250901.00.00".to_owned())),
+            "1.20250901.00.00"
+        );
+        assert_eq!(cache.get().map(String::as_str), Some("1.20250901.00.00"));
+        assert_eq!(
+            resolve_client_version(&cache, || Some("1.20251001.00.00".to_owned())),
+            "1.20250901.00.00",
+            "first writer wins"
+        );
+    }
 }

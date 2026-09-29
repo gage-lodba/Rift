@@ -12,6 +12,7 @@ serde_json.workspace = true
 reqwest = { version = "0.12", features = ["json", "gzip", "brotli"] }
 regex = "1"
 thiserror = "2"
+tracing = "0.1.44"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

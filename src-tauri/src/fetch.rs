@@ -66,6 +66,17 @@ pub async fn fetch_bytes(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
     fetch_via_ytdlp(video_id).await
 }
 
+/// Upper bound on a single yt-dlp run. Generous — it covers resolving and
+/// downloading a full audio stream on a slow link — but finite: without it a
+/// hung yt-dlp wedges the fetch (and, for a download worker, its
+/// `Downloads::begin` claim) for the rest of the session.
+const YTDLP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Wall-clock ceiling for the one-click installer's asset download. The
+/// installer reuses the player's HTTP client, whose 30 s ceiling is right for
+/// status calls but too tight for a multi-megabyte binary.
+const YTDLP_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
     // A random suffix keeps concurrent fetches of the same id from writing to —
     // and reading back — the same temp file.
@@ -86,17 +97,28 @@ async fn fetch_via_ytdlp(video_id: &str) -> anyhow::Result<(Vec<u8>, f64)> {
         .arg("--force-overwrites")
         .arg("-o")
         .arg(&path)
-        .arg(format!("https://www.youtube.com/watch?v={video_id}"));
+        .arg(format!("https://www.youtube.com/watch?v={video_id}"))
+        // If the `timeout` below fires, the child is killed as the future is
+        // dropped rather than left running against a temp file we delete.
+        .kill_on_drop(true);
 
     // Without CREATE_NO_WINDOW, spawning a console subprocess from a GUI app
     // flashes a console window on Windows. No-op elsewhere.
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = cmd
-        .output()
-        .await
-        .context("could not run yt-dlp — install it (https://github.com/yt-dlp/yt-dlp#installation), or set RIFT_YTDLP to its full path")?;
+    let output = match tokio::time::timeout(YTDLP_TIMEOUT, cmd.output()).await {
+        Ok(result) => result.context("could not run yt-dlp — install it (https://github.com/yt-dlp/yt-dlp#installation), or set RIFT_YTDLP to its full path")?,
+        Err(_) => {
+            // `kill_on_drop` above reaps the child as the timed-out future is
+            // dropped, so nothing keeps writing to the temp file we remove.
+            let _ = tokio::fs::remove_file(&path).await;
+            bail!(
+                "yt-dlp timed out after {}s resolving {video_id}",
+                YTDLP_TIMEOUT.as_secs()
+            );
+        }
+    };
 
     if !output.status.success() {
         // yt-dlp may have left a partial output file behind.
@@ -180,6 +202,9 @@ pub async fn download_ytdlp(dest_dir: &Path, http: &reqwest::Client) -> anyhow::
     let bytes = http
         .get(&url)
         .header(header::USER_AGENT, "rift")
+        // Override the client's short status-call ceiling: this is a
+        // multi-megabyte binary, not a JSON probe.
+        .timeout(YTDLP_DOWNLOAD_TIMEOUT)
         .send()
         .await
         .context("download request failed")?
