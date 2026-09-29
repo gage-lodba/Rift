@@ -360,7 +360,18 @@ input[type="range"] { accent-color: var(--accent); }
 
 /* ===== links, tabs, page headers ===== */
 
-.link { cursor: pointer; }
+.link {
+  cursor: pointer;
+  /* This is a `<button>` (so the album is reachable by keyboard), and a button
+     does not inherit the page's colour or clear its own chrome: without these
+     it renders on the UA's white `buttonface` background, mid-row. `font:
+     inherit` also stops it rendering at the UA's default size. */
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+}
 .link:hover { color: var(--text); text-decoration: underline; }
 
 .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
