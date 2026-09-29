@@ -226,6 +226,16 @@ pub fn app() -> Html {
                 );
             }
             {
+                let toast = toast.clone();
+                let gen = toast_gen.clone();
+                // Frontend-side IPC failures land in the same toast as the
+                // backend's. Registered before the bootstrap below so a failure
+                // there is reported too.
+                api::set_error_sink(Callback::from(move |msg: String| {
+                    show_toast(toast.clone(), gen.clone(), msg, 6000);
+                }));
+            }
+            {
                 // Informational toasts (e.g. export/import results).
                 let toast = toast.clone();
                 let gen = toast_gen.clone();
@@ -441,6 +451,8 @@ pub fn app() -> Html {
         let artist_results = artist_results.clone();
         let album_results = album_results.clone();
         let search_gen = search_gen.clone();
+        let toast = toast.clone();
+        let toast_gen = toast_gen.clone();
         Callback::from(move |query: String| {
             view.set(View::Search);
             search_tab.set(SearchTab::Songs);
@@ -458,6 +470,8 @@ pub fn app() -> Html {
             };
             let search = search.clone();
             let search_gen = search_gen.clone();
+            let toast = toast.clone();
+            let toast_gen = toast_gen.clone();
             spawn_local(async move {
                 let result =
                     api::invoke::<Vec<Track>>("search", &json!({ "query": query.clone() })).await;
@@ -471,7 +485,12 @@ pub fn app() -> Html {
                         busy: false,
                     }),
                     Err(e) => {
+                        // "No results." and "the search failed" look identical in
+                        // the list, so say which one happened. Offline or
+                        // rate-limited, the user otherwise concludes the track
+                        // does not exist.
                         web_sys::console::error_1(&format!("search: {e}").into());
+                        show_toast(toast.clone(), toast_gen.clone(), e, 6000);
                         search.set(Search {
                             query,
                             results: vec![],
@@ -480,6 +499,31 @@ pub fn app() -> Html {
                     }
                 }
             });
+        })
+    };
+
+    // The search box was emptied. Step off the results view and drop the stale
+    // query, so the previous results can't keep rendering under "Results for
+    // ‹the old query›" — and bump the generation so a search still in flight
+    // for the deleted text can't land afterwards and restore them.
+    let on_search_clear = {
+        let view = view.clone();
+        let search = search.clone();
+        let search_tab = search_tab.clone();
+        let artist_results = artist_results.clone();
+        let album_results = album_results.clone();
+        let search_gen = search_gen.clone();
+        Callback::from(move |()| {
+            *search_gen.borrow_mut() += 1;
+            search.set(Search::default());
+            search_tab.set(SearchTab::Songs);
+            artist_results.set(None);
+            album_results.set(None);
+            // Only leave the search view; a user who cleared the box while
+            // browsing a playlist should stay where they were.
+            if matches!(*view, View::Search) {
+                view.set(View::Home);
+            }
         })
     };
 
@@ -1279,7 +1323,7 @@ pub fn app() -> Html {
 
     html! {
         <div class="app">
-            <Titlebar on_search={on_search} />
+            <Titlebar on_search={on_search} on_clear={on_search_clear} />
             <div class="body">
                 <Sidebar view={(*view).clone()} playlists={sidebar_playlists}
                          on_nav={on_nav} on_new_playlist={on_new_playlist}

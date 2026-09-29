@@ -13,6 +13,8 @@ use anyhow::{bail, Context};
 use reqwest::header;
 use tracing::{debug, info, warn};
 
+use crate::sha256;
+
 /// Windows process creation flag: don't allocate a console for the child.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -193,26 +195,47 @@ fn ytdlp_release_asset() -> &'static str {
 /// Download the latest yt-dlp standalone binary for this platform into
 /// `dest_dir`, mark it executable, and return its path. Used by Settings when
 /// yt-dlp isn't already installed.
+/// The release the installer downloads from, and the checksum manifest that
+/// comes with it.
+const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
+/// yt-dlp publishes SHA-256 digests for every release asset here.
+const YTDLP_SUMS_ASSET: &str = "SHA2-256SUMS";
+
 pub async fn download_ytdlp(dest_dir: &Path, http: &reqwest::Client) -> anyhow::Result<PathBuf> {
-    let url = format!(
-        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/{}",
-        ytdlp_release_asset()
-    );
+    let asset = ytdlp_release_asset();
+    let url = format!("{YTDLP_RELEASE_BASE}/{asset}");
     info!("downloading yt-dlp from {url}");
-    let bytes = http
-        .get(&url)
-        .header(header::USER_AGENT, "rift")
-        // Override the client's short status-call ceiling: this is a
-        // multi-megabyte binary, not a JSON probe.
-        .timeout(YTDLP_DOWNLOAD_TIMEOUT)
-        .send()
+
+    // Fetch the checksum manifest *first*, so a manifest that cannot be
+    // retrieved fails before anything is written to disk. Both requests use the
+    // same `latest/download` base, so they resolve to the same release.
+    let sums = fetch(http, &format!("{YTDLP_RELEASE_BASE}/{YTDLP_SUMS_ASSET}"))
         .await
-        .context("download request failed")?
-        .error_for_status()
-        .context("download request returned an error status")?
-        .bytes()
-        .await
-        .context("could not read the downloaded yt-dlp")?;
+        .context("could not download SHA2-256SUMS to verify the yt-dlp download")?;
+    let sums_text = String::from_utf8_lossy(&sums);
+    let Some(expected) = sha256::checksum_for(&sums_text, asset) else {
+        // Named explicitly: the alternative (falling back to writing the binary
+        // unverified) is exactly the behaviour this exists to prevent, and
+        // "no entry for this asset" is a different problem from a bad digest.
+        bail!(
+            "the release's SHA2-256SUMS has no entry for {asset}; refusing to install an \
+             unverified binary"
+        );
+    };
+
+    let bytes = fetch(http, &url).await.context("download request failed")?;
+
+    // Verify before anything is written or chmod'd: the file Rift later spawns
+    // must be the one the manifest describes. "latest" plus no verification
+    // would make a compromised release asset or TLS path into code execution.
+    let actual = sha256::hex(&sha256::sha256(&bytes));
+    if actual != expected {
+        bail!(
+            "the downloaded yt-dlp failed verification (expected {expected}, got {actual}); \
+             refusing to install it"
+        );
+    }
+    info!("verified yt-dlp {asset} (sha256 {actual})");
 
     tokio::fs::create_dir_all(dest_dir)
         .await
@@ -236,9 +259,58 @@ pub async fn download_ytdlp(dest_dir: &Path, http: &reqwest::Client) -> anyhow::
     Ok(dest)
 }
 
+/// GET a URL fully into memory, with the installer's generous ceiling (these
+/// are multi-megabyte release assets, not JSON probes).
+async fn fetch(http: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(http
+        .get(url)
+        .header(header::USER_AGENT, "rift")
+        .timeout(YTDLP_DOWNLOAD_TIMEOUT)
+        .send()
+        .await?
+        .error_for_status()
+        .context("the server returned an error status")?
+        .bytes()
+        .await?
+        .to_vec())
+}
+
 /// User-configured custom yt-dlp location, set from Settings at startup and
 /// whenever it changes. Takes priority over PATH/common-location detection.
 static CUSTOM_YTDLP: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Validate a user-supplied yt-dlp path before it is used to spawn a process.
+///
+/// Rift executes whatever this resolves to, and the path is persisted into
+/// `settings.json`, so it is the one place the app turns a string from the
+/// webview into a process. `Path::is_file()` alone accepts any path-shaped
+/// string, including one carrying `..` or a symlink; canonicalizing first
+/// resolves those to the real target, and requiring a regular file rejects a
+/// directory or a device. A relative path is resolved against the process's
+/// current directory, which for a GUI launch is not something the user chose —
+/// so it is rejected outright rather than silently meaning something arbitrary.
+///
+/// This is defense-in-depth, not a sandbox: a caller who can already invoke
+/// commands can point Rift at any *existing* executable on the machine. It
+/// closes the "any path-shaped string" gap, which is what the review asked for.
+pub fn validate_ytdlp_override(path: &str) -> anyhow::Result<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("no path given");
+    }
+    let raw = Path::new(trimmed);
+    if !raw.is_absolute() {
+        bail!("the path must be absolute");
+    }
+    let canonical =
+        std::fs::canonicalize(raw).with_context(|| format!("could not resolve {trimmed}"))?;
+    let meta = std::fs::metadata(&canonical)
+        .with_context(|| format!("could not inspect {}", canonical.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", canonical.display());
+    }
+    Ok(canonical)
+}
 
 /// Set (or clear with `None`) the custom yt-dlp path. Applied on the next fetch
 /// or probe; an invalid path falls back to auto-detection.
@@ -333,7 +405,7 @@ fn probe_ytdlp_locations() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_stem;
+    use super::{safe_stem, validate_ytdlp_override};
 
     #[test]
     fn safe_stem_preserves_real_ids_and_neutralizes_traversal() {
@@ -345,5 +417,73 @@ mod tests {
         assert_eq!(safe_stem("../etc/passwd"), "___etc_passwd");
         // An empty id still yields a safe name.
         assert_eq!(safe_stem(""), "_");
+    }
+
+    /// A unique scratch directory, so parallel tests don't collide.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rift-fetch-{tag}-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// The path Rift will `spawn` must resolve to a real regular file. Every
+    /// rejection here is a string that `Path::is_file()` on the raw input would
+    /// have let through to a subprocess.
+    #[test]
+    fn ytdlp_override_rejects_anything_that_is_not_a_resolved_regular_file() {
+        let dir = scratch("ytdlp-validate");
+        let file = dir.join("yt-dlp");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("write fake binary");
+
+        // A real file resolves, and comes back canonicalized.
+        let resolved = validate_ytdlp_override(file.to_str().unwrap()).expect("a real file passes");
+        assert_eq!(resolved, std::fs::canonicalize(&file).unwrap());
+
+        // Whitespace around a pasted path is tolerated.
+        let padded = format!("  {}  ", file.display());
+        assert!(validate_ytdlp_override(&padded).is_ok());
+
+        // A directory is not an executable.
+        assert!(validate_ytdlp_override(dir.to_str().unwrap()).is_err());
+
+        // A path that does not exist cannot be spawned.
+        let missing = dir.join("nope");
+        assert!(validate_ytdlp_override(missing.to_str().unwrap()).is_err());
+
+        // A relative path would resolve against whatever the process's cwd
+        // happens to be, which the user never chose.
+        assert!(validate_ytdlp_override("yt-dlp").is_err());
+        assert!(validate_ytdlp_override("./yt-dlp").is_err());
+
+        // Empty and non-path input.
+        assert!(validate_ytdlp_override("").is_err());
+        assert!(validate_ytdlp_override("   ").is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `..` segments must be resolved away rather than carried into the value
+    /// that is persisted and later spawned.
+    #[test]
+    fn ytdlp_override_canonicalizes_parent_segments() {
+        let dir = scratch("ytdlp-dots");
+        let sub = dir.join("bin");
+        std::fs::create_dir_all(&sub).expect("create subdir");
+        let file = sub.join("yt-dlp");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("write fake binary");
+
+        let roundabout = sub.join("..").join("bin").join("yt-dlp");
+        let resolved = validate_ytdlp_override(roundabout.to_str().unwrap()).expect("resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&file).unwrap());
+        assert!(
+            !resolved.to_string_lossy().contains(".."),
+            "the persisted path must not carry parent segments"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

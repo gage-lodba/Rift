@@ -2,6 +2,8 @@
 //! `withGlobalTauri`). Commands are invoked with snake_case argument names,
 //! matching `#[tauri::command(rename_all = "snake_case")]` on the backend.
 
+use std::cell::RefCell;
+
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -29,11 +31,40 @@ pub async fn invoke<R: DeserializeOwned>(cmd: &str, args: &impl Serialize) -> Re
     serde_wasm_bindgen::from_value(out).map_err(|e| e.to_string())
 }
 
-/// Fire-and-forget command invocation; errors are logged to the console.
+/// Fire-and-forget command invocation.
+///
+/// "Fire-and-forget" is about the return value, not about the failure: 41 of
+/// this app's 55 IPC calls go through here, and a bare `console.error` meant
+/// every `Err` not mirrored by a backend `rift://error` event reached nobody.
+/// Concretely, clicking play on an empty collection did nothing at all, and
+/// `create_playlist` with a blank name silently closed the dialog. A rejected
+/// command now surfaces through the same toast the backend's own errors use.
 pub fn fire(cmd: &'static str, args: impl Serialize + 'static) {
     wasm_bindgen_futures::spawn_local(async move {
         if let Err(e) = invoke::<serde_json::Value>(cmd, &args).await {
-            web_sys::console::error_1(&format!("{cmd}: {e}").into());
+            let msg = format!("{cmd}: {e}");
+            web_sys::console::error_1(&msg.clone().into());
+            report_error(msg);
+        }
+    });
+}
+
+thread_local! {
+    /// Where a failed `fire` sends its message. `App` installs its toast here on
+    /// mount; until then failures only reach the console.
+    static ERROR_SINK: RefCell<Option<Callback<String>>> = const { RefCell::new(None) };
+}
+
+/// Install the sink that [`fire`] reports failures to.
+pub fn set_error_sink(sink: Callback<String>) {
+    ERROR_SINK.with(|s| *s.borrow_mut() = Some(sink));
+}
+
+/// Report a frontend-side failure to the installed sink, if any.
+fn report_error(msg: String) {
+    ERROR_SINK.with(|s| {
+        if let Some(cb) = s.borrow().as_ref() {
+            cb.emit(msg);
         }
     });
 }

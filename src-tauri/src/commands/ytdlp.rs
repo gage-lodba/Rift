@@ -17,14 +17,33 @@ pub async fn check_ytdlp() -> YtDlpStatus {
 
 /// Set (or clear, with a blank value) a custom yt-dlp location, persist it,
 /// apply it immediately, and re-probe so the caller sees the new status.
+///
+/// The path is validated before it is stored: this is the one command that
+/// turns a webview-supplied string into a process Rift spawns, and the value is
+/// persisted, so it is checked here rather than at each spawn. See
+/// [`rift::fetch::validate_ytdlp_override`].
 #[tauri::command(rename_all = "snake_case")]
 pub async fn set_yt_dlp_path(
     path: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<YtDlpStatus, String> {
+    // A blank value clears the override and falls back to auto-detection.
+    let validated = match path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => match rift::fetch::validate_ytdlp_override(p) {
+            Ok(resolved) => Some(resolved),
+            Err(e) => {
+                let msg = format!("That yt-dlp path can't be used: {e:#}");
+                warn!("{msg}");
+                // Leave the stored value alone: a bad paste must not clobber a
+                // working configuration.
+                return Err(msg);
+            }
+        },
+        None => None,
+    };
     let configured = {
         let mut settings = state.settings.lock_safe();
-        settings.set_yt_dlp_path(path);
+        settings.set_yt_dlp_path(validated.as_ref().map(|p| p.to_string_lossy().to_string()));
         settings.data.yt_dlp_path.clone()
     };
     rift::fetch::set_ytdlp_override(configured.map(std::path::PathBuf::from));

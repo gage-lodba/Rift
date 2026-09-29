@@ -11,6 +11,10 @@ use crate::api;
 #[derive(Properties, PartialEq)]
 pub struct TitlebarProps {
     pub on_search: Callback<String>,
+    /// The box was emptied. Without this the previous query's results stayed on
+    /// screen under `Results for "<the old query>"`, which reads as the search
+    /// box being broken rather than cleared.
+    pub on_clear: Callback<()>,
 }
 
 #[function_component(Titlebar)]
@@ -48,16 +52,20 @@ pub fn titlebar(props: &TitlebarProps) -> Html {
     // last pause in typing actually fires. Enter still searches immediately.
     let oninput = {
         let on_search = props.on_search.clone();
+        let on_clear = props.on_clear.clone();
         let debounce = debounce.clone();
         Callback::from(move |e: InputEvent| {
             let el: HtmlInputElement = e.target_unchecked_into();
             let q = el.value().trim().to_string();
+            // Bump the token either way: a pending search for the text that was
+            // just deleted must not fire after the box is emptied.
             let token = {
                 let mut d = debounce.borrow_mut();
                 *d += 1;
                 *d
             };
             if q.is_empty() {
+                on_clear.emit(());
                 return;
             }
             let on_search = on_search.clone();
