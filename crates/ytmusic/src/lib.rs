@@ -22,4 +22,10 @@ pub mod raw {
     pub use crate::parse::{
         album_page, albums, artist_page, artists, playlist_page, track_credits, tracks,
     };
+    // The pure helpers behind the row parsers, so their rules can be pinned
+    // without building a whole innertube response around each one.
+    pub use crate::parse::{
+        album_type_from_shelf, is_subtitle_noise, is_type_badge, parse_count, parse_duration,
+        tracks_playlist_id, unlinked_artist,
+    };
 }

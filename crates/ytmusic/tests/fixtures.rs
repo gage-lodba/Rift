@@ -88,17 +88,53 @@ fn search_tracks_parses_ids_titles_durations_and_covers() {
     assert!(blinding_lights.artists.is_empty());
 }
 
-/// A row with no artist link keeps the raw subtitle text rather than an empty
-/// byline — the UI would otherwise render a blank artist.
+/// A row whose artist is not linked must not render the whole subtitle column
+/// as the artist.
+///
+/// This used to assert `"Song • 3:22"` — the type badge, a separator, and the
+/// duration — which enshrined the defect the fallback was supposed to avoid.
+/// The subtitle column mixes all three into one run list, so the byline has to
+/// be picked out of it.
 #[test]
 fn search_tracks_falls_back_to_the_subtitle_for_unlinked_artists() {
     let tracks = raw::tracks(&fixture("search_tracks.json"));
 
+    // No artist link anywhere in the row: the badge and duration are dropped and
+    // nothing is left, which is honest — better blank than "Song • 3:22".
     let unlinked = track_by_id(&tracks, "J7p4bzqLvCw");
-    assert_eq!(unlinked.artist, "Song • 3:22");
+    assert_eq!(unlinked.artist, "");
+    assert_eq!(unlinked.duration, Some(202), "the duration is still parsed");
 
     let linked = track_by_id(&tracks, "wjE2YXSo2FM");
     assert_eq!(linked.artist, "The Weeknd");
+}
+
+/// A row whose byline is a plain unlinked name must keep that name.
+///
+/// The row for "Around The World - A Daft Punk Tribute" carries no artist link
+/// at all, and the name in its subtitle is the only one available. The fallback
+/// has to keep it while still dropping the badge, separators and duration — the
+/// two requirements pull in opposite directions, and the first version of this
+/// fix satisfied one by breaking the other.
+#[test]
+fn search_albums_keeps_an_unlinked_byline() {
+    let albums = raw::albums(&fixture("search_albums.json"));
+
+    let tribute = album_by_id(&albums, "MPREb_bBLhlwZWbpp");
+    assert_eq!(tribute.name, "Around The World - A Daft Punk Tribute");
+    assert_eq!(
+        tribute.artist, "",
+        "this row carries no byline at all; the badge/year must not fill the gap"
+    );
+    assert_eq!(tribute.year, Some(2022), "the year is still parsed");
+
+    // Every album row keeps a linked artist, and none of them swallowed the
+    // type badge or the year.
+    for a in &albums {
+        assert!(!a.artist.contains("Album"), "badge in byline: {a:?}");
+        assert!(!a.artist.contains("2013"), "year in byline: {a:?}");
+    }
+    assert_eq!(album_by_id(&albums, ALBUM_ID).artist, "Daft Punk");
 }
 
 /// The UGC filter is what keeps remixes and re-uploads out of results; if it
@@ -315,10 +351,15 @@ fn playlist_page_parses_name_tracks_and_continuation() {
 // Track credits
 // ---------------------------------------------------------------------------
 
+/// The video the `next.json` queue was opened for. `track_credits` matches the
+/// byline to this id, so a fixture captured for a different video would not
+/// yield credits — which is the point (see the parser's own tests).
+const CREDITS_VIDEO_ID: &str = "khnokW3Mw24";
+
 #[test]
 fn track_credits_splits_artists_from_the_album() {
     let (artists, album, album_id) =
-        raw::track_credits(&fixture("next.json")).expect("track credits");
+        raw::track_credits(&fixture("next.json"), CREDITS_VIDEO_ID).expect("track credits");
 
     let credits: Vec<(Option<&str>, &str)> = artists
         .iter()
@@ -334,4 +375,13 @@ fn track_credits_splits_artists_from_the_album() {
 
     assert_eq!(album.as_deref(), Some("Random Access Memories"));
     assert_eq!(album_id.as_deref(), Some(ALBUM_ID));
+}
+
+/// A video the queue does not contain must yield nothing rather than whatever
+/// byline happens to be present — the caller persists what it gets, so a
+/// substituted or unavailable video would otherwise be credited to another
+/// song's artists on the requested track's row.
+#[test]
+fn track_credits_refuses_a_video_the_response_does_not_contain() {
+    assert!(raw::track_credits(&fixture("next.json"), "not-in-this-queue").is_none());
 }

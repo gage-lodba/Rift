@@ -113,12 +113,16 @@ impl Client {
     }
 
     /// Fetch per-artist credits and album info for a track (for enrichment).
+    ///
+    /// `video_id` is passed through to the parser, which matches the byline to
+    /// that exact queue entry — a substituted video must not contribute another
+    /// song's artists.
     pub async fn track_credits(
         &self,
         video_id: &str,
     ) -> Result<(Vec<ArtistRef>, Option<String>, Option<String>)> {
         let resp = self.next_raw(video_id).await?;
-        parse::track_credits(&resp)
+        parse::track_credits(&resp, video_id)
             .ok_or_else(|| Error::Parse("could not parse track credits".to_owned()))
     }
 

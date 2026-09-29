@@ -142,7 +142,7 @@ enum Kind {
 }
 
 impl Kind {
-    fn parse(self, v: &Value, browse_id: &str) -> String {
+    fn parse(self, v: &Value, browse_id: &str, video_id: &str) -> String {
         match self {
             Kind::Tracks => format!("{:?}", raw::tracks(v)),
             Kind::Artists => format!("{:?}", raw::artists(v)),
@@ -157,7 +157,7 @@ impl Kind {
                 let (name, tracks, cont) = raw::playlist_page(v);
                 format!("name={name:?} cont={} {tracks:?}", cont.is_some())
             }
-            Kind::Next => format!("{:?}", raw::track_credits(v)),
+            Kind::Next => format!("{:?}", raw::track_credits(v, video_id)),
         }
     }
 }
@@ -355,14 +355,21 @@ fn find_key_paths(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (input, kind, out, browse_id) = match args.as_slice() {
-        [input, kind, out] => (input, kind, out, ""),
-        [input, kind, out, browse_id] => (input, kind, out, browse_id.as_str()),
+    let (input, kind, out, browse_id, video_id) = match args.as_slice() {
+        [input, kind, out] => (input, kind, out, "", ""),
+        [input, kind, out, browse_id] => (input, kind, out, browse_id.as_str(), ""),
+        [input, kind, out, browse_id, video_id] => {
+            (input, kind, out, browse_id.as_str(), video_id.as_str())
+        }
         _ => {
-            eprintln!("usage: prune_fixture <input.json> <kind> <output.json> [browseId]");
+            eprintln!(
+                "usage: prune_fixture <input.json> <kind> <output.json> [browseId] [videoId]"
+            );
             eprintln!("kinds: tracks artists albums album artist playlist next");
             eprintln!("browseId is required for `album` and `artist` (it comes from the");
             eprintln!("caller in production, and the parser stamps it onto the result)");
+            eprintln!("videoId is required for `next` (track_credits matches the byline to the");
+            eprintln!("requested video, so the fixture must be parsed with the same id)");
             std::process::exit(2);
         }
     };
@@ -393,7 +400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let raw_text = fs::read_to_string(input)?;
     let original: Value = serde_json::from_str(&raw_text)?;
-    let before = kind.parse(&original, browse_id);
+    let before = kind.parse(&original, browse_id, video_id);
 
     let compacted = compact(kind, &original, browse_id, &opts);
     if std::env::var_os("PRUNE_TRACE").is_some() {
@@ -412,8 +419,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let after = kind.parse(&compacted, browse_id);
+    let after = kind.parse(&compacted, browse_id, video_id);
 
+    // NOTE: this proves the compacted document parses the *same as itself* — it
+    // is an equivalence check between the original and the compacted copy, not
+    // a correctness check on the parser. Both sides run the same parser, so a
+    // parser that returns the wrong thing returns the same wrong thing twice
+    // and this passes. Its job is to guarantee pruning did not lose any input
+    // the parsers read; correctness is what `tests/fixtures.rs` asserts, against
+    // values captured from the real responses.
     if before != after {
         // Leave the compacted document behind for `PRUNE_KEEP=1` debugging.
         if std::env::var_os("PRUNE_KEEP").is_some() {
