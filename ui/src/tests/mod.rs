@@ -14,4 +14,5 @@ mod api;
 mod app;
 mod components;
 pub(crate) mod harness;
+mod hook_order;
 mod reorder;
