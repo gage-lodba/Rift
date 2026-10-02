@@ -16,3 +16,15 @@ serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console", "HtmlInputElement", "HtmlSelectElement", "Navigator", "DragEvent", "DataTransfer", "Element", "HtmlElement", "HtmlImageElement", "DomRect", "Window", "Storage"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
+
+[dev-dependencies]
+# Test-only, and only for the wasm target: this is the harness that lets the
+# frontend's real logic (the IPC call path, the reorder index math) be driven
+# without a running app. It is NOT a runtime dependency — `trunk build` and the
+# shipped wasm never link it.
+#
+# Version-coupled to `wasm-bindgen` above: the CLI that runs these tests
+# (`wasm-bindgen-test-runner`) refuses a test binary whose `wasm-bindgen` does
+# not match its own version exactly, so CI installs
+# `wasm-bindgen-cli@<the version Cargo.lock pins>` — see ui/README.md.
+wasm-bindgen-test = "0.3"

@@ -1,0 +1,13 @@
+# Frontend test harness (see ui/README.md).
+#
+# `cargo test` on wasm32 produces a `.wasm` module, which Cargo then tries to
+# exec directly — on every platform that fails with "not a valid Win32
+# application" / "Exec format error". `wasm-bindgen-test-runner` is the missing
+# half: it generates the JS glue for the test binary and runs it under Node.
+#
+# Scoped to the wasm32 target so native builds are untouched, and it only fires
+# when Cargo *executes* an artifact, i.e. `cargo test`. `trunk build`, the
+# wasm clippy pass, and `cargo test --workspace --exclude rift-ui` never invoke
+# it.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
