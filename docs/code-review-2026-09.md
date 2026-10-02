@@ -38,10 +38,20 @@
 > consecutive runs rather than once.
 >
 > **Deferred, with reasons:** L7 (regex caching), L10 (typed UGC signal), M10
-> (shuffle-history remapping), the `with_extension` shape in M9, and a frontend
-> test harness (no way to cover computed style, which is what the white-background
-> regression needed). Each is noted at its item. L16's `rust-version` and L17's
-> `client.rs` transport tests were deferred and have since been done.
+> (shuffle-history remapping), and the `with_extension` shape in M9. Each is
+> noted at its item. L16's `rust-version` and L17's `client.rs` transport tests
+> were deferred and have since been done.
+>
+> **Added after this review closed — the frontend harness.** `rift-ui` was the
+> one crate with no tests, so every UI change was unverifiable except by running
+> the app. There is now a `wasm-bindgen-test` harness (`ui/src/tests/`, 34 tests,
+> wired into CI next to the frontend clippy pass) covering the IPC boundary's
+> argument shapes, the reorder index math, and `App`'s pure decisions about
+> shuffling, durations, and the offline pin. **The computed-style gap is still
+> open and is now explicit rather than implied**: the white album text came from
+> a `<button>` inheriting `buttonface`, which needs a real layout engine and
+> `getComputedStyle`, and that is a different purchase from this harness — see
+> "What the frontend harness does not cover" at the end of this document.
 
 Scope: every tracked source file (`src-tauri/`, `crates/ytmusic/`, `types/`, `ui/`,
 `docs/`, `.github/`, manifests). HEAD `a4b8d30` plus the uncommitted player diff.
@@ -686,9 +696,10 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
   > page carries rows *and* a continuation token together). Note also that the two
   > halves of the H1 fix mask each other — reverting either alone leaves the new
   > test green, and it takes both to reproduce the defect, which is stated in the
-  > test rather than glossed over. **Still open:** there is no frontend harness,
-  > so nothing covers computed style — which is what the white-album-text
-  > regression actually needed.
+  > test rather than glossed over. **Still open:** nothing covers computed style —
+  > which is what the white-album-text regression actually needed. The frontend
+  > harness added later reaches the IPC call path and the reorder math, not
+  > layout; see the closing section.
 
 - **L18. Test litter**: `settings.rs` / `downloads.rs` / `library.rs` tests create
   `%TEMP%\rift-*` dirs and skip cleanup on failure.
@@ -807,12 +818,13 @@ starts from the code rather than from scratch.
   mock HTTP server. `crates/ytmusic` has `tokio` as a dev-dependency already, so
   a `TcpListener` speaking canned responses would do it without a new crate; the
   decision to be made is whether that belongs in this repo's test suite.
-- **No frontend test harness at all.** Three fixes this session (C1, H4, M5b)
-  are in Yew components and carry no test, for this reason. `wasm-bindgen-test`
-  plus a headless runner in CI is the missing piece, and it would also let the
-  focus and keyboard work in Phase 5 be asserted rather than built-and-eyeballed.
-  Note this is also why the ACL failure looked like a data-loss bug to the user
-  rather than a config bug: nothing exercised the frontend against the backend.
+- **The frontend had no test harness at all.** C1, H4 and M5b are in Yew
+  components and carry no test for this reason, as does the white-album-text
+  regression. **Partly done** — see the closing section: `wasm-bindgen-test` is
+  now wired into CI and covers the IPC boundary, the reorder math and `App`'s
+  pure decisions. C1 (hook order), H4 (progress on track change) and the
+  computed-style class all need the renderer, and the closing section says which
+  of those need a browser and which need a component harness.
 - **The `ui` clippy pass needs `wasm32-unknown-unknown`; `trunk build` needs
   `NO_COLOR` set to a value trunk accepts.** Trunk 0.21 rejects `NO_COLOR=1`
   ("invalid value '1' for '--no-color'"). CI does not set it, so this only bites
@@ -828,3 +840,95 @@ starts from the code rather than from scratch.
   and it is gitignored, but `verify` never prunes files for commands that no
   longer exist. Worth a `git clean`-style note in the build docs.
 
+
+---
+
+## What the frontend harness does and does not cover
+
+`rift-ui` was the one crate with no tests: ~160 KB of source, including a 62 KB
+`app.rs`, and no way to verify any of it except by running the app and clicking.
+That is how the `play_track` argument-shape breakage reached a runtime failure
+with both sides compiling, and how the white album text reached a user.
+
+`ui/src/tests/` is now a `wasm-bindgen-test` harness, 34 tests, run under Node by
+`wasm-bindgen-test-runner` and wired into CI beside the frontend clippy pass.
+`ui/README.md` is the operational reference; this is the record of what it buys.
+
+### Covered
+
+| Priority | Where | What is asserted |
+|---|---|---|
+| 1. The IPC boundary | `ui/src/tests/api.rs` | The JS argument object each command sends — key names, key sets, and **value types** — read back out of `serde_wasm_bindgen`, so it is observed rather than restated. Plus the error sink, response deserialization, and the non-string-rejection fallback. |
+| 2. Drag/drop index math | `ui/src/tests/reorder.rs` | `slot_at_offset` and `drag_shift_style`: the last row's bottom edge, exact slot boundaries across a range of list lengths and row heights, scroll offset, and that a preview is a permutation of the slots (parsed back out of the generated CSS, not recomputed). |
+| 3. `app.rs` decisions | `ui/src/tests/app.rs` | `shuffled_start`, `fmt_total_duration`, `playlist_fully_downloaded`. |
+
+The harness sits at the Tauri bridge: `spawn` and `tauri_invoke` are replaced
+under `cfg(test)`, and everything above them — the real serialization, the real
+error routing, the real call-site functions — runs for real. Nothing depends on
+a running app, a network, or a `window`.
+
+Every test was mutation-tested: the fix was reverted and the test watched to
+fail. Two mutations **survived**, and they are the honest boundary:
+
+- **Dropping `.floor()` or `.max(0.0)` from `slot_at_offset` changes nothing.**
+  `as usize` on an `f64` truncates toward zero and saturates at zero, so both are
+  redundant against the implementation. They are kept as statements of intent,
+  not as behaviour the tests defend. (`min(len - 1)`, by contrast, is
+  load-bearing: two tests fail without it.)
+- **A `play_track`-style argument change inside an unnamed `app.rs` closure is
+  not caught.** This is the finding that mattered. The first version of the
+  `play_track` test built its own `json!` literal, and the mutation that
+  re-instated the exact historical defect passed. Fixed by extracting
+  `app::fire_play_track` — the function the row and Home handlers now call — so
+  the test drives the real call site. Once it did, the same mutation failed with
+  `left: ["radio", "track"], right: ["track"]`. The lesson generalises: a test
+  that restates a payload proves the transport works and nothing about whether
+  the app uses it.
+
+### Not covered
+
+**Computed style — the class of bug that already shipped.** The white album text
+came from a `<button>` inheriting `buttonface`, and nothing here can see it. It
+needs a real layout engine, a `getComputedStyle` call, and a browser; that is a
+separate harness (chromedriver or `wasm-bindgen-test`'s in-browser mode) with its
+own install and version pinning on three operating systems. **This gap is open,
+and it is recorded as open rather than implied to be closed by the tests above.**
+The harness is deliberately not described as covering it.
+
+**Rendering and hooks.** C1 (`use_state` after an early return) and H4 (progress
+surviving a track change) both need a component mounted and re-rendered. That is
+a *different* missing piece from the browser one: a component harness can run
+under the same Node runner, but it needs a DOM implementation and a way to drive
+Yew's renderer, neither of which this harness provides. Worth doing; not done.
+
+**Most call sites' argument shapes.** `src-tauri/tests/ipc_contract.rs` parses
+`api::fire("cmd", json!({...}))` as text and compares key names against the
+backend's parameters. It is textual: it cannot see value types, and it does not
+see through a helper that builds its payload elsewhere — `fire_play_tracks` was
+invisible to it before this work. The two `play_*` commands are now covered end
+to end from the frontend; the other 53 IPC call sites still have the text check
+and nothing more.
+
+### Two things worth knowing before trusting a green run
+
+**The suite cannot run on Windows, for a reason outside this repo.**
+`wasm-bindgen-test-runner` 0.2.128 builds its Node script with
+`Path::display()` inside single quotes, so a Windows path becomes
+`'C:\Users\...'` and Node dies parsing `\U` as an escape *before any test runs*.
+It is unconditional (the `readFile` is inside `if (false)`, which is still
+parsed) and 0.2.129 does not fix it. `WASM_BINDGEN_BENCH_RESULT` does not help:
+the path is re-encoded through `PathBuf`, so the backslashes come back. CI
+therefore runs the step on Linux and macOS only. The tests themselves are
+platform-independent — the same wasm module and the same assertions — so this
+costs local reproduction, not coverage. Run them under WSL on Windows.
+
+**The first harness design was wrong and the failures were confusing.** It used
+`spawn_local` and yielded to the event loop, on the assumption that
+`wasm-bindgen-test` drives the page's executor. It does not: every async test
+failed with the same `expected exactly one IPC call, got 0`, which reads like a
+missing call rather than an un-polled one, and a single test run in isolation
+failed identically — which is what ruled out the cross-talk hypothesis I started
+with. The fix was to stop racing an executor: `spawn` queues the future and
+`settle()` drains it on the test's own stack, which also made the async tests
+synchronous and therefore immune to interleaving. The same shape as the L17
+harness lesson — when a harness misbehaves, suspect the harness first.
