@@ -28,20 +28,57 @@ use yew::Callback;
 // library: the seam is at the transport, and there is no third party to agree
 // with.
 #[cfg(not(test))]
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke, catch)]
-    async fn tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
+mod bridge {
+    use wasm_bindgen::prelude::*;
 
-    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen)]
-    fn tauri_listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>) -> js_sys::Promise;
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke, catch)]
+        pub async fn tauri_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
+
+        #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen)]
+        fn listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>);
+    }
+
+    /// Subscribe `handler` to `event` for the lifetime of the page.
+    ///
+    /// The `Closure` is built here and leaked, which is what the real binding
+    /// needs: a `Closure` is a handle to a JS function, so the callback has to
+    /// stay alive as long as the page does.
+    pub(super) fn tauri_listen(event: &'static str, handler: impl FnMut(JsValue) + 'static) {
+        let closure = Closure::<dyn FnMut(JsValue)>::new(handler);
+        listen(event, &closure);
+        // The subscription lives as long as the page; intentionally leaked.
+        closure.forget();
+    }
 }
 
 #[cfg(test)]
-pub(crate) use crate::tests::harness::{spawn, tauri_invoke, tauri_listen};
+pub(crate) use crate::tests::harness::{spawn, tauri_invoke};
 
 #[cfg(not(test))]
-use wasm_bindgen_futures::spawn_local as spawn;
+pub use bridge::tauri_invoke;
+
+/// Subscribe to a backend event for the lifetime of the page.
+///
+/// A thin wrapper over [`deliver`], which is where the payload handling lives and
+/// which is compiled in *both* configurations — so the shape this depends on is
+/// the shape the tests exercise. Only the transport differs between a real build
+/// and a test build.
+#[cfg(not(test))]
+pub fn listen_event<T: DeserializeOwned + 'static>(event: &'static str, cb: Callback<T>) {
+    // `Callback` is not itself `Fn`, so the `deliver` call goes through a
+    // closure that emits — the same shape the test build uses.
+    bridge::tauri_listen(event, move |raw: JsValue| {
+        deliver(raw, |value: T| cb.emit(value));
+    });
+}
+
+/// The test build's subscription: the same function the app calls, with the
+/// transport replaced by a recorder that a test can deliver events through. See
+/// `tests/harness.rs`'s `listen_event`.
+#[cfg(test)]
+pub(crate) use crate::tests::harness::listen_event;
 
 fn js_err(e: JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))
@@ -106,18 +143,31 @@ fn report_error(msg: String) {
     });
 }
 
-/// Subscribe to a backend event for the lifetime of the page.
-pub fn listen_event<T: DeserializeOwned + 'static>(event: &'static str, cb: Callback<T>) {
-    let closure = Closure::<dyn FnMut(JsValue)>::new(move |raw: JsValue| {
-        let Ok(payload) = js_sys::Reflect::get(&raw, &JsValue::from_str("payload")) else {
-            return;
-        };
-        match serde_wasm_bindgen::from_value::<T>(payload) {
-            Ok(v) => cb.emit(v),
-            Err(e) => web_sys::console::error_1(&format!("event {event}: {e}").into()),
-        }
-    });
-    let _ = tauri_listen(event, &closure);
-    // The subscription lives as long as the app; intentionally leaked.
-    closure.forget();
+#[cfg(not(test))]
+use wasm_bindgen_futures::spawn_local as spawn;
+
+/// Unwrap one event payload and hand it to `cb`, logging a payload the event's
+/// type cannot read.
+///
+/// Split out of [`listen_event`] so it is not behind `cfg(test)`: it is real
+/// behaviour — the `payload` key is the bridge's envelope, not the event's own
+/// data — and the test build has to run *this* code rather than a copy of it for
+/// `emit_for_test` to be worth anything.
+///
+/// The callback borrows instead of owning (`Fn(T) + '_` rather than
+/// `+ 'static`) so both callers can pass one: the real path passes an owned
+/// value, the test path passes a borrow of the recorded handler, and neither
+/// should have to change shape to satisfy the other.
+pub fn deliver<T, C>(raw: JsValue, cb: C)
+where
+    T: DeserializeOwned,
+    C: Fn(T),
+{
+    let Ok(payload) = js_sys::Reflect::get(&raw, &JsValue::from_str("payload")) else {
+        return;
+    };
+    match serde_wasm_bindgen::from_value::<T>(payload) {
+        Ok(v) => cb(v),
+        Err(e) => web_sys::console::error_1(&format!("event payload: {e}").into()),
+    }
 }

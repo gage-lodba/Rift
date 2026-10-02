@@ -309,15 +309,73 @@ impl<T> std::future::Future for Immediate<T> {
     }
 }
 
-/// Stub for `api.rs`'s `tauri_listen`. The real one returns
-/// `window.__TAURI__.event.listen`'s Promise, which nothing awaits (the
-/// subscription lives for the life of the page), so a resolved Promise is
-/// enough for `listen_event` to run its body.
-pub(crate) fn tauri_listen(
-    _event: &str,
-    _handler: &Closure<dyn FnMut(JsValue)>,
-) -> js_sys::Promise {
-    js_sys::Promise::resolve(&JsValue::UNDEFINED)
+thread_local! {
+    /// The event listeners registered since the test binary started, each with a
+    /// Rust-side copy of the callback `api::listen_event` was given.
+    ///
+    /// The copy is necessary rather than convenient: a `Closure` is a handle to
+    /// a JS function and **cannot be invoked from Rust**, and in
+    /// `wasm-bindgen` 0.2.128 it is not `Clone` either, so a recorded
+    /// `&Closure` could never be delivered to.
+    ///
+    /// Not cleared per test: each entry belongs to a component instance, and a
+    /// component from an earlier test has been unmounted, so its callback either
+    /// no-ops or targets a dropped root. [`emit_for_test`] reports how many
+    /// handlers it reached, so a test that needs exactly one can require that.
+    static LISTENERS: RefCell<Vec<(String, Callback<JsValue>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Stub for `api::listen_event`, replacing the real subscription under
+/// `cfg(test)`.
+///
+/// It records the callback and hands `api::deliver` back unchanged, so the
+/// envelope unwrapping and the deserialization of the payload are the real ones
+/// — the stub replaces the transport, not the logic above it.
+pub(crate) fn listen_event<T>(event: &'static str, cb: Callback<T>)
+where
+    T: serde::de::DeserializeOwned + 'static,
+{
+    // The handler is owned by an `Rc` so the callback `deliver` receives can
+    // still be `'static`: a plain `RefCell` borrow would not outlive the
+    // enclosing closure, and `bridge`'s real subscription requires `'static`.
+    let handler = std::rc::Rc::new(RefCell::new(cb));
+    LISTENERS.with(|l| {
+        l.borrow_mut().push((
+            event.to_string(),
+            Callback::from(move |raw: JsValue| {
+                let handler = handler.clone();
+                crate::api::deliver::<T, _>(raw, move |value| handler.borrow().emit(value));
+            }),
+        ))
+    });
+}
+
+/// Deliver `payload` to every listener registered for `event`, as the backend's
+/// `emit` would, and return how many were reached.
+///
+/// The payload is wrapped in an object with a `payload` key because that is the
+/// envelope `api::deliver` unwraps, and delivering through that function — rather
+/// than calling a component's callback directly — is what makes this a test of
+/// the real subscription path rather than of a copy of it.
+pub(crate) fn emit_for_test<T: Serialize>(event: &str, payload: &T) -> usize {
+    let raw = to_js(&serde_json::to_value(payload).expect("test payload serializes"));
+    let envelope = js_sys::Object::new();
+    js_sys::Reflect::set(&envelope, &JsValue::from_str("payload"), &raw)
+        .expect("setting `payload` on a fresh object cannot fail");
+    let envelope = JsValue::from(envelope);
+
+    let handlers: Vec<Callback<JsValue>> = LISTENERS.with(|l| {
+        l.borrow()
+            .iter()
+            .filter(|(name, _)| name == event)
+            .map(|(_, cb)| cb.clone())
+            .collect()
+    });
+    let delivered = handlers.len();
+    for cb in handlers {
+        cb.emit(envelope.clone());
+    }
+    delivered
 }
 
 fn to_js(v: &Value) -> JsValue {
