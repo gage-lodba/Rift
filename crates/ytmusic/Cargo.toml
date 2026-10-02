@@ -2,6 +2,7 @@
 name = "rift-ytmusic"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Clean-room YouTube Music innertube client for Rift"
 

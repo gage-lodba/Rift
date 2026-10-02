@@ -5,8 +5,19 @@
 # from the same commit. `rustup` honours this file automatically, so a plain
 # `cargo build` in this repo also gets the pinned version.
 #
-# Keep in step with the `toolchain:` input in .github/workflows/*.yml.
+# The channel is deliberately the same version as `rust-version` in the root
+# Cargo.toml — the floor of the resolved dependency graph, 1.88, not the newest
+# toolchain available. Pinning above the floor means the oldest supported
+# toolchain is never exercised, so it silently rots: code using a newer std API
+# compiles here and fails for anyone on the declared minimum, and the declared
+# minimum stops being true. Pinning *at* the floor makes every ordinary build a
+# compatibility check, and building on anything newer is then a free choice
+# rather than a requirement. It was pinned to 1.98.0 for no reason other than
+# being what happened to be installed, which is exactly how that rot starts.
+#
+# Keep in step with the `toolchain:` input in .github/workflows/*.yml and with
+# `rust-version` in Cargo.toml.
 [toolchain]
-channel = "1.98.0"
+channel = "1.88.0"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]

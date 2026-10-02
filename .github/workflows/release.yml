@@ -86,7 +86,7 @@ jobs:
           # Pinned and mirrored in rust-toolchain.toml: the released installers
           # should be built by a known compiler, not by whatever `stable` is that
           # week. Without an explicit `toolchain` this action installs the latter.
-          toolchain: 1.98.0
+          toolchain: 1.88.0
           targets: ${{ matrix.rust-targets }}
 
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2

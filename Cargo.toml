@@ -8,10 +8,16 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["Gage Lodba"]
 repository = "https://github.com/gage-lodba/Rift"
-# No `rust-version`: the toolchain is *pinned* by rust-toolchain.toml (and
-# mirrored in the workflows), and declaring a minimum supported version nobody
-# has actually built against would be a guess presented as a guarantee. Add one
-# once an older toolchain has been verified in CI.
+# The real floor of the resolved graph, not a guess: the highest `rust-version`
+# declared by anything Cargo.lock pins is 1.88 (`time`, `plist`, `darling`,
+# `icu_*`), with `rodio` 1.87 and `reqwest` 1.85 just behind. Verified by
+# building, testing, and linting the workspace on 1.88.0 — see the MSRV job in
+# .github/workflows/ci.yml, which keeps that true rather than trusting this
+# comment.
+#
+# Declaring it also makes clippy refuse to suggest APIs newer than the floor, so
+# a lint cannot "fix" something into breaking the oldest toolchain we support.
+rust-version = "1.88"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -538,6 +538,12 @@ fn build_activity(n: &Now) -> Activity<'_> {
     if !n.cover.is_empty() {
         assets = assets.large_image(n.cover.as_str());
     }
+    // `const_is_empty` is right that this is always true as the constant stands,
+    // and the check stays anyway: `LOGO_ASSET` is the documented hook for a fork
+    // with no uploaded badge (see its declaration), so clearing it must drop the
+    // small image rather than request an asset that does not exist. Allowing the
+    // lint here is more honest than deleting the branch that makes that work.
+    #[allow(clippy::const_is_empty)]
     if !LOGO_ASSET.is_empty() {
         assets = assets.small_image(LOGO_ASSET).small_text("Rift");
     }
