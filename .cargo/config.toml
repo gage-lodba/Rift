@@ -11,3 +11,24 @@
 # it.
 [target.wasm32-unknown-unknown]
 runner = "wasm-bindgen-test-runner"
+
+# The DOM the renderer tests mount into.
+#
+# `wasm-bindgen-test-runner` builds a Node script and runs it, and offers no hook
+# of its own for injecting globals — but `NODE_OPTIONS=--require <file>` is
+# evaluated by Node *before* the script, which is exactly early enough: `web-sys`
+# resolves `window` and `document` lazily, so they only have to exist before the
+# first component mounts. `ui/tests/dom-shim.cjs` installs them.
+#
+# `relative = true` resolves the path against *this file's* directory rather than
+# the working directory, so it is correct whether Cargo is invoked from the repo
+# root or from `ui/`, on every platform. `force` is deliberately left unset, so a
+# `NODE_OPTIONS` you set yourself wins (Cargo warns that it is skipping this one)
+# rather than being silently replaced.
+#
+# Only the wasm32 test run needs it. `trunk build`, the wasm clippy pass, and
+# every native build are unaffected — though `cargo build`, which reads this
+# table too, will also carry the variable. That is inert: `--require` only means
+# anything to Node.
+[env]
+NODE_OPTIONS = { value = "--require ui/tests/dom-shim.cjs", relative = true }
