@@ -2,10 +2,12 @@
 
 > **Status (2026-09-29):** every item below has been triaged and marked
 > **fixed**, **retracted**, or **deferred** with a one-line reason, in
-> `<blockquote>` notes under each heading. The work landed as eleven commits,
-> `7df0c81..c0e108f`. Test count went 65 → 107; the four required checks
+> `<blockquote>` notes under each heading. The work landed as fourteen commits,
+> `7df0c81..baa5af8`. Test count went 65 → 117; the four required checks
 > (`cargo fmt --all -- --check`, both clippy passes, and
-> `cargo test --workspace --exclude rift-ui --locked`) are clean.
+> `cargo test --workspace --exclude rift-ui --locked`) are clean, and the whole
+> block was re-run on both the declared MSRV (1.88.0) and a newer toolchain
+> (1.98.0).
 >
 > Two claims are retracted, both because the defect does not exist in the code
 > as written: **L1** (the crossfade fade-out already reads the live master
@@ -26,9 +28,20 @@
 > `ipc_contract.rs`). The third, in my own SHA-256, was caught by a test written
 > for it.
 >
+> The L17 client-test harness added later (`d1cac0c`) supplied a fourth instance
+> of the same pattern, and it is worth recording because the failure mode was
+> new: the *harness* had two bugs of its own — an accept loop that a panicking
+> route could kill, and a request log mutex held across handler calls — so one
+> assertion failure surfaced as eight unrelated `ConnectionRefused`/`PoisonError`
+> results. It read as "the client is broken on 1.98" when the client was fine.
+> Both are fixed (`baa5af8`), and the suite was confirmed stable over 20
+> consecutive runs rather than once.
+>
 > **Deferred, with reasons:** L7 (regex caching), L10 (typed UGC signal), M10
-> (shuffle-history remapping), L16's `rust-version`, the `with_extension` shape
-> in M9, and L17's `client.rs` transport tests. Each is noted at its item.
+> (shuffle-history remapping), the `with_extension` shape in M9, and a frontend
+> test harness (no way to cover computed style, which is what the white-background
+> regression needed). Each is noted at its item. L16's `rust-version` and L17's
+> `client.rs` transport tests were deferred and have since been done.
 
 Scope: every tracked source file (`src-tauri/`, `crates/ytmusic/`, `types/`, `ui/`,
 `docs/`, `.github/`, manifests). HEAD `a4b8d30` plus the uncommitted player diff.
@@ -43,9 +56,12 @@ Verification performed on this checkout:
 | Tests | `cargo test --workspace --exclude rift-ui --locked` | 65 passed, 0 failed |
 | Path semantics | isolated `rustc` program printing `with_extension` results | confirmed L2 |
 
-*(As of the fixes: the same four commands are clean and the test count is 101.
-Two further checks were added to CI — `cargo tauri build --no-bundle`, and
-`.github/scripts/check-duplicate-deps.sh`.)*
+*(As of the fixes: the same four commands are clean and the test count is 117.
+Three further checks were added to CI — `cargo tauri build --no-bundle`,
+`.github/scripts/check-duplicate-deps.sh`, and
+`.github/scripts/check-toolchain-consistency.sh`. The whole block is also clean
+on a newer toolchain (1.98.0), which matters because pinning to the MSRV would
+otherwise make upgrading a prerequisite for building.)*
 
 Overall this is an unusually well-documented, well-tested codebase for its size.
 Comments explain *why*; the panic surface in the backend is tiny (4 non-test
@@ -590,10 +606,17 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
 
   > **FIXED** (`7ddd789`). All five actions pinned to commit SHAs with the version
   > in a trailing comment (which Dependabot can still update), `rust-toolchain.toml`
-  > pins 1.98.0, and every workflow passes it explicitly. Note `@stable` there is a
-  > *moving branch*, not a tag — and with no `toolchain:` input it installed
-  > whatever `stable` was that week, so CI and the released installers could be
-  > built by different compilers from the same commit.
+  > pins an explicit version, and every workflow passes it explicitly. Note
+  > `@stable` there is a *moving branch*, not a tag — and with no `toolchain:`
+  > input it installed whatever `stable` was that week, so CI and the released
+  > installers could be built by different compilers from the same commit.
+  >
+  > **Follow-up** (`736c5b3`): the pinned version was 1.98.0, chosen only because
+  > it was what happened to be installed. Nothing in the resolved graph needs more
+  > than **1.88**, so the pin was not just over-strict — it hid breakage, because
+  > building above the floor means the oldest supported toolchain is never
+  > exercised. Moved to 1.88.0, and `.github/scripts/check-toolchain-consistency.sh`
+  > now fails if the pin, `rust-version`, and the workflow inputs disagree.
 
 - **L15. `src-tauri/gen/schemas/*.json` (~440 KB) is tracked** and not ignored;
   upstream's Tauri template ignores `/gen/schemas`. It churns on every dependency
@@ -607,10 +630,21 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
   and no `bundle.publisher`/`copyright`/`licenseFile`, so `.deb` Maintainer and MSI
   Manufacturer fall back to defaults.
 
-  > **FIXED** (`7ddd789`), except `rust-version`: the toolchain is *pinned* by
-  > `rust-toolchain.toml`, and declaring a minimum nobody has built against would
-  > be a guess presented as a guarantee. Add one once an older toolchain is
-  > verified in CI.
+  > **FIXED** (`7ddd789`, and `736c5b3` for `rust-version`). The earlier note here
+  > held that declaring a minimum nobody had built against would be a guess
+  > presented as a guarantee — sound reasoning, and it is now satisfied rather
+  > than abandoned: the workspace was built, tested and linted on 1.88.0 before
+  > `rust-version = "1.88"` was declared. The comment in `Cargo.toml` records
+  > where 1.88 comes from (`time`/`plist`/`darling`/`icu_*` declare 1.88;
+  > `rodio` 1.87 and `reqwest` 1.85 behind them) so the number can be re-derived
+  > instead of trusted, and CI builds at that version on every run, so the
+  > declaration cannot rot. Declaring it also makes clippy MSRV-aware, so it will
+  > not suggest an API newer than the floor.
+  >
+  > One lint needed a decision: `const_is_empty` fires on `!LOGO_ASSET.is_empty()`
+  > under 1.88, correctly. The branch stays with an `#[allow]` and a reason,
+  > because `LOGO_ASSET`'s own doc says "Leave empty to show only the cover" —
+  > deleting it would break the fork path the constant exists for.
 
 - **L17. No malformed-input tests.** `tests/fixtures.rs` covers only happy paths;
   nothing feeds missing `flexColumns`, `null` titles, wrong JSON types, empty
@@ -627,9 +661,34 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
   > it found a real gap: a row with a valid `videoId` but no title column produced
   > a blank, unclickable track. `prune_fixture.rs` now carries a comment stating
   > that its check is an equivalence proof between the original and the compacted
-  > document, not a correctness proof. **Still open:** `client.rs` transport, the
-  > 403 retry and pagination remain untested — they need a mock HTTP server, which
-  > is a test-infrastructure decision rather than a parser fix.
+  > document, not a correctness proof.
+  >
+  > **FIXED (client half)** (`d1cac0c`). Eight transport tests against a real
+  > HTTP server on loopback — no new dependency, since `std::net::TcpListener`
+  > plus a thread is enough and `tokio` was already a dev-dependency of the crate.
+  > They cover the 403 retry rotating the visitor id *and recovering* (H1, end to
+  > end), the request actually built (method, content type, the three innertube
+  > headers, origin/referer, the consent cookie, the merged `context.client`
+  > object), that only a 403 is retried, pagination following continuations in
+  > order and truncating at the limit, the no-progress guard, and album/artist
+  > routing. The seam is a `#[cfg(test)]` substitution of the base URL rather
+  > than an env var, deliberately: an env override would ship in the release
+  > binary, and "send every metadata request somewhere else" is not a capability
+  > a music player should have.
+  >
+  > Getting there took three attempts, all recorded in the module's doc comment
+  > because each is a mistake a later addition there could repeat: tests racing on
+  > the process-global visitor pool (every test now holds a gate, which is blunter
+  > than strictly needed and the comment says why); a `clear_override()` placed
+  > *after* the call under test, so both retry attempts ran inside the window it
+  > was supposed to close; and two wrong fake-response shapes where the parser was
+  > right and I was not (`/browse` receives `VL<id>` for a playlist, and a real
+  > page carries rows *and* a continuation token together). Note also that the two
+  > halves of the H1 fix mask each other — reverting either alone leaves the new
+  > test green, and it takes both to reproduce the defect, which is stated in the
+  > test rather than glossed over. **Still open:** there is no frontend harness,
+  > so nothing covers computed style — which is what the white-album-text
+  > regression actually needed.
 
 - **L18. Test litter**: `settings.rs` / `downloads.rs` / `library.rs` tests create
   `%TEMP%\rift-*` dirs and skip cleanup on failure.
