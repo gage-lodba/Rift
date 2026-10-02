@@ -26,6 +26,13 @@ jobs:
       # declared minimum cannot quietly stop being what anything is built with.
       - name: Check toolchain consistency
         run: .github/scripts/check-toolchain-consistency.sh
+      # The test runner refuses a wasm test binary built against a different
+      # `wasm-bindgen` than its own, and `wasm-bindgen` is a transitive
+      # dependency Dependabot will bump on its own. Checked here rather than in
+      # the frontend job because it is a comparison of two files, and belongs
+      # before anything compiles.
+      - name: Check wasm-bindgen version consistency
+        run: .github/scripts/check-wasm-bindgen-version.sh
 
   fmt:
     name: rustfmt
@@ -94,6 +101,14 @@ jobs:
         with:
           tool: trunk@0.21.14
 
+      # The runner that executes the frontend's wasm test binaries. Must be the
+      # exact version Cargo.lock resolves for `wasm-bindgen` (checked by the
+      # `toolchain` job above): it rejects a test binary built against any other.
+      - name: Install wasm-bindgen-cli
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen-cli@0.2.128
+
       # Build the WASM frontend. This also populates ../dist, which the Tauri
       # backend embeds via generate_context! when it compiles below.
       - name: Build frontend
@@ -102,6 +117,23 @@ jobs:
 
       - name: Clippy (frontend / wasm)
         run: cargo clippy -p rift-ui --target wasm32-unknown-unknown --locked -- -D warnings
+
+      # The frontend's tests, run on Node via wasm-bindgen-test-runner (wired up
+      # by the runner entry in .cargo/config.toml). They cover the IPC boundary's
+      # argument shapes, the reorder index math, and App's pure decisions — not
+      # rendering, and not computed style; see ui/README.md for what is
+      # deliberately outside this harness.
+      #
+      # Skipped on Windows, and not because it is untested there: it cannot run
+      # there at all. `wasm-bindgen-test-runner` 0.2.128 writes the benchmark
+      # path into the generated Node script with `Path::display()`, so on
+      # Windows it emits `'C:\Users\...'` inside a JS single-quoted string and
+      # Node dies parsing `\U` as an escape before a single test runs. That is
+      # a fixed defect in the runner, not in this repository, and the tests are
+      # platform-independent — the same wasm binary runs on either OS.
+      - name: Test (frontend / wasm)
+        if: runner.os != 'Windows'
+        run: cargo test -p rift-ui --target wasm32-unknown-unknown --locked
 
       - name: Clippy (backend)
         run: cargo clippy --workspace --exclude rift-ui --all-targets --locked -- -D warnings
