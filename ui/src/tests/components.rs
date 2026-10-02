@@ -28,7 +28,7 @@ use rift_types::{PlaybackState, Progress, QueueSnapshot, RepeatMode, Track};
 use wasm_bindgen_test::wasm_bindgen_test;
 use yew::prelude::*;
 
-use crate::components::{PlayerBar, PlayerBarProps, QueuePanel, QueuePanelProps};
+use crate::components::{track_key, PlayerBar, PlayerBarProps, QueuePanel, QueuePanelProps};
 use crate::tests::harness::track;
 
 /// A queue of `n` tracks, `t0..tn`.
@@ -146,5 +146,67 @@ async fn player_bar_renders_the_loaded_track() {
     assert!(
         html.contains("Artist"),
         "the loaded track's artist is missing: {html}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H4's dependency: the re-seed effect must be able to notice a track change
+// ---------------------------------------------------------------------------
+
+/// The half of H4 that can be checked without a renderer.
+///
+/// H4 was a stale progress bar: the re-seed effect was keyed on
+/// `props.progress` alone, and `App` deliberately does not subscribe to
+/// PROGRESS ticks, so that value never moved after bootstrap. Switching tracks
+/// therefore left the bar showing the *previous* track's elapsed time and
+/// slider `max` for the whole fetch window. The fix added the track's identity
+/// to the effect's dependency list — which only works if two different tracks
+/// produce two different keys.
+///
+/// So this asserts the property the fix rests on rather than the effect
+/// running, which needs a second render. If `track_key` ever stopped
+/// distinguishing tracks, this fails and the effect would silently go back to
+/// never re-running — the exact regression, restored invisibly.
+#[wasm_bindgen_test]
+fn track_key_distinguishes_tracks_so_the_reseed_effect_can_rerun() {
+    let a = track_key(&Some(track("a")));
+    let b = track_key(&Some(track("b")));
+    assert_ne!(
+        a, b,
+        "two different tracks produced the same key, so the re-seed effect \
+         would never re-run on a track change (H4)"
+    );
+}
+
+/// Nothing loaded is its own identity, distinct from any track — so stopping
+/// re-seeds the bar instead of leaving the last track's position on screen.
+#[wasm_bindgen_test]
+fn track_key_separates_no_track_from_a_track() {
+    let idle = track_key(&None);
+    assert_eq!(idle, None);
+    assert_ne!(
+        idle,
+        track_key(&Some(track("a"))),
+        "`None` must be distinguishable from a loaded track"
+    );
+}
+
+/// The key is the track's *id*, not a title or cover URL — metadata for the
+/// same song can be refreshed and re-sent during playback (a like, a download
+/// completing), and if that re-seeded the bar the position would jump back to
+/// the seed mid-song.
+#[wasm_bindgen_test]
+fn track_key_ignores_metadata_that_can_change_mid_playback() {
+    let original = track("abc");
+    let mut refreshed = original.clone();
+    refreshed.title = "Title abc (remastered)".to_string();
+    refreshed.cover = "https://example.invalid/other.jpg".to_string();
+    refreshed.duration = Some(999);
+
+    assert_eq!(
+        track_key(&Some(original)),
+        track_key(&Some(refreshed)),
+        "the same track id with refreshed metadata must keep its key, or the \
+         bar re-seeds and the position jumps mid-song"
     );
 }

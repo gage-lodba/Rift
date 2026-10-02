@@ -36,7 +36,7 @@ pub use update_banner::UpdateBanner;
 // modules above are private, so these are unreachable from outside the crate
 // and would be dead re-exports in a real build.
 #[cfg(test)]
-pub(crate) use player_bar::PlayerBarProps;
+pub(crate) use player_bar::{track_key, PlayerBarProps};
 #[cfg(test)]
 pub(crate) use queue::QueuePanelProps;
 

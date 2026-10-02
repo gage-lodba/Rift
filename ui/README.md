@@ -79,7 +79,7 @@ wsl -e bash -lc 'cd /mnt/c/.../Rift && cargo test -p rift-ui --target wasm32-unk
 | `api.rs` — the IPC boundary | `src/tests/api.rs` | The exact JS argument object each priority command sends: key names, key sets, and value **types**, read back through `serde_wasm_bindgen` so they are observed rather than restated. Plus the error sink, response deserialization, and the non-string-rejection fallback. |
 | `components/reorder.rs` | `src/tests/reorder.rs` | `slot_at_offset` (which slot the pointer is over) and `drag_shift_style` (which way each row slides), including the last row's bottom edge, exact slot boundaries across a range of lengths and row heights, scroll offset, and that a preview is a permutation of the slots. |
 | `app.rs` | `src/tests/app.rs` | `shuffled_start` (a shuffled Play must not start out of range), `fmt_total_duration`, `playlist_fully_downloaded` (the offline pin behind two user-visible behaviours). |
-| Components, first render | `src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all, and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track's title and artist reaching the bar. A panic in a first render is a blank screen, so this is worth having. |
+| Components, first render | `src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all, and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track's title and artist reaching the bar. A panic in a first render is a blank screen, so this is worth having. Also `track_key`, the dependency `H4`'s re-seed effect is keyed on: distinct tracks must produce distinct keys, or the effect stops re-running on a track change. |
 | Hook order, statically | `src/tests/hook_order.rs` | That no hook is called after an early return, in any component source. This is the defect class behind `C1`. A token scanner over the component files, biased toward silence; it reports only what it can prove from brace depth, and its blind spots are listed in the module doc. |
 ### How components are rendered without a DOM
 
@@ -132,9 +132,12 @@ disagrees until a second render happens.
 **Rendering and computed style.** Two consequences worth stating plainly:
 
 1. `H4` from `docs/code-review-2026-09.md` — PlayerBar's live progress surviving
-   a track change — is a second-render question and is not covered. What *is*
-   covered is that the bar renders at all, with and without a track, and that no
-   hook in it sits below an early return.
+   a track change — is a second-render question and is **not** covered as
+   behaviour. What *is* covered is the property its fix rests on: `track_key`
+   must give two different tracks two different keys, because the re-seed effect
+   is keyed on it and a constant key is exactly how H4 happened. That is the
+   logic half. The effect actually re-running, and the bar actually re-seeding,
+   still need a second render.
 2. The white album-text regression (`buttonface` inherited from a `<button>`)
    remains untestable here. It is a computed-style question: the correct answer
    requires a real browser, `getComputedStyle`, and a layout engine. That is a

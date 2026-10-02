@@ -44,7 +44,7 @@
 >
 > **Added after this review closed — the frontend harness.** `rift-ui` was the
 > one crate with no tests, so every UI change was unverifiable except by running
-> the app. There is now a `wasm-bindgen-test` harness (`ui/src/tests/`, 46 tests,
+> the app. There is now a `wasm-bindgen-test` harness (`ui/src/tests/`, 49 tests,
 > wired into CI next to the frontend clippy pass) covering the IPC boundary's
 > argument shapes, the reorder index math, and `App`'s pure decisions about
 > shuffling, durations, and the offline pin. **The computed-style gap is still
@@ -881,7 +881,7 @@ starts from the code rather than from scratch.
 That is how the `play_track` argument-shape breakage reached a runtime failure
 with both sides compiling, and how the white album text reached a user.
 
-`ui/src/tests/` is now a `wasm-bindgen-test` harness, 46 tests, run under Node by
+`ui/src/tests/` is now a `wasm-bindgen-test` harness, 49 tests, run under Node by
 `wasm-bindgen-test-runner` and wired into CI beside the frontend clippy pass.
 `ui/README.md` is the operational reference; this is the record of what it buys.
 
@@ -893,7 +893,7 @@ with both sides compiling, and how the white album text reached a user.
 | 2. Drag/drop index math | `ui/src/tests/reorder.rs` | `slot_at_offset` and `drag_shift_style`: the last row's bottom edge, exact slot boundaries across a range of list lengths and row heights, scroll offset, and that a preview is a permutation of the slots (parsed back out of the generated CSS, not recomputed). |
 | 3. `app.rs` decisions | `ui/src/tests/app.rs` | `shuffled_start`, `fmt_total_duration`, `playlist_fully_downloaded`. |
 | 4. Components, first render | `ui/src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track reaching the bar. Added in a second pass, so the suite was 39 tests at that point. |
-| 5. Hook order, statically | `ui/src/tests/hook_order.rs` | That no hook sits below an early return in any component source — the structural cause of **C1**. Mutation-verified: with the defect re-injected into the queue panel, the check fails at the offending line. Suite is 46 tests. |
+| 5. Hook order, statically | `ui/src/tests/hook_order.rs` | That no hook sits below an early return in any component source — the structural cause of **C1**. Mutation-verified: with the defect re-injected into the queue panel, the check fails at the offending line. Suite is 49 tests. |
 
 Components are rendered without a DOM through Yew's `ssr` feature, declared as a
 dev-dependency so the shipped bundle never links it. That was measured rather
@@ -957,8 +957,15 @@ the body, so the expansion is well-formed and nothing disagrees until a second
 render happens.
 
 H4 (progress surviving a track change) is squarely in that uncovered
-second-render territory. Closing it properly needs a hook harness or a DOM shim
-driving the real client renderer — the shim also being the first step toward the
+second-render territory — **but its logic half is now covered.** The fix added
+the track's identity to the re-seed effect's dependency list, which only works
+if two different tracks produce two different keys. `track_key` is tested for
+exactly that, mutation-verified: making it return a constant fails with "two
+different tracks produced the same key, so the re-seed effect would never re-run
+on a track change (H4)". So the *property the fix rests on* is guarded; the
+effect actually re-running, and the bar actually re-seeding, still need a second
+render. Closing that properly needs a hook harness or a DOM shim driving the
+real client renderer — the shim also being the first step toward the
 computed-style work below. Worth doing; not done.
 
 **Most call sites' argument shapes.** `src-tauri/tests/ipc_contract.rs` parses

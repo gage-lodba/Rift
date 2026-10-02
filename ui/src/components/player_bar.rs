@@ -11,7 +11,13 @@ use crate::api;
 
 /// Identity of the track a set of progress values describes. `None` (nothing
 /// loaded) is its own identity, so stopping clears the bar too.
-fn track_key(track: &Option<Track>) -> Option<String> {
+///
+/// This is the dependency that makes the re-seed effect below run on a track
+/// change (see the comment at the `use_effect_with`), which is what H4 was
+/// about. `pub(crate)` so its contract — distinct tracks get distinct keys —
+/// can be tested without a renderer; the effect is keyed on its output, so a
+/// key that stopped distinguishing tracks would silently reintroduce H4.
+pub(crate) fn track_key(track: &Option<Track>) -> Option<String> {
     track.as_ref().map(|t| t.id.clone())
 }
 
