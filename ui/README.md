@@ -67,6 +67,7 @@ wsl -e bash -lc 'cd /mnt/c/.../Rift && cargo test -p rift-ui --target wasm32-unk
 | `components/reorder.rs` | `src/tests/reorder.rs` | `slot_at_offset` (which slot the pointer is over) and `drag_shift_style` (which way each row slides), including the last row's bottom edge, exact slot boundaries across a range of lengths and row heights, scroll offset, and that a preview is a permutation of the slots. |
 | `app.rs` | `src/tests/app.rs` | `shuffled_start` (a shuffled Play must not start out of range), `fmt_total_duration`, `playlist_fully_downloaded` (the offline pin behind two user-visible behaviours). |
 | Components, first render | `src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all, and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track's title and artist reaching the bar. A panic in a first render is a blank screen, so this is worth having. |
+| Hook order, statically | `src/tests/hook_order.rs` | That no hook is called after an early return, in any component source. This is the defect class behind `C1`. A token scanner over the component files, biased toward silence; it reports only what it can prove from brace depth, and its blind spots are listed in the module doc. |
 
 ### How components are rendered without a DOM
 
@@ -95,30 +96,32 @@ quietly fixed, because they are the honest boundary of the suite:
 
 ## What is *not* covered, and why
 
-**Second renders, and therefore hook order.** The component tests above render
-each component **once**. Yew's server renderer drives a component instance a
-single time and does not run effects, so nothing here sees a second render —
-and a second render is exactly where the hook-order defect lives: Yew asserts
-that the hook count matches the *previous* render, so `C1` (`use_state` after an
-early return in the queue panel) panics only when the panel goes from an empty
-queue to a non-empty one. Two attempts to reach it through SSR are recorded as
-dead ends in `src/tests/components.rs` so nobody repeats them. Covering `C1`
-needs a different mechanism — a hook harness, or a DOM shim driving the real
-client renderer — and that work is open.
+**Second renders.** The component tests render each component **once**. Yew's
+server renderer drives a component instance a single time and does not run
+effects, so nothing here sees a second render — and a second render is where
+Yew's hook-order assertion lives, since it compares a render against the
+*previous* one. Two attempts to force a second pass through SSR are recorded as
+dead ends in `src/tests/components.rs` so nobody repeats them.
+
+This is where `hook_order.rs` sits, and the distinction matters: it covers the
+*structural* cause of `C1` (a hook below an early return) by reading the source,
+which is decidable without a renderer. It does not cover second-render
+*behaviour*, and it is not a renderer-level test. Closing that properly needs a
+hook harness or a DOM shim driving the real client renderer — see below.
 
 **Rendering and computed style.** Two consequences worth stating plainly:
 
 1. `H4` from `docs/code-review-2026-09.md` — PlayerBar's live progress surviving
-   a track change — is a *second-render* question for the same reason as `C1`,
-   and is not covered. What is covered is that the bar renders at all, with and
-   without a track.
+   a track change — is a second-render question and is not covered. What *is*
+   covered is that the bar renders at all, with and without a track, and that no
+   hook in it sits below an early return.
 2. The white album-text regression (`buttonface` inherited from a `<button>`)
    remains untestable here. It is a computed-style question: the correct answer
    requires a real browser, `getComputedStyle`, and a layout engine. That is a
    *different* purchase from this one — a browser runner (chromedriver, or
    `wasm-bindgen-test`'s in-browser mode) plus its installation and version
-   pinning on three operating systems — and it is not included. The gap is open,
-   not closed by accident.
+   pinning on three operating systems — and it is not included. A DOM shim would
+   be the natural first step toward it and would also unlock `H4`.
 
 **Other call sites' argument shapes.** `src-tauri/tests/ipc_contract.rs` parses
 the frontend's `api::fire("cmd", json!({...}))` calls as text and compares key

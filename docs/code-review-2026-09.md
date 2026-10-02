@@ -44,7 +44,7 @@
 >
 > **Added after this review closed — the frontend harness.** `rift-ui` was the
 > one crate with no tests, so every UI change was unverifiable except by running
-> the app. There is now a `wasm-bindgen-test` harness (`ui/src/tests/`, 39 tests,
+> the app. There is now a `wasm-bindgen-test` harness (`ui/src/tests/`, 46 tests,
 > wired into CI next to the frontend clippy pass) covering the IPC boundary's
 > argument shapes, the reorder index math, and `App`'s pure decisions about
 > shuffling, durations, and the offline pin. **The computed-style gap is still
@@ -850,7 +850,7 @@ starts from the code rather than from scratch.
 That is how the `play_track` argument-shape breakage reached a runtime failure
 with both sides compiling, and how the white album text reached a user.
 
-`ui/src/tests/` is now a `wasm-bindgen-test` harness, 39 tests, run under Node by
+`ui/src/tests/` is now a `wasm-bindgen-test` harness, 46 tests, run under Node by
 `wasm-bindgen-test-runner` and wired into CI beside the frontend clippy pass.
 `ui/README.md` is the operational reference; this is the record of what it buys.
 
@@ -861,7 +861,8 @@ with both sides compiling, and how the white album text reached a user.
 | 1. The IPC boundary | `ui/src/tests/api.rs` | The JS argument object each command sends — key names, key sets, and **value types** — read back out of `serde_wasm_bindgen`, so it is observed rather than restated. Plus the error sink, response deserialization, and the non-string-rejection fallback. |
 | 2. Drag/drop index math | `ui/src/tests/reorder.rs` | `slot_at_offset` and `drag_shift_style`: the last row's bottom edge, exact slot boundaries across a range of list lengths and row heights, scroll offset, and that a preview is a permutation of the slots (parsed back out of the generated CSS, not recomputed). |
 | 3. `app.rs` decisions | `ui/src/tests/app.rs` | `shuffled_start`, `fmt_total_duration`, `playlist_fully_downloaded`. |
-| 4. Components, first render | `ui/src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track reaching the bar. Added in a second pass, so the suite is 39 tests. |
+| 4. Components, first render | `ui/src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track reaching the bar. Added in a second pass, so the suite was 39 tests at that point. |
+| 5. Hook order, statically | `ui/src/tests/hook_order.rs` | That no hook sits below an early return in any component source — the structural cause of **C1**. Mutation-verified: with the defect re-injected into the queue panel, the check fails at the offending line. Suite is 46 tests. |
 
 Components are rendered without a DOM through Yew's `ssr` feature, declared as a
 dev-dependency so the shipped bundle never links it. That was measured rather
@@ -902,17 +903,21 @@ own install and version pinning on three operating systems. **This gap is open,
 and it is recorded as open rather than implied to be closed by the tests above.**
 The harness is deliberately not described as covering it.
 
-**Second renders, and therefore hooks.** The component tests render each
-component **once**, and that is a deliberate boundary rather than an oversight.
-Yew's server renderer drives a component instance a single time and does not run
-effects, so nothing in this harness sees a second render — which is exactly where
-C1 and H4 live. Yew asserts that a render's hook count matches the *previous*
-render's, so C1 panics only when the queue panel goes from an empty queue to a
-non-empty one, and H4 is about what happens when the track prop changes. Both
-need a second pass this mechanism cannot produce; two attempts to reach one
-through SSR are recorded as dead ends in `ui/src/tests/components.rs` so the
-next person does not repeat them. Closing it needs a hook harness or a DOM shim
-driving the real client renderer. Worth doing; not done.
+**Second-render behaviour, and the residue of C1.** The component tests render
+each component **once**, and that is a deliberate boundary. Yew's server renderer
+drives a component instance a single time and does not run effects, so nothing
+here sees a second render — which is where Yew's hook assertion lives, since it
+compares a render against the *previous* one. Two attempts to force a second
+pass through SSR are recorded as dead ends in `ui/src/tests/components.rs`.
+
+**C1's structural cause is now covered** by `ui/src/tests/hook_order.rs`, which
+reads the component sources and fails on any hook below an early return. That is
+a static check, not a renderer test: it catches the shape of the defect by
+inspection and says nothing about what a component *does* on its second render.
+H4 (progress surviving a track change) is squarely in that uncovered
+second-render territory. Closing it properly needs a hook harness or a DOM shim
+driving the real client renderer — the shim also being the first step toward the
+computed-style work below. Worth doing; not done.
 
 **Most call sites' argument shapes.** `src-tauri/tests/ipc_contract.rs` parses
 `api::fire("cmd", json!({...}))` as text and compares key names against the
