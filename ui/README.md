@@ -66,6 +66,16 @@ wsl -e bash -lc 'cd /mnt/c/.../Rift && cargo test -p rift-ui --target wasm32-unk
 | `api.rs` — the IPC boundary | `src/tests/api.rs` | The exact JS argument object each priority command sends: key names, key sets, and value **types**, read back through `serde_wasm_bindgen` so they are observed rather than restated. Plus the error sink, response deserialization, and the non-string-rejection fallback. |
 | `components/reorder.rs` | `src/tests/reorder.rs` | `slot_at_offset` (which slot the pointer is over) and `drag_shift_style` (which way each row slides), including the last row's bottom edge, exact slot boundaries across a range of lengths and row heights, scroll offset, and that a preview is a permutation of the slots. |
 | `app.rs` | `src/tests/app.rs` | `shuffled_start` (a shuffled Play must not start out of range), `fmt_total_duration`, `playlist_fully_downloaded` (the offline pin behind two user-visible behaviours). |
+| Components, first render | `src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all, and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track's title and artist reaching the bar. A panic in a first render is a blank screen, so this is worth having. |
+
+### How components are rendered without a DOM
+
+`yew`'s `ssr` feature drives the real component renderer to a string, so a
+component can be rendered under the same Node runner as everything else. It is
+declared as a **dev-dependency**, so the shipped bundle never links it —
+measured, not assumed: `trunk build` with the line, without it, and with it
+again produced a byte-identical wasm each time, and neither crate the feature
+adds (`html-escape`, `base64ct`) appears in the non-test dependency tree.
 
 Every one of these has been mutation-tested: the fix was reverted and the test
 watched to fail. Two mutations *survived* and are recorded here rather than
@@ -85,15 +95,23 @@ quietly fixed, because they are the honest boundary of the suite:
 
 ## What is *not* covered, and why
 
-**Rendering and computed style.** Nothing here drives the Yew renderer. That
-needs a DOM, and no test in this tree may depend on a `window` — the same rule
-that makes the backend's client tests use a loopback `TcpListener` rather than a
-mock crate. Two consequences worth stating plainly:
+**Second renders, and therefore hook order.** The component tests above render
+each component **once**. Yew's server renderer drives a component instance a
+single time and does not run effects, so nothing here sees a second render —
+and a second render is exactly where the hook-order defect lives: Yew asserts
+that the hook count matches the *previous* render, so `C1` (`use_state` after an
+early return in the queue panel) panics only when the panel goes from an empty
+queue to a non-empty one. Two attempts to reach it through SSR are recorded as
+dead ends in `src/tests/components.rs` so nobody repeats them. Covering `C1`
+needs a different mechanism — a hook harness, or a DOM shim driving the real
+client renderer — and that work is open.
 
-1. `C1` from `docs/code-review-2026-09.md` — `use_state` after an early return in
-   the queue panel — could not have been caught by this harness either. It needs
-   a component mounted and re-rendered, not a function called. The invariant
-   stays documented at the call site and nowhere else.
+**Rendering and computed style.** Two consequences worth stating plainly:
+
+1. `H4` from `docs/code-review-2026-09.md` — PlayerBar's live progress surviving
+   a track change — is a *second-render* question for the same reason as `C1`,
+   and is not covered. What is covered is that the bar renders at all, with and
+   without a track.
 2. The white album-text regression (`buttonface` inherited from a `<button>`)
    remains untestable here. It is a computed-style question: the correct answer
    requires a real browser, `getComputedStyle`, and a layout engine. That is a
