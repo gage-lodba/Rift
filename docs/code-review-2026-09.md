@@ -914,6 +914,17 @@ pass through SSR are recorded as dead ends in `ui/src/tests/components.rs`.
 reads the component sources and fails on any hook below an early return. That is
 a static check, not a renderer test: it catches the shape of the defect by
 inspection and says nothing about what a component *does* on its second render.
+
+Worth recording, because it bounds what that check is for: the *other* half of
+this defect class — a hook written inside a conditional block — is already a
+compile error. `#[function_component]` rejects it with "hooks cannot be called
+at this position", verified by injecting one into `queue.rs` and watching the
+build fail. A rule for it was written and then deleted, because a check that can
+never fire reads as coverage without being any. C1 needed a test precisely
+because it is the half the macro cannot see: the hook sits at the top level of
+the body, so the expansion is well-formed and nothing disagrees until a second
+render happens.
+
 H4 (progress surviving a track change) is squarely in that uncovered
 second-render territory. Closing it properly needs a hook harness or a DOM shim
 driving the real client renderer — the shim also being the first step toward the

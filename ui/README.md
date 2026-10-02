@@ -68,7 +68,6 @@ wsl -e bash -lc 'cd /mnt/c/.../Rift && cargo test -p rift-ui --target wasm32-unk
 | `app.rs` | `src/tests/app.rs` | `shuffled_start` (a shuffled Play must not start out of range), `fmt_total_duration`, `playlist_fully_downloaded` (the offline pin behind two user-visible behaviours). |
 | Components, first render | `src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all, and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track's title and artist reaching the bar. A panic in a first render is a blank screen, so this is worth having. |
 | Hook order, statically | `src/tests/hook_order.rs` | That no hook is called after an early return, in any component source. This is the defect class behind `C1`. A token scanner over the component files, biased toward silence; it reports only what it can prove from brace depth, and its blind spots are listed in the module doc. |
-
 ### How components are rendered without a DOM
 
 `yew`'s `ssr` feature drives the real component renderer to a string, so a
@@ -108,6 +107,14 @@ This is where `hook_order.rs` sits, and the distinction matters: it covers the
 which is decidable without a renderer. It does not cover second-render
 *behaviour*, and it is not a renderer-level test. Closing that properly needs a
 hook harness or a DOM shim driving the real client renderer — see below.
+
+Note which half of the defect class it covers, because measuring showed the
+other half is already a compile error. A hook written *inside* a conditional
+block is rejected outright by `#[function_component]` ("hooks cannot be called
+at this position"), so no test is needed for it — a rule was written and then
+deleted for exactly that reason. `C1` is the half the macro cannot see: the hook
+sits at the top level of the body, so the expansion is well-formed and nothing
+disagrees until a second render happens.
 
 **Rendering and computed style.** Two consequences worth stating plainly:
 

@@ -18,16 +18,37 @@
 //!
 //! # What it does and does not catch
 //!
-//! Catches: any hook call in the component body *after* an early return that
-//! is itself in the body. `C1`'s historical shape is the concrete case — the
-//! early return for an empty queue, with hook work introduced below it later.
+//! Catches: any hook call in the component body *after* an early return that is
+//! itself in the body. `C1`'s historical shape is the concrete case — the early
+//! return for an empty queue, with hook work introduced below it later.
 //!
-//! Does not catch: a hook inside a nested block (`if { … }`) lower down, and a
-//! hook after a `match` arm that always returns. It is a scanner over tokens,
-//! not a parser, and it is deliberately conservative: it reports only what it
-//! can prove from brace depth. A false positive here breaks the build for
-//! innocent code, which is how a check like this gets deleted by the next
-//! person, so the scanner is biased toward silence.
+//! Does not catch: a hook after a `match` arm that always returns. It is a
+//! scanner over tokens, not a parser, and it is deliberately conservative: it
+//! reports only what it can prove from brace depth. A false positive here
+//! breaks the build for innocent code, which is how a check like this gets
+//! deleted by the next person, so the scanner is biased toward silence.
+//!
+//! # The other half of this defect class is already a compile error
+//!
+//! A hook written *inside* a conditional, rather than after an early return:
+//!
+//! ```ignore
+//! if props.items.is_empty() {
+//!     return html! {};
+//! } else {
+//!     let x = use_state(|| 0);   // error: hooks cannot be called at this position
+//! }
+//! ```
+//!
+//! A rule for this was written and then deleted, because measuring showed it
+//! could never fire: `#[function_component]` rejects it outright — *"hooks
+//! cannot be called at this position"* — so the crate does not build, let
+//! alone ship. Verified by injecting exactly that into `queue.rs` and watching
+//! the compiler refuse it. Keeping a check for it would have been dead code
+//! that read as coverage, which is the failure mode this whole harness exists
+//! to avoid. `C1` needed a test precisely because it is the half the macro
+//! *cannot* see: the hook is at the top level of the body, so the expansion is
+//! well-formed, and nothing but the second render disagrees.
 //!
 //! This is **not** a substitute for a real second-render test. It closes the
 //! specific structural hole; the renderer-level coverage is still open.
