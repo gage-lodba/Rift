@@ -109,6 +109,29 @@ jobs:
         with:
           tool: wasm-bindgen-cli@0.2.128
 
+      # The DOM the frontend's renderer tests mount into. A Node-side dependency
+      # of the *test harness only* — `trunk build` never runs Node, and nothing
+      # here reaches the wasm or the shipped bundle (ui/package.json says so).
+      #
+      # `npm ci` rather than `npm install` so the lockfile decides, which is the
+      # same reason Cargo.lock is committed and `--locked` is used everywhere
+      # else in this file. Skipped on Windows with the test step below, since
+      # the suite cannot run there at all.
+      - name: Install the frontend test harness's DOM
+        if: runner.os != 'Windows'
+        working-directory: ui
+        run: npm ci
+
+      # A one-second check that the shim can do the one thing the renderer tests
+      # need, before anything compiles. Its two failure modes are a jsdom that
+      # cannot load and a shim that loads without installing the globals — and
+      # both otherwise surface as a `web-sys` panic that names a missing global
+      # rather than this file.
+      - name: Check the DOM shim
+        if: runner.os != 'Windows'
+        working-directory: ui
+        run: node scripts/check-dom-shim.cjs
+
       # Build the WASM frontend. This also populates ../dist, which the Tauri
       # backend embeds via generate_context! when it compiles below.
       - name: Build frontend

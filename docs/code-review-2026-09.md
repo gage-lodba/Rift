@@ -44,14 +44,17 @@
 >
 > **Added after this review closed — the frontend harness.** `rift-ui` was the
 > one crate with no tests, so every UI change was unverifiable except by running
-> the app. There is now a `wasm-bindgen-test` harness (`ui/src/tests/`, 49 tests,
+> the app. There is now a `wasm-bindgen-test` harness (`ui/src/tests/`, 53 tests,
 > wired into CI next to the frontend clippy pass) covering the IPC boundary's
-> argument shapes, the reorder index math, and `App`'s pure decisions about
-> shuffling, durations, and the offline pin. **The computed-style gap is still
-> open and is now explicit rather than implied**: the white album text came from
-> a `<button>` inheriting `buttonface`, which needs a real layout engine and
-> `getComputedStyle`, and that is a different purchase from this harness — see
-> "What the frontend harness does not cover" at the end of this document.
+> argument shapes, the reorder index math, `App`'s pure decisions about
+> shuffling, durations, and the offline pin, and — since the DOM shim landed —
+> **second renders**, which is how `C1`'s behaviour and `H4`'s re-seed are
+> covered. **The computed-style gap is still open and is now explicit rather
+> than implied**: the white album text came from a `<button>` inheriting
+> `buttonface`, which needs a real layout engine and `getComputedStyle`, and that
+> is a different purchase from this harness — the DOM shim is the step toward it,
+> not the thing itself. See "What the frontend harness does and does not cover"
+> at the end of this document.
 
 Scope: every tracked source file (`src-tauri/`, `crates/ytmusic/`, `types/`, `ui/`,
 `docs/`, `.github/`, manifests). HEAD `a4b8d30` plus the uncommitted player diff.
@@ -881,9 +884,19 @@ starts from the code rather than from scratch.
 That is how the `play_track` argument-shape breakage reached a runtime failure
 with both sides compiling, and how the white album text reached a user.
 
-`ui/src/tests/` is now a `wasm-bindgen-test` harness, 49 tests, run under Node by
+`ui/src/tests/` is now a `wasm-bindgen-test` harness, 53 tests, run under Node by
 `wasm-bindgen-test-runner` and wired into CI beside the frontend clippy pass.
 `ui/README.md` is the operational reference; this is the record of what it buys.
+
+The harness has **two layers**, and which one a test sits in decides what it can
+see:
+
+- **No DOM** — the Tauri bridge is replaced and everything above it runs for
+  real. Covers the IPC boundary's argument shapes, the reorder math, `App`'s
+  pure decisions, and *first* renders through Yew's server renderer.
+- **A real DOM** (`jsdom`, installed into Node by `ui/tests/dom-shim.cjs`) — the
+  real Yew **client** renderer. This is the only layer that can see a second
+  render, an effect, or a callback. It is what `C1` and `H4` needed.
 
 ### Covered
 
@@ -892,8 +905,9 @@ with both sides compiling, and how the white album text reached a user.
 | 1. The IPC boundary | `ui/src/tests/api.rs` | The JS argument object each command sends — key names, key sets, and **value types** — read back out of `serde_wasm_bindgen`, so it is observed rather than restated. Plus the error sink, response deserialization, and the non-string-rejection fallback. |
 | 2. Drag/drop index math | `ui/src/tests/reorder.rs` | `slot_at_offset` and `drag_shift_style`: the last row's bottom edge, exact slot boundaries across a range of list lengths and row heights, scroll offset, and that a preview is a permutation of the slots (parsed back out of the generated CSS, not recomputed). |
 | 3. `app.rs` decisions | `ui/src/tests/app.rs` | `shuffled_start`, `fmt_total_duration`, `playlist_fully_downloaded`. |
-| 4. Components, first render | `ui/src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track reaching the bar. Added in a second pass, so the suite was 39 tests at that point. |
-| 5. Hook order, statically | `ui/src/tests/hook_order.rs` | That no hook sits below an early return in any component source — the structural cause of **C1**. Mutation-verified: with the defect re-injected into the queue panel, the check fails at the offending line. Suite is 49 tests. |
+| 4. Components, first render | `ui/src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track reaching the bar. |
+| 5. Hook order, statically | `ui/src/tests/hook_order.rs` | That no hook sits below an early return in any component source — the structural cause of **C1**. Mutation-verified: with C1's defect re-injected into the queue panel, the check fails at the offending line *and* the render test below aborts on Yew's own assertion. |
+| 6. Second renders | `ui/src/tests/render.rs` | The real client renderer in a real DOM: the harness's own proof that it runs effects and re-renders; the queue panel surviving **empty-then-populated**, the transition C1 broke; and `PlayerBar` re-seeding from the app's props across a **track change**, driven through the real PROGRESS subscription rather than a callback called by hand. |
 
 Components are rendered without a DOM through Yew's `ssr` feature, declared as a
 dev-dependency so the shipped bundle never links it. That was measured rather
@@ -907,7 +921,7 @@ error routing, the real call-site functions — runs for real. Nothing depends o
 a running app, a network, or a `window`.
 
 Every test was mutation-tested: the fix was reverted and the test watched to
-fail. Two mutations **survived**, and they are the honest boundary:
+fail. Three mutations **survived**, and they are the honest boundary:
 
 - **Dropping `.floor()` or `.max(0.0)` from `slot_at_offset` changes nothing.**
   `as usize` on an `f64` truncates toward zero and saturates at zero, so both are
@@ -923,58 +937,56 @@ fail. Two mutations **survived**, and they are the honest boundary:
   `left: ["radio", "track"], right: ["track"]`. The lesson generalises: a test
   that restates a payload proves the transport works and nothing about whether
   the app uses it.
+- **Removing the track key from `PlayerBar`'s re-seed effect fails nothing in
+  `render.rs`.** Measured by building it both ways, and it is the sharpest
+  boundary the harness has. The stale `live` values are masked on every render by
+  `track_changed`, which stays `true` forever when the effect never re-runs — so
+  the bar falls back to the new track's own duration and a zeroed position,
+  which is exactly what it shows for the one render *before* the effect fires.
+  Defect and fix therefore differ for a single render, and this harness cannot
+  sample one: Yew renders a component and runs its effects inside the same
+  scheduler pass, which one microtask drains in full (measured hop by hop). See
+  the open gap below.
 
 ### Not covered
 
+**A single render, and with it the last of `H4`.** `flush()` runs the scheduler
+to quiescence, so "rendered but effects not yet run" is not an observable state
+here. That window is where the surviving `H4` mutation above lives. Seeing it
+needs a real frame boundary — the same purchase as the computed-style work
+below, not a separate one.
+
+**Nothing can assert that a panic happened.** On `wasm32-unknown-unknown` there
+is no unwinding: `panic = "abort"` is the only strategy, and
+`wasm_bindgen::__rt::maybe_catch_unwind` is the identity function without
+`panic = "unwind"` (`wasm-bindgen-0.2.128/src/rt/mod.rs:1090`). A panic raised by
+a render happens on a microtask, so the process dies with
+`RuntimeError: unreachable` and reports no results at all. The harness installs a
+panic hook that prints the message before the abort, which is a diagnostic rather
+than a detector. This is why the C1 detector — re-inject the defect, watch Yew's
+assertion fire — is a **documented manual procedure** in `hook_order.rs`, with
+its measured output, instead of a test that could only ever kill the run.
+
 **Computed style — the class of bug that already shipped.** The white album text
-came from a `<button>` inheriting `buttonface`, and nothing here can see it. It
-needs a real layout engine, a `getComputedStyle` call, and a browser; that is a
-separate harness (chromedriver or `wasm-bindgen-test`'s in-browser mode) with its
-own install and version pinning on three operating systems. **This gap is open,
-and it is recorded as open rather than implied to be closed by the tests above.**
-The harness is deliberately not described as covering it.
+came from a `<button>` inheriting `buttonface`, and nothing here can see it.
+jsdom has no layout engine, so `getComputedStyle` answers from inline and
+stylesheet declarations only and an *inherited* value is not observable. It needs
+a real browser, `getComputedStyle`, and a layout engine: a separate harness
+(chromedriver or `wasm-bindgen-test`'s in-browser mode) with its own install and
+version pinning on three operating systems. **This gap is open, and the DOM shim
+does not close it** — it is the stepping stone toward it, which is why it was
+worth taking, but it is not the thing itself. The harness is deliberately not
+described as covering it.
 
-**Second-render behaviour, and the residue of C1.** The component tests render
-each component **once**, and that is a deliberate boundary. Yew's server renderer
-drives a component instance a single time and does not run effects, so nothing
-here sees a second render — which is where Yew's hook assertion lives, since it
-compares a render against the *previous* one. Two attempts to force a second
-pass through SSR are recorded as dead ends in `ui/src/tests/components.rs`.
+**Which callback a control is wired to.** The DOM makes this reachable —
+`dispatch_event` works under the shim, and `scripts/check-dom-shim.cjs` proves it
+— but no test drives a click. Recorded as open.
 
-**C1's structural cause is now covered** by `ui/src/tests/hook_order.rs`, which
-reads the component sources and fails on any hook below an early return. That is
-a static check, not a renderer test: it catches the shape of the defect by
-inspection and says nothing about what a component *does* on its second render.
-
-Worth recording, because it bounds what that check is for: the *other* half of
-this defect class — a hook written inside a conditional block — is already a
-compile error. `#[function_component]` rejects it with "hooks cannot be called
-at this position", verified by injecting one into `queue.rs` and watching the
-build fail. A rule for it was written and then deleted, because a check that can
-never fire reads as coverage without being any. C1 needed a test precisely
-because it is the half the macro cannot see: the hook sits at the top level of
-the body, so the expansion is well-formed and nothing disagrees until a second
-render happens.
-
-H4 (progress surviving a track change) is squarely in that uncovered
-second-render territory — **but its logic half is now covered.** The fix added
-the track's identity to the re-seed effect's dependency list, which only works
-if two different tracks produce two different keys. `track_key` is tested for
-exactly that, mutation-verified: making it return a constant fails with "two
-different tracks produced the same key, so the re-seed effect would never re-run
-on a track change (H4)". So the *property the fix rests on* is guarded; the
-effect actually re-running, and the bar actually re-seeding, still need a second
-render. Closing that properly needs a hook harness or a DOM shim driving the
-real client renderer — the shim also being the first step toward the
-computed-style work below. Worth doing; not done.
-
-**Most call sites' argument shapes.** `src-tauri/tests/ipc_contract.rs` parses
-`api::fire("cmd", json!({...}))` as text and compares key names against the
-backend's parameters. It is textual: it cannot see value types, and it does not
-see through a helper that builds its payload elsewhere — `fire_play_tracks` was
-invisible to it before this work. The two `play_*` commands are now covered end
-to end from the frontend; the other 53 IPC call sites still have the text check
-and nothing more.
+**Second-render behaviour, beyond the two components above.** `components.rs`
+still renders each component once through SSR, which drives an instance a single
+time and never runs an effect; two attempts to force a second pass that way are
+recorded as dead ends in that file. `render.rs` reaches second renders, but only
+for the queue panel and the player bar, and only at `flush()` granularity.
 
 ### Two things worth knowing before trusting a green run
 
@@ -999,3 +1011,42 @@ with. The fix was to stop racing an executor: `spawn` queues the future and
 `settle()` drains it on the test's own stack, which also made the async tests
 synchronous and therefore immune to interleaving. The same shape as the L17
 harness lesson — when a harness misbehaves, suspect the harness first.
+
+### The DOM shim: what it cost, and the three traps in it
+
+This was a decision that needed a call rather than a discovery: a renderer-level
+mechanism is a dependency, and the standing rule is to ask before adding one. The
+options were mirroring Yew's `assemble` macro (a Rust dev-dependency, no DOM,
+`C1`'s behaviour only) or a DOM shim driving the real CSR renderer. **The shim
+was chosen**, because it is the only one of the two that also moves toward the
+computed-style class — the one bug class that actually reached a user.
+
+What it cost: **one Node-side dev-dependency**, `jsdom@26.1.0`, pinned in
+`ui/package.json` and `ui/package-lock.json`, plus an `npm install` step in CI's
+frontend job and an `npm ci`-able lockfile to cache. Nothing in the Cargo
+dependency tree, and nothing in the shipped bundle: `trunk build` never runs
+Node. The version was chosen for a `node >= 18` engine floor, so the CI runners'
+preinstalled Node cannot fall below it — jsdom 30 requires Node 22+, which would
+have made the job depend on the runner image's Node.
+
+Three traps, each of which cost a run to find and each of which is now recorded
+at the line that has to stay that way:
+
+- **The shim must define `pre#output`.** `wasm-bindgen-test` picks its output
+  formatter by asking whether the global object has a `self` property. A DOM
+  shim has one, so the *browser* formatter runs and writes every result line into
+  `document.getElementById("output")`. Missing it, the run dies on
+  `Cannot read properties of null` before a single test executes.
+- **The shim must not shadow `performance`, `crypto` or `fetch`.** jsdom's own
+  implementations delegate to the global one, so mirroring jsdom's wrapper over
+  Node's built-in makes it call itself: `Maximum call stack size exceeded`,
+  before any test executes.
+- **`self` must resolve to `undefined`.** Deleting it does not work — jsdom's
+  `window` still answers a structural `self` lookup, so the detection reports
+  Browser anyway and the run then produces *no output at all*, which in CI is a
+  silent hole rather than a red build. The shim keeps the browser formatter and
+  mirrors its writes to stdout instead.
+
+The first two are the kind of failure that reads as "the harness is broken" and
+sends you looking at the tests; both are now checked in about a second by
+`node scripts/check-dom-shim.cjs`, without compiling anything.
