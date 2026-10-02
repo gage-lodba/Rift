@@ -52,6 +52,53 @@
 //!
 //! This is **not** a substitute for a real second-render test. It closes the
 //! specific structural hole; the renderer-level coverage is still open.
+//!
+//! # The render harness catches this defect too, and it is checked by hand
+//!
+//! `render.rs` mounts real components through Yew's client renderer, so it can
+//! reach the second render this file reasons about — and with the defect
+//! re-injected into `queue.rs` it **does** catch it. That check is not a test in
+//! the suite, because it cannot be one: Yew's assertion is a panic, the render
+//! happens on a microtask, and `wasm32-unknown-unknown` has no unwinding to
+//! catch it with (`wasm_bindgen::__rt::maybe_catch_unwind` is the identity
+//! function without `panic = "unwind"`). The panic therefore aborts the whole
+//! test binary, which means a test asserting it could only ever kill the run
+//! instead of reporting. The procedure, so it can be repeated rather than
+//! believed:
+//!
+//! 1. Add a hook below `queue_panel`'s empty-queue early return in
+//!    `components/queue.rs` — one line is enough:
+//!    `let _x = use_state(|| false);`
+//! 2. Run `cargo test -p rift-ui --target wasm32-unknown-unknown`.
+//!
+//! Measured, in two parts. This file's
+//! [`no_hook_is_called_after_an_early_return`] fails with the line and the text
+//! of the offending hook:
+//!
+//! ```text
+//! test tests::hook_order::no_hook_is_called_after_an_early_return ... FAIL
+//! a hook is called after an early return, so it is skipped on that path and
+//! Yew's hook-order assertion will fire on a later render:
+//!   components/queue.rs:51: let _collapsed_below_the_early_return = use_state(|| false);
+//! ```
+//!
+//! and `render.rs`'s
+//! `the_repair_is_exercised_on_the_real_component` — which mounts the queue empty
+//! and then populates it, the only path C1 was ever reachable on — aborts the run
+//! from Yew's own assertion:
+//!
+//! ```text
+//! panicked at yew-0.21.0/src/functional/mod.rs:235:49:
+//! assertion `left == right` failed: Hooks are called conditionally.
+//!   left: 0
+//!  right: 1
+//! RuntimeError: unreachable
+//! ```
+//!
+//! Two independent mechanisms, then: a static check that reports a line number,
+//! and a real render that dies on the assertion the defect actually produces.
+//! The second is the one that proves the *mechanism*; the first is the one that
+//! can run in the suite. Reverting the injection makes both pass again.
 
 use wasm_bindgen_test::wasm_bindgen_test;
 
