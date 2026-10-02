@@ -21,7 +21,7 @@ pub(crate) fn track_key(track: &Option<Track>) -> Option<String> {
     track.as_ref().map(|t| t.id.clone())
 }
 
-#[derive(Properties, PartialEq)]
+#[derive(Properties, PartialEq, Clone)]
 pub struct PlayerBarProps {
     pub track: Option<Track>,
     pub state: PlaybackState,

@@ -14,7 +14,7 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 serde-wasm-bindgen = "0.6"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console", "HtmlInputElement", "HtmlSelectElement", "Navigator", "DragEvent", "DataTransfer", "Element", "HtmlElement", "HtmlImageElement", "DomRect", "Window", "Storage"] }
+web-sys = { version = "0.3", features = ["console", "HtmlInputElement", "HtmlSelectElement", "Navigator", "DragEvent", "DataTransfer", "Element", "HtmlElement", "HtmlImageElement", "DomRect", "Window", "Storage", "Document", "Node", "NodeList"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dev-dependencies]
@@ -42,4 +42,8 @@ wasm-bindgen-test = "0.3"
 # Note the same `version = "0.21"` requirement as the dependency above is what
 # lets the features unify. Raising one without the other would silently split
 # Yew into two crates and the renderer would stop being the one the app uses.
-yew = { version = "0.21", features = ["ssr"] }
+#
+# `csr` is already on through the main dependency, so this would unify anyway;
+# it is listed so the feature the *tests* need is stated where the tests'
+# dependencies are, rather than only implied by the line above.
+yew = { version = "0.21", features = ["ssr", "csr"] }
