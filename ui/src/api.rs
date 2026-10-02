@@ -9,6 +9,25 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use yew::Callback;
 
+// The bridge itself is the one part of this module the test harness does not
+// run: it needs a live `window.__TAURI__`, and no test may depend on a running
+// app. Everything above it — the JSON-compatible serialization, the error
+// stringification, `fire`'s error routing — is exercised for real; see
+// `crate::tests::harness`, which replaces these two imports with a recording
+// stub under `cfg(test)`.
+//
+// What that costs, stated rather than glossed: under `cfg(test)` these two
+// declarations are not compiled, so nothing checks the stub against them. The
+// stub must nonetheless be callable from `invoke` and `listen_event` below —
+// a change to *those* call sites breaks the build — but a change to these two
+// signatures alone would not. If you edit either signature, edit
+// `tests/harness.rs` in the same commit.
+//
+// The stub is hand-written rather than a mock crate's, mirroring how the
+// backend's client tests use a loopback `TcpListener` instead of a mocking
+// library: the seam is at the transport, and there is no third party to agree
+// with.
+#[cfg(not(test))]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke, catch)]
@@ -17,6 +36,12 @@ extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = listen)]
     fn tauri_listen(event: &str, handler: &Closure<dyn FnMut(JsValue)>) -> js_sys::Promise;
 }
+
+#[cfg(test)]
+pub(crate) use crate::tests::harness::{spawn, tauri_invoke, tauri_listen};
+
+#[cfg(not(test))]
+use wasm_bindgen_futures::spawn_local as spawn;
 
 fn js_err(e: JsValue) -> String {
     e.as_string().unwrap_or_else(|| format!("{e:?}"))
@@ -40,7 +65,7 @@ pub async fn invoke<R: DeserializeOwned>(cmd: &str, args: &impl Serialize) -> Re
 /// `create_playlist` with a blank name silently closed the dialog. A rejected
 /// command now surfaces through the same toast the backend's own errors use.
 pub fn fire(cmd: &'static str, args: impl Serialize + 'static) {
-    wasm_bindgen_futures::spawn_local(async move {
+    spawn(async move {
         if let Err(e) = invoke::<serde_json::Value>(cmd, &args).await {
             let msg = format!("{cmd}: {e}");
             web_sys::console::error_1(&msg.clone().into());
@@ -58,6 +83,18 @@ thread_local! {
 /// Install the sink that [`fire`] reports failures to.
 pub fn set_error_sink(sink: Callback<String>) {
     ERROR_SINK.with(|s| *s.borrow_mut() = Some(sink));
+}
+
+/// Remove the installed sink.
+///
+/// Production installs one for the life of the page and never removes it. The
+/// test harness clears it around each test, because the thread-local outlives
+/// any single test (wasm is single-threaded, so "thread-local" is process-wide
+/// here) and a sink left installed would let one test's toast assertion see
+/// another test's message.
+#[cfg(test)]
+pub(crate) fn unset_error_sink() {
+    ERROR_SINK.with(|s| *s.borrow_mut() = None);
 }
 
 /// Report a frontend-side failure to the installed sink, if any.

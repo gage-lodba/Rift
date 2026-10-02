@@ -11,7 +11,9 @@ mod icons;
 mod menu;
 mod player_bar;
 mod queue;
-mod reorder;
+// `pub(crate)` so the test tree can reach `Reorder`'s pure index math; the
+// module is not re-exported below, so nothing outside the crate sees it.
+pub(crate) mod reorder;
 mod settings;
 mod sidebar;
 mod titlebar;

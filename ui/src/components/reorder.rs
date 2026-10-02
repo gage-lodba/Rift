@@ -55,6 +55,26 @@ fn allow_move_drop(e: &DragEvent) {
     }
 }
 
+/// Which slot a vertical offset inside the list's content falls in.
+///
+/// Split out of [`hover_slot`] so the arithmetic — the part where an off-by-one
+/// is invisible in a diff and only shows up as the wrong row moving — can be
+/// tested without a DOM. `y` is the pointer's offset from the top of the list's
+/// *content*, i.e. already including `scroll_top`.
+///
+/// `slot_h` must be positive; the caller establishes that before calling.
+pub(crate) fn slot_at_offset(y: f64, slot_h: f64, len: usize) -> usize {
+    debug_assert!(len > 0, "slot_at_offset needs a non-empty list");
+    // `max(0.0)` so "above the list is slot 0" is stated rather than inherited:
+    // `as usize` on a negative float happens to saturate to 0, so dropping the
+    // clamp would leave the behaviour identical and the intent implicit.
+    let slot = (y / slot_h).max(0.0) as usize;
+    // `min` rather than leaving the slot to the caller: a drop at or past the
+    // last row's bottom edge computes `len`, and an index one past the end is
+    // how a drag silently moves the wrong track.
+    slot.min(len - 1)
+}
+
 /// Which slot a reorder drag is hovering, from the pointer's Y offset inside
 /// the list element (uniform slot height, DOM order). Geometry-based because
 /// the live-preview transforms slide rows around under the pointer — hit-tests
@@ -75,7 +95,7 @@ fn hover_slot(list: &NodeRef, e: &DragEvent, len: usize, margin: f64) -> Option<
     }
     let y =
         f64::from(e.client_y()) - el.get_bounding_client_rect().top() + f64::from(el.scroll_top());
-    Some(((y / slot_h).floor().max(0.0) as usize).min(len - 1))
+    Some(slot_at_offset(y, slot_h, len))
 }
 
 /// Live reorder preview: inline transform for row `i` while row `from` is
@@ -83,7 +103,7 @@ fn hover_slot(list: &NodeRef, e: &DragEvent, len: usize, margin: f64) -> Option<
 /// and the rows in between slide one slot the other way, so the list shows the
 /// exact post-drop order. `margin` is the vertical gap between rows in px
 /// (translateY percentages only cover the row's own height).
-fn drag_shift_style(
+pub(crate) fn drag_shift_style(
     from: Option<usize>,
     over: Option<usize>,
     i: usize,
