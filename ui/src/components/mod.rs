@@ -32,6 +32,14 @@ pub use titlebar::Titlebar;
 pub use track_list::{TrackList, TrackListCtx};
 pub use update_banner::UpdateBanner;
 
+// The props types the component tests construct. `cfg(test)` because the
+// modules above are private, so these are unreachable from outside the crate
+// and would be dead re-exports in a real build.
+#[cfg(test)]
+pub(crate) use player_bar::PlayerBarProps;
+#[cfg(test)]
+pub(crate) use queue::QueuePanelProps;
+
 /// The main view routed to by the sidebar and search.
 #[derive(Clone, PartialEq)]
 pub enum View {
