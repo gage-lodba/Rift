@@ -260,6 +260,7 @@ mod tests {
     const ALWAYS_429: &str = "__always_429__";
     const ALWAYS_403: &str = "__always_403__";
 
+    #[derive(Clone)]
     struct Request {
         method: String,
         path: String,
@@ -330,6 +331,12 @@ mod tests {
 
     /// Bind a server, move its state into the accept thread, and hand back the
     /// handle tests use to inspect what was sent.
+    ///
+    /// Each connection is handled on its own thread so a panic in a route cannot
+    /// take the accept loop down with it. That is not defensive padding: this
+    /// server is shared by every test in the binary, so a died accept loop turns
+    /// one handler bug into `ConnectionRefused` in unrelated tests, which is a
+    /// far more confusing failure than the original panic.
     fn spawn(routes: HashMap<String, Handler>) -> FakeYt {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -339,18 +346,38 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let _ = serve(stream, &mut log.lock().unwrap(), &routes);
+                let (log, routes) = (log.clone(), routes.clone());
+                let _ = std::thread::spawn(move || serve(stream, &log, &routes));
             }
         });
 
         FakeYt { addr, requests }
     }
 
+    /// Read the requests seen so far, surviving a poisoned log.
+    ///
+    /// A route that panics while a test holds nothing still leaves the log
+    /// poisoned if the panic happened during a `lock()`. Recovering the guard
+    /// keeps that from turning into a second, misleading failure.
+    fn logged(requests: &Mutex<Vec<Request>>) -> Vec<Request> {
+        requests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|r| Request {
+                method: r.method.clone(),
+                path: r.path.clone(),
+                headers: r.headers.clone(),
+                body: r.body.clone(),
+            })
+            .collect()
+    }
+
     /// Read one request, write one response. Always answers, so a test cannot
     /// hang waiting on a connection that was never replied to.
     fn serve(
         mut stream: TcpStream,
-        log: &mut Vec<Request>,
+        log: &Mutex<Vec<Request>>,
         routes: &HashMap<String, Handler>,
     ) -> std::io::Result<()> {
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -390,6 +417,14 @@ mod tests {
         };
         let route = request.path.split('?').next().unwrap_or("").to_owned();
 
+        // Log and release before running the handler: this server is shared by
+        // every test in the binary, so a handler that panics — or a future one
+        // that reaches back into the log — must not be able to poison the lock
+        // for everyone else.
+        log.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(request.clone());
+
         let response = match routes.get(&route) {
             Some(handler) => handler(&request),
             None => Response {
@@ -399,7 +434,6 @@ mod tests {
                     .to_string(),
             },
         };
-        log.push(request);
 
         let reason = match response.status {
             200 => "OK",
@@ -618,13 +652,25 @@ mod tests {
         identity::seed_pool_for_test(id);
     }
 
-    /// Serialises tests that depend on *which* visitor id goes out.
+    /// Serialises the tests in this module. Held by **every** test here.
     ///
-    /// The visitor pool is process-global, so a test that seeds it cannot run
-    /// concurrently with a test that asserts on the sent id. Cargo runs tests in
-    /// parallel threads by default, so this is not hypothetical. Blocks rather
-    /// than fails: these tests are independent, they just each need the shared
-    /// state to themselves for a moment.
+    /// Two pieces of process-global state are shared: the request log, and the
+    /// visitor pool that decides which id goes out. A test that seeds the pool
+    /// therefore cannot run alongside any other test that makes a request —
+    /// including one that does not care about the visitor id, because its lookup
+    /// would consume the seeded value. That is exactly how
+    /// `the_request_carries_the_context_object_and_innertube_headers` first
+    /// became an intermittent failure: it seeded an id, and a concurrent test's
+    /// request took it, so the assertion saw `HOME_VISITOR` instead.
+    ///
+    /// So the rule is blunt on purpose — take the gate, and hold it for the whole
+    /// test. These tests are milliseconds each and the client is I/O-bound, so
+    /// serialising them costs nothing that matters, and it removes a class of
+    /// failure that is otherwise very hard to read. Blocks rather than fails:
+    /// they are independent, they just each need the shared state to themselves.
+    ///
+    /// Cargo runs test functions on parallel threads by default, so this is not
+    /// hypothetical.
     async fn visitor_gate() -> tokio::sync::MutexGuard<'static, ()> {
         static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         GATE.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -658,17 +704,18 @@ mod tests {
         let fake = server();
         let c = client();
 
+        // A query unique to this call, so the assertion below is about *these*
+        // requests and stays correct if the test is re-run in the same process
+        // (cargo's `--rerun-failed`, or a retry harness).
+        let query = format!("rotation-{}", tx());
         seed_visitor(REJECTED_VISITOR);
         // No un-seeding afterwards: the client bans this id on the 403 and
         // fetches a fresh one, which is the behaviour under test.
-        let outcome = c.search_tracks("rotation").await;
+        let outcome = c.search_tracks(&query).await;
 
-        let sent: Vec<String> = fake
-            .requests
-            .lock()
-            .unwrap()
+        let sent: Vec<String> = logged(&fake.requests)
             .iter()
-            .filter(|r| r.endpoint() == "search" && r.query() == "rotation")
+            .filter(|r| r.endpoint() == "search" && r.query() == query)
             .map(|r| r.header("x-goog-eom-visitor-id").to_owned())
             .collect();
         // Asserted as one value so a failure reports the whole sequence.
@@ -695,14 +742,17 @@ mod tests {
         let c = client();
         seed_visitor("visitor-for-context-test");
 
-        c.search_tracks("blinding lights").await.expect("search");
+        // A query unique to this test, so its request can be picked out of the
+        // shared log. Taking "the latest search" instead is how this test first
+        // failed: another test's request landed after it.
+        const QUERY: &str = "blinding lights";
+        c.search_tracks(QUERY).await.expect("search");
 
-        let reqs = fake.requests.lock().unwrap();
+        let reqs = logged(&fake.requests);
         let search = reqs
             .iter()
-            .rev()
-            .find(|r| r.endpoint() == "search")
-            .expect("a search request");
+            .find(|r| r.endpoint() == "search" && r.query() == QUERY)
+            .expect("a search request for this test's query");
 
         assert_eq!(search.method, "POST");
         assert_eq!(search.header("content-type"), "application/json");
@@ -730,7 +780,7 @@ mod tests {
         assert_eq!(client_ctx["clientName"], context::CLIENT_NAME);
         assert_eq!(client_ctx["visitorData"], "visitor-for-context-test");
         assert_eq!(client_ctx["hl"], "en");
-        assert_eq!(search.body["query"], "blinding lights");
+        assert_eq!(search.body["query"], QUERY);
         assert!(
             search.body["params"].is_string(),
             "a filtered search must send params"
@@ -739,6 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_a_403_is_retried() {
+        let _gate = visitor_gate().await;
         let fake = server();
         let c = client();
 
@@ -751,10 +802,7 @@ mod tests {
             other => panic!("expected Error::Api, got {other:?}"),
         }
 
-        let attempts = fake
-            .requests
-            .lock()
-            .unwrap()
+        let attempts = logged(&fake.requests)
             .iter()
             .filter(|r| r.endpoint() == "search" && r.query() == ALWAYS_429)
             .count();
@@ -763,6 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_403_on_every_attempt_reports_forbidden() {
+        let _gate = visitor_gate().await;
         let fake = server();
         let c = client();
 
@@ -781,10 +830,7 @@ mod tests {
             other => panic!("expected Error::Api, got {other:?}"),
         }
 
-        let attempts = fake
-            .requests
-            .lock()
-            .unwrap()
+        let attempts = logged(&fake.requests)
             .iter()
             .filter(|r| r.endpoint() == "search" && r.query() == ALWAYS_403)
             .count();
@@ -793,6 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn playlist_pagination_follows_continuations_up_to_the_limit() {
+        let _gate = visitor_gate().await;
         let c = client();
         let tx = tx();
         let playlist = c
@@ -815,6 +862,7 @@ mod tests {
 
     #[tokio::test]
     async fn playlist_pagination_truncates_at_the_limit() {
+        let _gate = visitor_gate().await;
         let c = client();
         let tx = tx();
         let playlist = c
@@ -835,6 +883,7 @@ mod tests {
 
     #[tokio::test]
     async fn playlist_pagination_stops_when_a_page_yields_no_tracks() {
+        let _gate = visitor_gate().await;
         let c = client();
         let playlist = c.playlist("PLtest_degenerate", 50).await.expect("playlist");
         assert!(
@@ -846,6 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn album_and_artist_pages_route_to_browse_and_parse() {
+        let _gate = visitor_gate().await;
         let c = client();
 
         let album = c.album("MPREb_test").await.expect("album");

@@ -11,9 +11,12 @@ repository = "https://github.com/gage-lodba/Rift"
 # The real floor of the resolved graph, not a guess: the highest `rust-version`
 # declared by anything Cargo.lock pins is 1.88 (`time`, `plist`, `darling`,
 # `icu_*`), with `rodio` 1.87 and `reqwest` 1.85 just behind. Verified by
-# building, testing, and linting the workspace on 1.88.0 — see the MSRV job in
-# .github/workflows/ci.yml, which keeps that true rather than trusting this
-# comment.
+# building, testing, and linting the workspace on 1.88.0.
+#
+# Keeping it true is the point of two other things, not this comment: every CI
+# job builds at 1.88.0 rather than at `stable`, so the floor is exercised on each
+# run, and `.github/scripts/check-toolchain-consistency.sh` fails if this value,
+# the rust-toolchain.toml channel, and the workflow pins ever disagree.
 #
 # Declaring it also makes clippy refuse to suggest APIs newer than the floor, so
 # a lint cannot "fix" something into breaking the oldest toolchain we support.
