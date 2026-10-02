@@ -35,7 +35,7 @@ enum SearchTab {
 }
 
 /// Human-readable total duration for a collection subtitle, e.g. "1 hr 23 min".
-fn fmt_total_duration(secs: u32) -> String {
+pub(crate) fn fmt_total_duration(secs: u32) -> String {
     let (h, m) = (secs / 3600, (secs % 3600) / 60);
     if h > 0 {
         format!("{h} hr {m} min")
@@ -60,23 +60,66 @@ fn collection_meta(tracks: &[Track]) -> Html {
 /// Every track of `p` is downloaded (and it has any): the playlist pins its
 /// tracks' offline copies, which then can't be removed individually. Shared by
 /// the pinned-row computation and the remove-download guard (its mirror).
-fn playlist_fully_downloaded(p: &Playlist, downloaded: &HashSet<String>) -> bool {
+pub(crate) fn playlist_fully_downloaded(p: &Playlist, downloaded: &HashSet<String>) -> bool {
     !p.tracks.is_empty() && p.tracks.iter().all(|t| downloaded.contains(&t.id))
 }
 
 /// Fire the `play_tracks` command for a collection, tagged with where it came
 /// from so the UI can mark the playing collection.
-fn fire_play_tracks(tracks: &[Track], source: &Option<String>, start: usize) {
+pub(crate) fn fire_play_tracks(tracks: &[Track], source: &Option<String>, start: usize) {
     api::fire(
         "play_tracks",
         json!({ "tracks": tracks, "start": start, "source": source }),
     );
 }
 
+/// Fire `play_track` for a single track, replacing the queue.
+///
+/// Split out of the two closures that call it for the same reason
+/// [`shuffled_start`] is: the payload this builds is the exact thing that
+/// regressed — the command's `radio` parameter was removed from the backend
+/// while this call site kept sending it — and a `json!` literal inside a
+/// `Callback::from` closure cannot be reached by any test. Both the row handler
+/// and the Home view call it, so it is shared code rather than a test-only
+/// detour.
+pub(crate) fn fire_play_track(track: &Track) {
+    api::fire("play_track", json!({ "track": track }));
+}
+
+/// Where a shuffled "play this collection" click starts.
+///
+/// Never returns `len` — the backend rejects `start >= tracks.len()` with
+/// "nothing to play", so an unclamped result would let a rare `Math::random()`
+/// roll make the Play button do nothing at all. `random()` returns `[0, 1)`, so
+/// `len` is only reachable by the multiplication rounding up at the very top of
+/// that range, but "only reachable by rounding" is not a guarantee worth
+/// spending a user's click on.
+///
+/// Split out from the click handler so the bound is testable: inside the
+/// handler it depended on a random number and so could never be asserted.
+pub(crate) fn shuffled_start(random: f64, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let scaled = random * len as f64;
+    if scaled >= len as f64 {
+        return len - 1;
+    }
+    // `max(0.0)` covers a hypothetical negative `random` the same way
+    // `slot_at_offset` does: `as usize` would saturate it to 0 anyway, but
+    // stating it keeps the invariant in the code rather than in the cast.
+    (scaled.floor().max(0.0) as usize).min(len - 1)
+}
+
 /// Show a toast that auto-dismisses after `ms`, unless a newer toast supersedes
 /// it first. `gen` is a shared counter bumped on every toast so overlapping
 /// toasts don't clear each other's messages early.
-fn show_toast(toast: UseStateHandle<Option<String>>, gen: Rc<RefCell<u64>>, msg: String, ms: u32) {
+pub(crate) fn show_toast(
+    toast: UseStateHandle<Option<String>>,
+    gen: Rc<RefCell<u64>>,
+    msg: String,
+    ms: u32,
+) {
     let token = {
         let mut g = gen.borrow_mut();
         *g += 1;
@@ -601,9 +644,7 @@ pub fn app() -> Html {
     };
 
     // Play one track by itself (replacing the queue).
-    let on_play_single = Callback::from(|t: Track| {
-        api::fire("play_track", json!({ "track": t }));
-    });
+    let on_play_single = Callback::from(|t: Track| fire_play_track(&t));
 
     // Play a full list starting at an index, tagged with where it came from.
     let play_list = |tracks: Vec<Track>, source: Option<String>| {
@@ -902,7 +943,7 @@ pub fn app() -> Html {
                     return;
                 }
                 let start = if shuffle && tracks.len() > 1 {
-                    (js_sys::Math::random() * tracks.len() as f64) as usize
+                    shuffled_start(js_sys::Math::random(), tracks.len())
                 } else {
                     0
                 };
