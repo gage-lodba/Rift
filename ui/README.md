@@ -28,6 +28,19 @@ glue and runs the module under Node. That needs:
 - **Node** on `PATH`. Any recently-supported LTS will do; the runner emits
   CommonJS.
 
+- **`NO_COLOR` must be `true` or unset if you build the app locally.** Trunk
+  0.21 rejects `NO_COLOR=1` — and because `cargo tauri build` runs
+  `trunk build --release` as its `beforeBuildCommand`, with the environment
+  inherited, a `NO_COLOR=1` in your shell fails the whole application build with
+  a message that names neither the variable nor the value:
+
+  ```
+  Error beforeBuildCommand `trunk build --release` failed with exit code 2
+  ```
+
+  CI never hits this (it does not set the variable), so it is a local-only trap.
+  `$env:NO_COLOR = "true"` on Windows, `export NO_COLOR=true` elsewhere.
+
 ### On Windows, run them under WSL
 
 They do not run on Windows, and this is not a gap in the harness.
