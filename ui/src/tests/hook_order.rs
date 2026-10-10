@@ -28,6 +28,16 @@
 //! breaks the build for innocent code, which is how a check like this gets
 //! deleted by the next person, so the scanner is biased toward silence.
 //!
+//! That bias was paid for once, by a teammate's legitimate in-flight edit: a
+//! `return` inside a nested closure — the ordinary way to leave a keydown
+//! handler early — was counted as an early return from the *component* body, and
+//! this check reported the `use_reorder(…)` call below it. [`early_return_offset`]
+//! now counts a `return` only when no enclosing block is a callable body
+//! (closure, `async` block, nested `fn`). The shapes it cannot tell apart are
+//! listed on that function; the honest summary is that it reads braces, not
+//! syntax, and the regression test built from the exact shape that misfired is
+//! what keeps this from recurring.
+//!
 //! # The other half of this defect class is already a compile error
 //!
 //! A hook written *inside* a conditional, rather than after an early return:
@@ -303,50 +313,117 @@ fn hooks_at_body_depth(body: &str) -> Vec<HookAt> {
     out
 }
 
-/// If `body` contains a `return` at all, the offset of the first one.
+/// The offset of the first `return` that actually leaves the **component** body,
+/// or `None` if nothing in the body can skip the rest of it.
 ///
-/// **Any** depth, not just the body's own. The first version of this only
-/// looked at depth zero, which found nothing in practice: an early return is
-/// almost always written inside a conditional (`if props.queue.is_empty() {
-/// return html! {}; }`), so it sits one brace deeper than the body. That
-/// version passed against the real codebase while being unable to detect the
-/// very defect it was written for — the unit test that plants the defect is
-/// what caught it.
+/// **Any** block depth counts, not just the body's own. The first version of
+/// this only looked at depth zero, which found nothing in practice: an early
+/// return is almost always written inside a conditional (`if props.queue
+/// .is_empty() { return html! {}; }`), so it sits one brace deeper than the
+/// body. That version passed against the real codebase while being unable to
+/// detect the very defect it was written for — the unit test that plants the
+/// defect is what caught it.
 ///
-/// A `return` anywhere means some path skips the rest of the body, which is
-/// all this check needs to know about it.
+/// What does **not** count is a `return` inside a *callable body* nested in the
+/// component: a closure, an `async` block, or a nested `fn` item. Those returns
+/// leave the closure rather than the component, so they cannot make a later hook
+/// conditional, and counting them is a false positive on correct code.
+///
+/// That is the third bug in this scanner, and it was found in production rather
+/// than in review: on 2026-09 a teammate added
+///
+/// ```ignore
+/// let toggle_key = Callback::from(move |e: KeyboardEvent| {
+///     if key_on_nested_control(&e) {
+///         return;
+///     }
+///     …
+/// });
+/// ```
+///
+/// to `queue.rs` — correct code, the guard that keeps Enter on a nested button
+/// from activating the row — and this check reported the `use_reorder(…)` call
+/// twenty lines *below* it as a hook after an early return, turning the suite red
+/// for an innocent edit. A check that cries wolf on correct code gets deleted by
+/// the next person, which is the bias the module doc claims for it; the stack
+/// below is how that stays true.
 ///
 /// `body` must already be noise-stripped. The second version of this took the
 /// raw body, and `queue.rs`'s own comment — "…the empty-queue early return
-/// below — a hook called after it would be…" — was read as a return
-/// statement, reporting the *correct* code as a violation. Prose is the most
-/// likely place for the word to appear, so that was not a corner case.
-fn has_toplevel_return(body: &str) -> Option<usize> {
+/// below — a hook called after it would be…" — was read as a return statement,
+/// reporting the *correct* code as a violation. Prose is the most likely place
+/// for the word to appear, so that was not a corner case.
+fn early_return_offset(body: &str) -> Option<usize> {
     let b = body.as_bytes();
-    let mut depth = 0usize;
+    // One flag per open `{`, innermost last: true when that block is a callable
+    // body, whose `return` does not leave the component.
+    let mut callable: Vec<bool> = Vec::new();
+    // A `fn` token opens a callable body at its next `{`. Tracked separately
+    // because the byte before that brace is the parameter list's `)`, which is
+    // exactly what an `if (…) {` block looks like.
+    let mut fn_body_next = false;
     let mut i = 0;
 
     while i < b.len() {
-        match b[i] {
-            b'{' => depth += 1,
-            b'}' => depth = depth.saturating_sub(1),
-            // `depth` is tracked but deliberately not filtered on; see above.
-            b'r' if b[i..].starts_with(b"return") => {
-                let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
-                let after = b.get(i + 6).copied().unwrap_or(b' ');
-                let after_ok = !after.is_ascii_alphanumeric() && after != b'_';
-                if before_ok && after_ok {
-                    return Some(i);
-                }
-                i += 6;
-                continue;
+        if b[i] == b'{' {
+            callable.push(fn_body_next || opens_callable_body(b, i));
+            fn_body_next = false;
+        } else if b[i] == b'}' {
+            callable.pop();
+        } else if b[i..].starts_with(b"return") {
+            let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            let after = b.get(i + 6).copied().unwrap_or(b' ');
+            let after_ok = !after.is_ascii_alphanumeric() && after != b'_';
+            // Any enclosing callable body means this `return` leaves that body,
+            // not the component.
+            if before_ok && after_ok && !callable.iter().any(|in_callable| *in_callable) {
+                return Some(i);
             }
-            _ => {}
+            i += 6;
+            continue;
+        } else if b[i] == b'f' && starts_fn(b, i) {
+            fn_body_next = true;
+            i += 2;
+            continue;
         }
         i += 1;
     }
 
     None
+}
+
+/// True if the `{` at `at` opens a *callable* body — a closure or an `async`
+/// block — rather than an inline block (`if`, `else`, `match`, `loop`, `for`,
+/// `while`).
+///
+/// A closure body is the only block in Rust whose `{` is preceded by the `|`
+/// that closes its parameter list, so that is the test. `async {` and
+/// `async move {` are the other two spellings, and `move` is otherwise only ever
+/// part of a closure header, which the `|` check has already caught.
+///
+/// The blind spot: a closure with an explicit return type —
+/// `move |_| -> Html { … }` — has its `{` preceded by the type rather than by
+/// `|`, so a `return` inside it is counted as the component's. No component in
+/// this crate writes one; if one ever does, this is the function to fix, and
+/// [`a_return_inside_a_closure_is_not_an_early_return`] is the test that will
+/// not notice.
+fn opens_callable_body(b: &[u8], at: usize) -> bool {
+    let mut end = at;
+    while end > 0 && b[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return false;
+    }
+    if b[end - 1] == b'|' {
+        return true;
+    }
+    let mut start = end;
+    while start > 0 && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_') {
+        start -= 1;
+    }
+    let word = &b[start..end];
+    word == &b"async"[..] || word == &b"move"[..]
 }
 
 /// Every hook placed after an early return, as a byte offset into `src`.
@@ -359,7 +436,7 @@ fn violations(src: &str) -> Vec<usize> {
     let mut found = Vec::new();
     for (start, end) in fn_bodies(src) {
         let body = &stripped[start..end];
-        let Some(ret) = has_toplevel_return(body) else {
+        let Some(ret) = early_return_offset(body) else {
             continue;
         };
         for hook in hooks_at_body_depth(body) {
@@ -491,6 +568,93 @@ fn a_hook_inside_a_closure_is_not_the_component_body() {
     assert!(
         violations(nested).is_empty(),
         "a hook at closure depth was attributed to the component body"
+    );
+}
+
+/// **The false positive, reproduced from the shape that caused it.**
+///
+/// `queue.rs` gained a keydown closure that returns early when the key was
+/// aimed at one of the row's own nested buttons — correct code, and the guard
+/// the whole `key_on_nested_control` mechanism exists for. The closure's
+/// `return` was then read as an early return from the *component*, so the
+/// `use_reorder(…)` call below it was reported and the suite went red for a
+/// teammate's in-flight edit.
+///
+/// This is that file's shape, with the bodies elided: hook, closure with a
+/// `return`, hook, then the component's own empty-queue return. Nothing here is
+/// a violation, and before [`early_return_offset`] ignored callable bodies this
+/// test failed with the `use_reorder` line as the offense.
+#[wasm_bindgen_test]
+fn a_return_inside_a_closure_is_not_an_early_return() {
+    let shape = r#"
+        pub fn queue_panel(props: &QueuePanelProps) -> Html {
+            let collapsed = use_state(|| false);
+            let flip = {
+                let collapsed = collapsed.clone();
+                Callback::from(move |_: ()| collapsed.set(!*collapsed))
+            };
+            let toggle_key = Callback::from(move |e: KeyboardEvent| {
+                if key_on_nested_control(&e) {
+                    return;
+                }
+                if e.key() == "Enter" {
+                    flip.emit(());
+                }
+            });
+            let reorder = use_reorder(ids, 0, props.on_move.clone());
+            if props.queue.tracks.is_empty() {
+                return html! {};
+            }
+            html! {}
+        }
+    "#;
+    let found = violations(shape);
+    assert!(
+        found.is_empty(),
+        "a `return` inside the keydown closure was read as an early return from \
+         the component body, which reports the `use_reorder` hook above the real \
+         return (offsets: {found:?})"
+    );
+}
+
+/// And the fix must not silence the defect it was written for: with *both*
+/// shapes in one body, exactly the hook below the real early return is reported.
+///
+/// This is the test that separates "ignore returns in closures" from "ignore
+/// returns". Before the fix the scanner stopped at the closure's `return`, so it
+/// reported the hoisted `use_state(|| 1)` as well — two offenses, one of them
+/// innocent, and the real one indistinguishable from it.
+#[wasm_bindgen_test]
+fn a_real_early_return_is_still_reported_beside_a_closure_return() {
+    let mixed = r#"
+        pub fn panel(props: &Props) -> Html {
+            let a = use_state(|| 0);
+            let cb = Callback::from(move |_: ()| {
+                if props.stale() {
+                    return;
+                }
+            });
+            let b = use_state(|| 1);
+            if props.items.is_empty() {
+                return html! {};
+            }
+            let c = use_state(|| 2);
+            html! {}
+        }
+    "#;
+    let found = violations(mixed);
+    assert_eq!(
+        found.len(),
+        1,
+        "only the hook below the real early return is a violation, and the \
+         hoisted one must not be (offsets: {found:?})"
+    );
+    assert!(
+        mixed[found[0]..].starts_with("use_state(|| 2)"),
+        "the report should point at the hook after the real early return, not at \
+         the hoisted one: offset {} is {:?}",
+        found[0],
+        &mixed[found[0]..mixed.len().min(found[0] + 16)]
     );
 }
 

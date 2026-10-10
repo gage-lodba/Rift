@@ -12,23 +12,69 @@
 [target.wasm32-unknown-unknown]
 runner = "wasm-bindgen-test-runner"
 
-# The DOM the renderer tests mount into.
-#
-# `wasm-bindgen-test-runner` builds a Node script and runs it, and offers no hook
-# of its own for injecting globals — but `NODE_OPTIONS=--require <file>` is
-# evaluated by Node *before* the script, which is exactly early enough: `web-sys`
-# resolves `window` and `document` lazily, so they only have to exist before the
-# first component mounts. `ui/tests/dom-shim.cjs` installs them.
-#
-# `relative = true` resolves the path against *this file's* directory rather than
-# the working directory, so it is correct whether Cargo is invoked from the repo
-# root or from `ui/`, on every platform. `force` is deliberately left unset, so a
-# `NODE_OPTIONS` you set yourself wins (Cargo warns that it is skipping this one)
-# rather than being silently replaced.
-#
-# Only the wasm32 test run needs it. `trunk build`, the wasm clippy pass, and
-# every native build are unaffected — though `cargo build`, which reads this
-# table too, will also carry the variable. That is inert: `--require` only means
-# anything to Node.
+# The environment every Cargo-spawned process inherits. Both values below are read
+# by exactly one consumer — the wasm test runner and the Node script it generates
+# — and are inert for `trunk build`, the clippy pass, and every native build.
 [env]
-NODE_OPTIONS = { value = "--require ui/tests/dom-shim.cjs", relative = true }
+
+# The DOM the renderer tests mount into, installed as a Node preload.
+#
+# `NODE_OPTIONS=--require <file>` is evaluated by Node *before* the script it was
+# given, which is the only injection point the runner offers — and it is early
+# enough: `web-sys` resolves `window` and `document` lazily, so they only have to
+# exist before the first component mounts. `ui/tests/dom-shim.cjs` installs them.
+#
+# The path is relative to the *runner's* working directory, which Cargo sets to
+# the package root rather than to the directory Cargo was invoked from. Measured
+# with a probe runner, four ways — from the repo root, from `ui/`, from `ui/src/`,
+# and through `--manifest-path` — every one of them ran the runner with
+# `cwd = ui/`, so `./tests/dom-shim.cjs` is `ui/tests/dom-shim.cjs`. (Invoked from
+# outside the repo with `--manifest-path`, Cargo does not read this file at all:
+# it discovers `.cargo/config.toml` from the working directory upwards.)
+#
+# The `./` is load-bearing. Without it Node reads the value as a bare package
+# specifier, searches `node_modules`, and exits with MODULE_NOT_FOUND before the
+# test module loads.
+#
+# **`relative = true` cannot be used for this value, and it is the trap this file
+# used to contain.** Cargo path-joins the *whole* value — flag included — onto
+# the config's base directory:
+#
+#   NODE_OPTIONS = { value = "--require ui/tests/dom-shim.cjs", relative = true }
+#   => NODE_OPTIONS = "C:\Users\...\Rift\--require ui/tests/dom-shim.cjs"
+#
+# Node *silently ignores* NODE_OPTIONS tokens that do not begin with `-`, so that
+# is not a startup error: the shim simply never loads, and the four renderer tests
+# fail with "the DOM shim installs `window` before any test runs" — a message
+# about a missing global, naming neither this line nor the reason. Measured both
+# ways on 2026-09: the value above gives `49 passed; 4 failed`, the value below
+# gives `53 passed; 0 failed`. CI has never exercised this table (the branch is
+# unpushed), so the Linux/macOS job carries the same four failures today.
+#
+# `force` is deliberately left unset, so a `NODE_OPTIONS` exported in your shell
+# wins (Cargo warns that it is skipping this one) rather than being silently
+# replaced. That property is what isolated the broken value: exporting the
+# working one was enough to turn the four failures green.
+NODE_OPTIONS = "--require ./tests/dom-shim.cjs"
+
+# The benchmark baseline path the runner would otherwise compute for itself, as
+# `<cwd>/target/wbg_benchmark.json`.
+#
+# It has to be overridden because the runner writes its default into the generated
+# Node script with `Path::display()` inside a **single-quoted JS string**. On
+# Windows that is
+#
+#   const benchmark_import = await fs.readFile('C:\...\Rift\ui\target\wbg_benchmark.json');
+#
+# and `\ui` is an invalid Unicode escape — `\u` must be followed by four hex
+# digits — so Node rejects the file while *parsing* it, and the run dies before a
+# single test executes. (It is not `\U`: JS accepts that as a `NonEscapeCharacter`,
+# and so does `\Users`. The caret in Node's error points at the `\ui` of the
+# package directory.) The read sits in an `if (is_bench)` branch that a
+# `cargo test` run never takes, which changes nothing: a syntax error is a syntax
+# error whether or not its branch executes.
+#
+# Pinning the value to this relative path keeps the runner's own location (its cwd
+# is the package root, `ui/`, as above) and is valid JS on every platform. Only
+# `cargo bench` reads or writes it; the test suite never does.
+WASM_BINDGEN_BENCH_RESULT = "target/wbg_benchmark.json"

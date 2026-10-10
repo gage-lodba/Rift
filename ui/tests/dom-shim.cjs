@@ -163,15 +163,40 @@ globalThis.self = undefined;
 // Give a CI log the result lines the browser formatter would otherwise leave in
 // the DOM. Without this the suite can pass, or fail, with nothing in the log to
 // say which tests ran.
+//
+// Only the *new* text goes to stdout, not the whole element each time. The
+// formatter appends a line at a time and the observer fires per append, so
+// re-printing `textContent` grows the log quadratically: measured at 369 lines
+// for a 53-test run, every line a longer prefix of the same report, with the one
+// line that matters buried in it. The common-prefix diff below also survives the
+// formatter replacing the element's contents instead of appending.
 const output = window.document.getElementById('output');
 if (output) {
-  const stream = () => process.stdout.write(`${output.textContent}\n`);
+  let written = '';
+  const stream = () => {
+    const text = output.textContent;
+    if (text === written) {
+      return;
+    }
+    let common = 0;
+    const shared = Math.min(text.length, written.length);
+    while (common < shared && text[common] === written[common]) {
+      common += 1;
+    }
+    process.stdout.write(text.slice(common));
+    written = text;
+  };
   new window.MutationObserver(stream).observe(output, {
     childList: true,
     characterData: true,
     subtree: true,
   });
-  process.on('exit', stream);
+  process.on('exit', () => {
+    stream();
+    if (written && !written.endsWith('\n')) {
+      process.stdout.write('\n');
+    }
+  });
 }
 
 if (process.env.RIFT_TEST_SHIM_VERBOSE === '1') {
