@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, error, info};
 
 use super::nav::{pick_next, play_next};
-use super::state::{emit_queue, emit_state, PlayerShared};
+use super::state::{emit_queue, emit_state, PlayerCore, PlayerShared};
 use crate::audio::AudioCmd;
 use crate::util::LockExt;
 use crate::AppState;
@@ -51,9 +51,7 @@ pub fn play_index(app: &AppHandle, index: usize) {
         }
         // A deliberate jump is a fresh start: give the queue a full retry budget.
         core.failures = 0;
-        if core.shuffle {
-            super::nav::seed_shuffle_anchor(&mut core, index);
-        }
+        super::nav::anchor_playing(&mut core, index);
     }
     start_playback(app, index);
 }
@@ -285,6 +283,27 @@ async fn announce_track(
     let _ = app.emit(events::LIBRARY, &lib.data);
 }
 
+/// Commit a prefetched crossfade pick: `index` becomes the playing track. The
+/// caller has already established that the prefetch is still current (the
+/// generation is unchanged, `pending_next` still names it) and that playback is
+/// still inside the overlap window. Pure so the bookkeeping it touches is
+/// testable on its own; the fetched duration is applied by the caller.
+pub(crate) fn commit_crossfade(core: &mut PlayerCore, index: usize) {
+    core.pending_next = None;
+    // Anchor the shuffle cycle on the pick before it becomes current. Normally
+    // it is already the cursor's entry — the prefetch drew it through
+    // `pick_next` — but the pair can be rewritten between the draw and the
+    // commit (`toggle_shuffle` re-anchors the history and deliberately keeps the
+    // pick), and a pick the cursor does not name stays in the draw pool, so Next
+    // could redraw the track that just started.
+    super::nav::anchor_playing(core, index);
+    core.current = Some(index);
+    core.state = PlaybackState::Playing;
+    core.generation += 1;
+    core.failures = 0;
+    core.position = 0.0;
+}
+
 /// Begin a crossfade into the next track: draw it now, fetch it in the
 /// background, and once its bytes are ready overlap it with the current track
 /// via [`AudioCmd::Crossfade`]. Triggered by the position watcher as the current
@@ -348,12 +367,7 @@ pub(crate) fn begin_crossfade(app: &AppHandle) {
                         debug!("crossfade target ready but position left the overlap window; deferring");
                         return;
                     }
-                    core.pending_next = None;
-                    core.current = Some(index);
-                    core.state = PlaybackState::Playing;
-                    core.generation += 1;
-                    core.failures = 0;
-                    core.position = 0.0;
+                    commit_crossfade(&mut core, index);
                     core.duration = if duration > 0.0 {
                         duration
                     } else {

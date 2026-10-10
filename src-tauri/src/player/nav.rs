@@ -53,6 +53,22 @@ pub(crate) fn seed_shuffle_anchor(core: &mut PlayerCore, index: usize) {
     }
 }
 
+/// Anchor the shuffle cycle on the track playback is about to move to. Every
+/// path that makes a new track current — a direct jump, a replayed or drawn
+/// pick, a committed crossfade — goes through here, because `pick_next` replays
+/// forward from `history[shuffle_cursor]` and `pick_prev` steps back from it: a
+/// cursor left naming the *previous* track would put the one that just started
+/// back in the draw pool (so Next can redraw it) and make Previous walk back
+/// from the wrong place. Normally the entry already exists — the pick was drawn
+/// through [`pick_next`] — and this only moves the cursor onto it; the history
+/// can also have been rewritten under a pinned pick (`toggle_shuffle`), which is
+/// when the anchor does real work. With shuffle off there is no cycle to anchor.
+pub(crate) fn anchor_playing(core: &mut PlayerCore, index: usize) {
+    if core.shuffle {
+        seed_shuffle_anchor(core, index);
+    }
+}
+
 /// Decide the next queue index and advance the shuffle history. `manual` marks
 /// a user-initiated Next (wraps at the end and overrides repeat-one); automatic
 /// advancement respects repeat mode.
@@ -71,6 +87,13 @@ pub(crate) fn pick_next(core: &mut PlayerCore, manual: bool) -> Option<usize> {
     // bookkeeping as it did). Honour that pick so it isn't drawn twice.
     if let Some(i) = core.pending_next.take() {
         if i < len {
+            // The pick was drawn when it was the cycle's next track, but the
+            // history can be rewritten under it while it waits — `toggle_shuffle`
+            // re-anchors the history on the playing track and deliberately keeps
+            // the pick. Anchor it to the track that is about to play, or the
+            // just-started track is missing from the played set and therefore
+            // still in the draw pool, so the next Next can redraw it.
+            anchor_playing(core, i);
             return Some(i);
         }
     }
@@ -97,7 +120,17 @@ pub(crate) fn pick_next(core: &mut PlayerCore, manual: bool) -> Option<usize> {
             if !manual && core.repeat != RepeatMode::All {
                 return None;
             }
+            // Carry the playing track into the new cycle as its first entry.
+            // It has just played, so it has to stay out of the pool for the
+            // whole cycle (a back-to-back repeat is what the `fresh` filter
+            // below is about), and it has to stay in the history: this draw is
+            // usually a crossfade prefetch, i.e. it happens *before* the track
+            // ends, and the pinned pick can be dropped without playing (repeat
+            // cycling, a queue edit, a skip). A playing track outside the played
+            // set is back in the draw pool, so Next could restart it. It also
+            // gives Previous the track it came from.
             core.shuffle_history.clear();
+            core.shuffle_history.push(cur);
             let fresh: Vec<usize> = (0..len).filter(|i| *i != cur).collect();
             fresh[rand_index(fresh.len())]
         } else {

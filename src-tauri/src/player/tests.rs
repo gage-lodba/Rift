@@ -1,9 +1,9 @@
 //! Unit tests for the pure navigation and queue-mutation logic.
 
-use rift_types::{QueueSnapshot, RepeatMode, Track};
+use rift_types::{PlaybackState, QueueSnapshot, RepeatMode, Track};
 
-use super::nav::{cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor};
-use super::playback::preseed_duration;
+use super::nav::{anchor_playing, cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor};
+use super::playback::{commit_crossfade, preseed_duration};
 use super::queue::{
     append_tracks, insert_next, move_in_queue, remove_from_queue, AddOutcome, RemoveOutcome,
 };
@@ -745,4 +745,669 @@ fn an_unchanged_snapshot_is_not_persisted_again() {
 
     // ...and the just-written snapshot is itself deduped.
     assert!(!session_changed(&mut last, &resourced));
+}
+
+// ---------------------------------------------------------------------------
+// Seeded property test over sequences of commands
+// ---------------------------------------------------------------------------
+//
+// Every test above drives one operation and checks the state it leaves. M10
+// (the shuffle cycle forgetting what it had played across a queue edit) lived
+// through two review sessions because that is all they did: the invariant is a
+// property of *sequences*, so these drive the real functions the command layer
+// calls, thousands of steps at a time, and assert the bookkeeping after every
+// one. The seed is fixed so any failure is reproducible, and each message names
+// the seed and step.
+
+/// xorshift64. A fixed-seed generator is enough here and keeps the test free of
+/// a dependency; it is never asked for cryptographic quality, only for a long,
+/// reproducible walk over the state space.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// A value in `0..n` (`0` when `n` is zero).
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn chance(&mut self, one_in: u64) -> bool {
+        self.next() % one_in == 0
+    }
+}
+
+/// The state `start_playback` commits for a hard start: the track becomes
+/// current, the prefetched crossfade pick is dropped, and the position resets.
+/// The fetch/decode that follows is modelled as succeeding (`Playing`), since
+/// only the queue bookkeeping is under test here.
+fn start_like(core: &mut PlayerCore, index: usize) {
+    core.current = Some(index);
+    core.generation += 1;
+    core.pending_next = None;
+    core.state = PlaybackState::Playing;
+    core.position = 0.0;
+}
+
+/// `play_index` as the commands run it: an out-of-range jump is ignored, a real
+/// one clears the failure budget, anchors the cycle under shuffle, and starts.
+fn jump_like(core: &mut PlayerCore, index: usize) {
+    if index >= core.queue.len() {
+        return;
+    }
+    core.failures = 0;
+    anchor_playing(core, index);
+    start_like(core, index);
+}
+
+/// One to three tracks, occasionally reusing an id that is already queued so the
+/// real add paths' de-duplication is exercised by a rejection, not assumed.
+fn random_tracks(core: &PlayerCore, rng: &mut Rng, next_id: &mut usize, max: usize) -> Vec<Track> {
+    let n = 1 + rng.below(max);
+    (0..n)
+        .map(|_| {
+            if !core.queue.is_empty() && rng.chance(4) {
+                core.queue[rng.below(core.queue.len())].clone()
+            } else {
+                let id = *next_id;
+                *next_id += 1;
+                dummy_track(id)
+            }
+        })
+        .collect()
+}
+
+/// What one random command did, for the invariants that only apply to some of
+/// them.
+struct Step {
+    /// The command, for failure messages.
+    label: String,
+    /// A queue *edit*: the operations that must not lose the played set (M10).
+    edit: bool,
+    /// The command ended by making a specific track current through an anchored
+    /// path (a jump, a Next/auto-advance, a committed crossfade, a shuffle
+    /// toggle), so the cursor must name it afterwards. A prefetch is not one of
+    /// these: it deliberately runs the cycle ahead of playback.
+    settles: bool,
+}
+
+impl Step {
+    fn new(label: String, edit: bool, settles: bool) -> Self {
+        Self {
+            label,
+            edit,
+            settles,
+        }
+    }
+}
+
+/// Apply one random command the way the command layer does: call the real pure
+/// function, then perform the state updates its caller performs (`play_index`,
+/// `play_next`, `queue_remove`, `queue_clear`, `play_tracks`, …).
+fn apply_random_step(core: &mut PlayerCore, rng: &mut Rng, next_id: &mut usize) -> Step {
+    match rng.below(13) {
+        0 => {
+            let index = rng.below(core.queue.len() + 2);
+            jump_like(core, index);
+            Step::new(
+                format!("play_index({index})"),
+                false,
+                index < core.queue.len(),
+            )
+        }
+        1 => {
+            let manual = rng.chance(2);
+            // An automatic advance under repeat-one hands back the track that is
+            // already playing without touching the cycle, so it settles nothing.
+            let replaying = !manual && core.repeat == RepeatMode::One;
+            let advanced = match pick_next(core, manual) {
+                Some(i) => {
+                    start_like(core, i);
+                    true
+                }
+                // `play_next` stops when the cycle ends; `stop` leaves the
+                // current track in place.
+                None => {
+                    core.position = 0.0;
+                    false
+                }
+            };
+            Step::new(
+                format!("play_next(manual={manual})"),
+                false,
+                advanced && !replaying,
+            )
+        }
+        2 => {
+            // A Previous pressed part-way through restarts the track instead of
+            // stepping back (`pick_prev` reads `position`), and a restart can
+            // leave the cursor on a reservation the prefetch made — see the
+            // cursor note in `assert_bookkeeping` — so this step does not
+            // promise the strong form.
+            core.position = if rng.chance(3) { 5.0 } else { 0.0 };
+            if let Some(i) = pick_prev(core) {
+                start_like(core, i);
+            }
+            Step::new("play_prev".to_owned(), false, false)
+        }
+        3 => {
+            let index = rng.below(core.queue.len() + 2);
+            let mut settles = false;
+            match remove_from_queue(core, index) {
+                RemoveOutcome::PlayIndex(i) => {
+                    jump_like(core, i);
+                    settles = true;
+                }
+                RemoveOutcome::Stop => {
+                    core.state = PlaybackState::Stopped;
+                    core.position = 0.0;
+                }
+                RemoveOutcome::None | RemoveOutcome::EmitOnly => {}
+            }
+            Step::new(format!("remove({index})"), true, settles)
+        }
+        4 => {
+            let tracks = random_tracks(core, rng, next_id, 3);
+            let started = matches!(insert_next(core, tracks), AddOutcome::PlayIndex(_));
+            if started {
+                // The only insert that starts playback is the empty-queue one,
+                // which always starts index 0.
+                jump_like(core, 0);
+            }
+            Step::new("insert_next".to_owned(), true, started)
+        }
+        5 => {
+            let tracks = random_tracks(core, rng, next_id, 3);
+            let start = match append_tracks(core, tracks) {
+                AddOutcome::PlayIndex(i) => Some(i),
+                AddOutcome::EmitOnly => None,
+            };
+            if let Some(i) = start {
+                jump_like(core, i);
+            }
+            Step::new("append_tracks".to_owned(), true, start.is_some())
+        }
+        6 => {
+            let from = rng.below(core.queue.len() + 1);
+            let to = rng.below(core.queue.len() + 1);
+            move_in_queue(core, from, to);
+            Step::new(format!("move({from},{to})"), true, false)
+        }
+        7 => {
+            // `toggle_shuffle`: flips the mode and re-anchors the history on the
+            // current track, so the cursor names it again afterwards. Like the
+            // command, it does *not* drop a prefetched crossfade pick — the
+            // asymmetry with `cycle_repeat` is real, and the assertions below
+            // hold the bookkeeping to it.
+            core.shuffle = !core.shuffle;
+            core.shuffle_history = core.current.into_iter().collect();
+            core.shuffle_cursor = 0;
+            Step::new("toggle_shuffle".to_owned(), false, core.current.is_some())
+        }
+        8 => {
+            cycle_repeat(core);
+            Step::new("cycle_repeat".to_owned(), false, false)
+        }
+        9 => {
+            // The pure step of `begin_crossfade`: draw ahead of time and pin the
+            // pick. The position/state gates that decide *when* it arms don't
+            // change this transition. This is the one command that legitimately
+            // leaves the cursor ahead of the playing track.
+            if core.pending_next.is_none() && core.repeat != RepeatMode::One {
+                if let Some(next) = pick_next(core, false) {
+                    core.pending_next = Some(next);
+                }
+            }
+            Step::new("prefetch_crossfade".to_owned(), false, false)
+        }
+        10 => {
+            // The pure step of the commit once the fetch lands and nothing has
+            // advanced: the real function, so a missing anchor is caught here.
+            let committed = core.pending_next.is_some_and(|i| i < core.queue.len());
+            if committed {
+                let index = core.pending_next.expect("checked above");
+                commit_crossfade(core, index);
+            }
+            Step::new("commit_crossfade".to_owned(), false, committed)
+        }
+        11 => {
+            // `queue_clear`: the queue and the bookkeeping go together.
+            core.queue.clear();
+            core.current = None;
+            core.source = None;
+            core.shuffle_history.clear();
+            core.shuffle_cursor = 0;
+            core.pending_next = None;
+            core.state = PlaybackState::Stopped;
+            core.position = 0.0;
+            Step::new("queue_clear".to_owned(), false, false)
+        }
+        _ => {
+            // `play_tracks`: a new queue starts a fresh cycle, then plays the
+            // requested index (`start >= len` is rejected before anything).
+            let n = 1 + rng.below(6);
+            let start = rng.below(n + 1);
+            let tracks: Vec<Track> = (0..n)
+                .map(|_| {
+                    let id = *next_id;
+                    *next_id += 1;
+                    dummy_track(id)
+                })
+                .collect();
+            if start < n {
+                core.queue = tracks;
+                core.source = Some("random-queue".into());
+                core.shuffle_history.clear();
+                core.shuffle_cursor = 0;
+                jump_like(core, start);
+                Step::new("play_tracks".to_owned(), false, true)
+            } else {
+                Step::new("play_tracks(rejected)".to_owned(), false, false)
+            }
+        }
+    }
+}
+
+/// The ids the history names, in order: the cycle's played set.
+fn played_ids(core: &PlayerCore) -> Vec<String> {
+    core.shuffle_history
+        .iter()
+        .map(|i| core.queue[*i].id.clone())
+        .collect()
+}
+
+/// The id of the queue index the cursor names.
+fn cursor_id(core: &PlayerCore) -> String {
+    core.queue[core.shuffle_history[core.shuffle_cursor]]
+        .id
+        .clone()
+}
+
+/// Structural invariants after every command. Each is asserted, not
+/// re-established: the property is that the functions maintain them.
+fn assert_bookkeeping(core: &PlayerCore, seed: u64, step: usize, what: &str) {
+    let at = format!("seed {seed:#x} step {step} after {what}");
+    let len = core.queue.len();
+    for (pos, index) in core.shuffle_history.iter().enumerate() {
+        assert!(
+            *index < len,
+            "{at}: shuffle_history[{pos}] = {index} is not a live index (queue has {len})"
+        );
+        // Entries are unique by design: `pick_next` only draws from the pool
+        // (and `seed_shuffle_anchor` moves the cursor onto an entry that already
+        // exists), so a duplicate would mean a track repeated before its cycle
+        // was out.
+        assert!(
+            !core.shuffle_history[..pos].contains(index),
+            "{at}: shuffle_history lists {index} twice: {:?}",
+            core.shuffle_history
+        );
+    }
+    if core.shuffle_history.is_empty() {
+        assert_eq!(
+            core.shuffle_cursor, 0,
+            "{at}: an empty history leaves no cursor"
+        );
+    } else {
+        // `pick_prev` reads `history[cursor]` without a bounds check.
+        assert!(
+            core.shuffle_cursor < core.shuffle_history.len(),
+            "{at}: cursor {} is out of range for history {:?}",
+            core.shuffle_cursor,
+            core.shuffle_history
+        );
+    }
+    if let Some(cur) = core.current {
+        assert!(
+            cur < len,
+            "{at}: current {cur} is not a live index (queue has {len})"
+        );
+    }
+    if let Some(pending) = core.pending_next {
+        // A pinned pick is only ever read as `pick_next`'s next track, and that
+        // read re-checks the bound, but the command layer only ever pins a live
+        // index in the first place.
+        assert!(
+            pending < len,
+            "{at}: pending_next {pending} is not a live index (queue has {len})"
+        );
+    }
+    if core.shuffle {
+        match core.current {
+            // The playing track must be in the played set. The draw pool is
+            // "every index not in the history", so a current track missing from
+            // it can be drawn again — Next would restart the track already
+            // playing. The cursor is deliberately *not* asserted to name it:
+            // a prefetch advances the cursor onto the track it reserves while
+            // the previous one is still playing (that is what makes the pick
+            // reusable), and a pick dropped without playing leaves the cursor on
+            // that track — which then waits for the next cycle — rather than
+            // walking it back.
+            Some(cur) => assert!(
+                core.shuffle_history.contains(&cur),
+                "{at}: the playing track {cur} is not in the played set {:?}, so Next can redraw it",
+                core.shuffle_history
+            ),
+            None => assert!(
+                core.shuffle_history.is_empty(),
+                "{at}: nothing is playing but the history still holds {:?}",
+                core.shuffle_history
+            ),
+        }
+    }
+}
+
+/// The strong form of the cursor invariant, asserted where it *must* hold: a
+/// command that makes a new track current through an anchored path — a jump, a
+/// Next/auto-advance, a committed crossfade, a shuffle toggle — has to leave the
+/// cursor naming that track. It deliberately does not hold between a prefetch
+/// and the command that plays the reserved pick, nor after a Previous restarts a
+/// track whose cycle the prefetch had already run ahead of; see the note in
+/// `assert_bookkeeping` for exactly which states are permitted.
+fn assert_cursor_names_current(core: &PlayerCore, seed: u64, step: usize, what: &str) {
+    if !core.shuffle {
+        return;
+    }
+    if let Some(cur) = core.current {
+        assert_eq!(
+            core.shuffle_history.get(core.shuffle_cursor),
+            Some(&cur),
+            "seed {seed:#x} step {step} after {what}: the cursor must name the track playback settled on (history {:?}, cursor {}, current {cur})",
+            core.shuffle_history,
+            core.shuffle_cursor
+        );
+    }
+}
+
+/// M10 as a property: an edit may renumber the played set, but a track that has
+/// played this cycle and is still in the queue must not fall out of it — that
+/// is exactly what "the edit forgot what it played" looked like.
+fn assert_no_played_track_was_lost(
+    core: &PlayerCore,
+    before: &[String],
+    seed: u64,
+    step: usize,
+    what: &str,
+) {
+    let after = played_ids(core);
+    let lost: Vec<String> = before
+        .iter()
+        .filter(|id| !after.contains(*id) && core.queue.iter().any(|t| &t.id == *id))
+        .cloned()
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "seed {seed:#x} step {step} after {what}: the edit dropped played tracks {lost:?} from the cycle (was {before:?}, now {after:?})"
+    );
+}
+
+/// Play the rest of the cycle out on the bookkeeping alone (state saved and
+/// restored, so the surrounding sequence is unaffected): auto-advance must never
+/// replay a track, and with repeat off it must stop exactly when every track in
+/// the queue has played. That is the invariant the hand-written cycle tests
+/// assert, checked here from whatever state the sequence reached.
+fn assert_cycle_is_sound(core: &mut PlayerCore, seed: u64, step: usize, what: &str) {
+    if !core.shuffle || core.queue.len() < 2 || core.current.is_none() {
+        return;
+    }
+    let at = format!(
+        "seed {seed:#x} step {step} after {what} ({} tracks, history {:?}, cursor {}, current {:?}, pending {:?})",
+        core.queue.len(),
+        core.shuffle_history,
+        core.shuffle_cursor,
+        core.current,
+        core.pending_next
+    );
+    let saved = (
+        core.current,
+        core.repeat,
+        core.shuffle_history.clone(),
+        core.shuffle_cursor,
+        core.pending_next,
+    );
+    core.repeat = RepeatMode::Off;
+    let entered_on = core.current;
+    let mut played: Vec<String> = Vec::new();
+    while let Some(next) = pick_next(core, false) {
+        assert!(
+            next < core.queue.len(),
+            "{at}: pick_next returned {next} for a {}-track queue",
+            core.queue.len()
+        );
+        if played.is_empty() {
+            // Auto-advance must never restart the track that just ended: the
+            // pool excludes it precisely so a cycle doesn't repeat back-to-back,
+            // and the fresh-cycle branch filters it out too.
+            assert_ne!(
+                Some(next),
+                entered_on,
+                "{at}: auto-advance restarted the track that was already playing"
+            );
+        }
+        let id = core.queue[next].id.clone();
+        assert!(
+            !played.contains(&id),
+            "{at}: the cycle replayed \"{id}\" before every track had played: {played:?}"
+        );
+        played.push(id);
+        core.current = Some(next);
+        assert!(
+            played.len() <= core.queue.len(),
+            "{at}: auto-advance never stopped after {played:?}"
+        );
+    }
+    assert_eq!(
+        core.shuffle_history.len(),
+        core.queue.len(),
+        "{at}: a completed cycle must have played every track once"
+    );
+    let (current, repeat, history, cursor, pending) = saved;
+    core.current = current;
+    core.repeat = repeat;
+    core.shuffle_history = history;
+    core.shuffle_cursor = cursor;
+    core.pending_next = pending;
+}
+
+/// The sequence test. Seeds are fixed; each failure message names the seed, the
+/// step and the command, so a run is reproducible by rerunning this test.
+#[test]
+fn random_command_sequences_keep_the_shuffle_bookkeeping_sound() {
+    const SEEDS: [u64; 4] = [
+        0x9E37_79B9_7F4A_7C15,
+        0xDEAD_BEEF_CAFE_BABE,
+        0x0123_4567_89AB_CDEF,
+        0x0BAD_F00D_DEAD_BEEF,
+    ];
+    const STEPS: usize = 2_000;
+
+    for seed in SEEDS {
+        let mut rng = Rng::new(seed);
+        // Vary the starting shape so the four walks don't all leave the same
+        // state: 2–8 tracks, shuffle on or off, anchored on a real track.
+        let n = 2 + rng.below(7);
+        let start = rng.below(n);
+        let mut core = PlayerCore {
+            queue: (0..n).map(dummy_track).collect(),
+            current: Some(start),
+            shuffle: rng.chance(2),
+            shuffle_history: vec![start],
+            shuffle_cursor: 0,
+            crossfade: 10.0,
+            duration: 180.0,
+            ..PlayerCore::default()
+        };
+        let mut next_id = 1_000;
+        for step in 0..STEPS {
+            let before = played_ids(&core);
+            let applied = apply_random_step(&mut core, &mut rng, &mut next_id);
+            assert_bookkeeping(&core, seed, step, &applied.label);
+            if applied.settles {
+                assert_cursor_names_current(&core, seed, step, &applied.label);
+            }
+            if applied.edit {
+                assert_no_played_track_was_lost(&core, &before, seed, step, &applied.label);
+            }
+            assert_cycle_is_sound(&mut core, seed, step, &applied.label);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The prefetch/cursor states the property test settled
+// ---------------------------------------------------------------------------
+
+/// The prefetch deliberately runs the cycle ahead of playback: `pick_next`
+/// advances the cursor onto the track it draws, and `begin_crossfade` pins that
+/// pick so the crossfade commit or the end-of-track advance can reuse it. So
+/// between the draw and that advance the cursor names the *reserved* track while
+/// `current` is still the previous one. That is the state seed 0x9e3779b97f4a7c15
+/// step 15 reached (`history [4, 5, 0], cursor 2, current 5`), and it is by
+/// design, not a lost cursor: the playing track stays in the played set
+/// throughout, and the advance that plays the pick leaves the cursor naming it.
+/// Asserting "the cursor always names the playing track" would be wrong here;
+/// `random_command_sequences_keep_the_shuffle_bookkeeping_sound` instead asserts
+/// the strong form on the commands that must settle it (a jump, a Next, a
+/// committed crossfade, a toggle) and this pins the permitted intermediate state.
+#[test]
+fn a_prefetched_pick_leads_the_cursor_until_it_is_played() {
+    // Played "2", then "0", then stepped back: "0" is playing and "3" is the
+    // entry Next would replay.
+    let mut core = queue_core(4, Some(0));
+    core.shuffle = true;
+    core.shuffle_history = vec![2, 0, 3];
+    core.shuffle_cursor = 1;
+    // The prefetch draws it: the cursor moves onto "3" — the pick it pins —
+    // while "0" is still playing.
+    let next = pick_next(&mut core, false).expect("a next track");
+    core.pending_next = Some(next);
+    assert_eq!(next, 3, "the replay the cursor stepped onto");
+    assert_eq!(
+        cursor_id(&core),
+        "3",
+        "the cursor leads onto the reserved track"
+    );
+    assert_eq!(core.current, Some(0), "playback has not moved yet");
+    assert!(
+        core.shuffle_history.contains(&0),
+        "the playing track stays in the played set while the pick waits"
+    );
+
+    // The end-of-track advance consumes the pin, and now the cursor must name
+    // the track that is playing.
+    let played = pick_next(&mut core, false).expect("the pinned pick");
+    advance(&mut core, played);
+    assert_eq!(core.current, Some(3));
+    assert_eq!(
+        cursor_id(&core),
+        "3",
+        "once the pick plays, the cursor names it"
+    );
+}
+
+/// The property test's other finding (seed 0x9e3779b97f4a7c15 step 686): at the
+/// end of a complete cycle a prefetch draws the *next* cycle's first track, and
+/// that draw happens while the last track is still playing. If the pick never
+/// plays — here the user presses Previous, and a hard start drops the pin — the
+/// track that is still playing has to stay in the played set, or the draw pool
+/// hands it straight back to the next advance.
+#[test]
+fn a_cycle_rollover_keeps_the_playing_track_in_the_played_set() {
+    // A five-track cycle has played out completely, ending on "4".
+    let mut core = queue_core(5, Some(4));
+    core.shuffle = true;
+    core.repeat = RepeatMode::All;
+    core.shuffle_history = vec![1, 3, 0, 2, 4];
+    core.shuffle_cursor = 4;
+    // The prefetch's draw rolls into a fresh cycle there and then, pinning the
+    // first track of the new cycle.
+    let pick = pick_next(&mut core, false).expect("a fresh cycle");
+    core.pending_next = Some(pick);
+    assert_ne!(
+        pick, 4,
+        "a fresh cycle doesn't start on the track just played"
+    );
+
+    // The user presses Previous before it plays; `start_playback` drops the pin.
+    core.position = 0.0;
+    let prev = pick_prev(&mut core).expect("a previous track");
+    advance(&mut core, prev);
+    core.pending_next = None;
+    assert_eq!(prev, 4, "Previous replays the track that just played");
+    assert!(
+        core.shuffle_history.contains(&core.current.unwrap()),
+        "the playing track stays in the played set even though the pick was dropped"
+    );
+    // …and the next advance cannot restart it.
+    let next = pick_next(&mut core, false).expect("a next track");
+    assert_ne!(next, 4, "auto-advance must not restart the playing track");
+}
+
+/// The counterpart to the state above, found by the property test at seed
+/// 0x9e3779b97f4a7c15 step 241: `toggle_shuffle` re-anchors the shuffle history
+/// on the playing track but deliberately keeps a prefetched pick. When the track
+/// ends and that pick plays, it has to be anchored as the cycle's current point
+/// too — otherwise the track that just started is missing from the played set,
+/// stays in the draw pool, and Next can redraw it immediately (the property
+/// test's cycle check saw exactly that repeat).
+#[test]
+fn toggle_shuffle_mid_prefetch_anchors_the_pick_when_the_track_ends() {
+    let mut core = queue_core(4, Some(1)); // ids "0".."3", playing "1"
+    core.shuffle_history = vec![1]; // "1" has played this cycle
+    core.shuffle_cursor = 0;
+    core.pending_next = Some(2); // a crossfade drew "2" while shuffle was off
+                                 // The user turns shuffle on mid-prefetch: `toggle_shuffle` flips the mode,
+                                 // re-anchors the history on the playing track, and leaves the pin alone.
+    core.shuffle = !core.shuffle;
+    core.shuffle_history = core.current.into_iter().collect();
+    core.shuffle_cursor = 0;
+
+    let played = pick_next(&mut core, false).expect("the pinned pick");
+    advance(&mut core, played);
+    assert_eq!(played, 2, "the prefetched pick still plays");
+    assert_eq!(
+        cursor_id(&core),
+        "2",
+        "playing the pick anchors the cursor on it"
+    );
+    // The rest of the cycle is exactly the two tracks that have never played.
+    assert_eq!(play_rest(&mut core), vec!["0", "3"]);
+}
+
+/// The same sequence through the other consumer: the crossfade's fetch wins the
+/// race and `commit_crossfade` makes the pinned pick current. It needs the same
+/// anchor, which is why the commit's pure half is a function of its own.
+#[test]
+fn toggle_shuffle_mid_prefetch_anchors_the_pick_when_the_crossfade_commits() {
+    let mut core = queue_core(4, Some(1));
+    core.shuffle_history = vec![1];
+    core.shuffle_cursor = 0;
+    core.pending_next = Some(2);
+    core.shuffle = !core.shuffle; // the toggle above
+    core.shuffle_history = core.current.into_iter().collect();
+    core.shuffle_cursor = 0;
+
+    commit_crossfade(&mut core, 2);
+    assert_eq!(core.current, Some(2));
+    assert_eq!(
+        cursor_id(&core),
+        "2",
+        "committing the pick anchors the cursor on it"
+    );
+    assert_eq!(play_rest(&mut core), vec!["0", "3"]);
 }
