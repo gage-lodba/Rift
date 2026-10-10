@@ -142,14 +142,6 @@ const YTDLP_BIN: &str = "yt-dlp.exe";
 #[cfg(not(windows))]
 const YTDLP_BIN: &str = "yt-dlp";
 
-/// Resolve the yt-dlp executable to an absolute path, cached for the session.
-///
-/// GUI-launched apps don't inherit the interactive shell's `PATH` (a
-/// desktop-menu launch on Linux/macOS sees only the session `PATH`, which
-/// usually omits `~/.local/bin`), so `Command::new("yt-dlp")` finds nothing
-/// even though it works under `cargo tauri dev` from a terminal. We look in an
-/// explicit override, then `PATH`, then the usual install dirs, and fall back
-/// to the bare name so the "not found" error still reads sensibly.
 /// Upper bound on the `yt-dlp --version` probe.
 ///
 /// The probe is a local, trivial invocation, so this ceiling is not about a slow
@@ -256,25 +248,65 @@ const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/late
 /// yt-dlp publishes SHA-256 digests for every release asset here.
 const YTDLP_SUMS_ASSET: &str = "SHA2-256SUMS";
 
+/// The release base the installer installs from.
+///
+/// Production has exactly one answer, [`YTDLP_RELEASE_BASE`], compiled in. Under
+/// `cfg(test)` a test may point it at a loopback server, which is what lets the
+/// *shipped entry point itself* — rather than a near-copy of its body — drive the
+/// ordering that matters: nothing may be created or written before the digest is
+/// checked. A test-only static rather than a parameter or an environment
+/// variable, because those leave the shipped call site free to name some other
+/// source; a release build contains no override at all, so there is nothing for a
+/// user's environment, or a future edit to the wrapper, to redirect.
+fn release_base() -> String {
+    #[cfg(test)]
+    if let Some(base) = TEST_RELEASE_BASE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return base;
+    }
+    YTDLP_RELEASE_BASE.to_owned()
+}
+
+/// Test-only loopback override for [`release_base`]; see its doc.
+#[cfg(test)]
+static TEST_RELEASE_BASE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Test-only RAII handle: points [`release_base`] at `base` for as long as it
+/// lives, so a failing assertion cannot strand the override for later tests.
+///
+/// The override is process-global, so only one test at a time may drive
+/// [`download_ytdlp`]: a second concurrent test would see the loopback base.
+/// Nothing else in the suite calls it, and the guard clears it on drop.
+#[cfg(test)]
+struct ReleaseBaseOverride;
+
+#[cfg(test)]
+impl ReleaseBaseOverride {
+    fn at(base: &str) -> Self {
+        *TEST_RELEASE_BASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(base.to_owned());
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReleaseBaseOverride {
+    fn drop(&mut self) {
+        *TEST_RELEASE_BASE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 /// Download the latest yt-dlp standalone binary for this platform into
 /// `dest_dir`, mark it executable, and return its path. Used by Settings when
 /// yt-dlp isn't already installed.
 pub async fn download_ytdlp(dest_dir: &Path, http: &reqwest::Client) -> anyhow::Result<PathBuf> {
-    download_ytdlp_from(YTDLP_RELEASE_BASE, dest_dir, http).await
-}
-
-/// [`download_ytdlp`] against an arbitrary release base.
-///
-/// Split out so a test can point the installer at a loopback server and drive
-/// the real ordering — nothing may be created or written before the digest has
-/// been checked. A parameter rather than an environment variable on purpose: the
-/// shipped binary has exactly one base, compiled in, with no override a release
-/// build would honour.
-async fn download_ytdlp_from(
-    base: &str,
-    dest_dir: &Path,
-    http: &reqwest::Client,
-) -> anyhow::Result<PathBuf> {
+    let base = release_base();
     let asset = ytdlp_release_asset();
     let url = format!("{base}/{asset}");
     info!("downloading yt-dlp from {url}");
@@ -395,6 +427,13 @@ pub fn set_ytdlp_override(path: Option<PathBuf>) {
 
 /// Resolve the yt-dlp executable: the user's configured path if set and valid,
 /// otherwise the auto-detected location.
+///
+/// GUI-launched apps don't inherit the interactive shell's `PATH` (a
+/// desktop-menu launch on Linux/macOS sees only the session `PATH`, which
+/// usually omits `~/.local/bin`), so `Command::new("yt-dlp")` finds nothing
+/// even though it works under `cargo tauri dev` from a terminal. We look in an
+/// explicit override, then `PATH`, then the usual install dirs, and fall back
+/// to the bare name so the "not found" error still reads sensibly.
 fn ytdlp_path() -> PathBuf {
     if let Some(p) = CUSTOM_YTDLP
         .lock()
@@ -479,8 +518,8 @@ fn probe_ytdlp_locations() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        download_ytdlp_from, run_version_probe, safe_stem, validate_ytdlp_override,
-        ytdlp_release_asset, ProbeError, YTDLP_BIN, YTDLP_SUMS_ASSET,
+        download_ytdlp, run_version_probe, safe_stem, validate_ytdlp_override, ytdlp_release_asset,
+        ProbeError, ReleaseBaseOverride, YTDLP_BIN, YTDLP_RELEASE_BASE, YTDLP_SUMS_ASSET,
     };
 
     /// A command that keeps running far longer than any ceiling this test
@@ -678,6 +717,10 @@ mod tests {
     /// `create_dir_all` and the write leaves every other test green — this is the
     /// guard that fails.
     ///
+    /// It drives [`download_ytdlp`] itself, not a copy of its body: the loopback
+    /// base is injected through the `cfg(test)` override inside
+    /// [`super::release_base`], so the call site under test is the shipped one.
+    ///
     /// The `chmod 0o755` half is `#[cfg(unix)]` and therefore not exercised here
     /// on Windows; the unit tests cover what is platform-independent.
     #[tokio::test]
@@ -706,6 +749,7 @@ mod tests {
             ),
             (format!("/{name}"), asset.clone()),
         ]);
+        let _loopback = ReleaseBaseOverride::at(&base);
 
         let http = reqwest::Client::builder()
             .no_proxy()
@@ -716,7 +760,7 @@ mod tests {
         // digest has checked out.
         let dest = dir.join("bin");
 
-        let err = download_ytdlp_from(&base, &dest, &http)
+        let err = download_ytdlp(&dest, &http)
             .await
             .expect_err("a digest mismatch must not install");
         assert!(
@@ -728,7 +772,7 @@ mod tests {
             "the destination must not be created before the digest is checked"
         );
 
-        let err = download_ytdlp_from(&base, &dest, &http)
+        let err = download_ytdlp(&dest, &http)
             .await
             .expect_err("a manifest without this asset must not install");
         assert!(
@@ -742,7 +786,7 @@ mod tests {
 
         // The control: the same path with the right digest installs exactly the
         // served bytes, so the two refusals above are not passing vacuously.
-        let installed = download_ytdlp_from(&base, &dest, &http)
+        let installed = download_ytdlp(&dest, &http)
             .await
             .expect("a correct digest installs");
         assert_eq!(installed, dest.join(YTDLP_BIN));
@@ -759,5 +803,17 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shipped base has to be the release the checksum manifest comes from:
+    /// repointing it would verify a download against a manifest published by
+    /// whoever the new source is. Pinned here because the loopback test
+    /// deliberately overrides it, so nothing else in the suite names the value.
+    #[test]
+    fn the_installer_installs_from_the_yt_dlp_release() {
+        assert_eq!(
+            YTDLP_RELEASE_BASE,
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
+        );
     }
 }
