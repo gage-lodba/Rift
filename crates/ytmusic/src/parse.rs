@@ -657,6 +657,12 @@ fn year(node: &Value) -> Option<u16> {
     trailing_year(subtitle_runs(node)?)
 }
 
+/// The album/single/EP label a *search row's own badge* carries.
+///
+/// An exact match is right here: the badge is drawn from a small closed set of
+/// values YouTube Music emits for the row's kind, unlike the carousel shelf
+/// *title* [`album_type_from_shelf`] reads, which is server prose and so matches
+/// by prefix. An unrecognised badge yields no label rather than a guess.
 fn album_type(node: &Value) -> String {
     let runs = subtitle_runs(node);
     let first = runs
