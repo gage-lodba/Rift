@@ -26,7 +26,9 @@ pub struct PlayerCore {
     pub source: Option<String>,
     /// Ordered queue indices visited in the current shuffle cycle. Doubles as
     /// the "already played" set (so a cycle covers every track once) and as the
-    /// back/forward history for Previous/Next under shuffle.
+    /// back/forward history for Previous/Next under shuffle. Every entry names a
+    /// live queue index: each queue edit carries the list through the same
+    /// renumbering the edit applied to the queue (see `queue::remap_history`).
     pub shuffle_history: Vec<usize>,
     /// Position of the current track within `shuffle_history`. Stepping back
     /// with Previous moves it left; Next moves it right, replaying the existing

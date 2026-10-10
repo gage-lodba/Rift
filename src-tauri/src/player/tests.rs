@@ -289,6 +289,45 @@ fn queue_core(n: usize, current: Option<usize>) -> PlayerCore {
     }
 }
 
+/// Step forward `n` times the way a manual Next does, returning the ids played.
+fn skip_forward(core: &mut PlayerCore, n: usize) -> Vec<String> {
+    let mut played = Vec::new();
+    for _ in 0..n {
+        let next = pick_next(core, true).expect("a next track");
+        advance(core, next);
+        played.push(core.queue[next].id.clone());
+    }
+    played
+}
+
+/// Auto-advance through the rest of the cycle (repeat off) and return the ids
+/// played, sorted. The cycle has to end: one that keeps handing out tracks after
+/// every remaining track has had its turn is the defect these tests pin down.
+fn play_rest(core: &mut PlayerCore) -> Vec<String> {
+    let mut played = Vec::new();
+    while let Some(next) = pick_next(core, false) {
+        advance(core, next);
+        played.push(core.queue[next].id.clone());
+        assert!(played.len() < 64, "auto-advance never stopped: {played:?}");
+    }
+    played.sort_unstable();
+    played
+}
+
+/// The queue ids that have not played this cycle: neither in `played` nor the
+/// track playing now.
+fn unplayed_ids(core: &PlayerCore, played: &[String]) -> Vec<String> {
+    let current = core.current.map(|c| core.queue[c].id.clone());
+    let mut ids: Vec<String> = core
+        .queue
+        .iter()
+        .map(|t| t.id.clone())
+        .filter(|id| !played.contains(id) && Some(id) != current.as_ref())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
 #[test]
 fn pending_next_is_honoured_once_then_falls_through() {
     let mut core = PlayerCore {
@@ -360,12 +399,17 @@ fn remove_current_at_end_clamps_to_new_last() {
 #[test]
 fn remove_last_remaining_current_stops() {
     let mut core = queue_core(1, Some(0));
+    core.shuffle_history = vec![0];
     assert!(matches!(
         remove_from_queue(&mut core, 0),
         RemoveOutcome::Stop
     ));
     assert_eq!(core.current, None);
     assert!(core.queue.is_empty());
+    assert!(
+        core.shuffle_history.is_empty(),
+        "the played set goes with the queue it indexed"
+    );
 }
 
 #[test]
@@ -418,11 +462,17 @@ fn append_to_empty_queue_starts_playback() {
 #[test]
 fn insert_next_places_after_current() {
     let mut core = queue_core(3, Some(1)); // "0","1","2", playing "1"
+    core.shuffle_history = vec![0, 1];
+    core.shuffle_cursor = 1;
     let outcome = insert_next(&mut core, vec![dummy_track(9)]);
     assert!(matches!(outcome, AddOutcome::EmitOnly));
     assert_eq!(ids(&core), vec!["0", "1", "9", "2"]);
     assert_eq!(core.current, Some(1), "still playing the same track");
-    assert_eq!(core.shuffle_history, vec![1]);
+    assert_eq!(
+        core.shuffle_history,
+        vec![0, 1],
+        "the insertion is after both played entries, so neither moved"
+    );
 }
 
 #[test]
@@ -446,6 +496,183 @@ fn move_out_of_range_or_noop_is_rejected() {
     let mut core = queue_core(3, Some(0));
     assert!(!move_in_queue(&mut core, 0, 0), "no-op move");
     assert!(!move_in_queue(&mut core, 5, 1), "out of range");
+}
+
+/// The shuffle cycle is about *tracks*, not slots: a queue edit renumbers what
+/// has already played instead of forgetting it. After four of six tracks have
+/// played, removing one of them must leave exactly the two that never played
+/// before the cycle ends — the old code cleared the history here, so the draw
+/// pool was four tracks wide again and tracks heard moments ago came straight
+/// back.
+#[test]
+fn removing_a_played_track_leaves_the_rest_of_the_cycle_intact() {
+    let mut core = shuffled_core(6, 0);
+    let mut played = vec![core.queue[0].id.clone()];
+    played.extend(skip_forward(&mut core, 3));
+    // Index 0 always holds the anchor, which played first and is never the
+    // current track, so this is a removal before `current`.
+    assert!(matches!(
+        remove_from_queue(&mut core, 0),
+        RemoveOutcome::EmitOnly
+    ));
+    let expected = unplayed_ids(&core, &played);
+    assert_eq!(expected.len(), 2, "four of six tracks had played");
+    assert_eq!(play_rest(&mut core), expected);
+}
+
+/// A removal *after* the current track leaves its index alone but still
+/// renumbers the entries that shifted, so the played set survives it.
+#[test]
+fn removing_after_the_current_track_keeps_the_played_set() {
+    // Queue ids "0".."5" (the ids match their indices, so the history reads as
+    // tracks): this cycle played "3", then "5", then jumped back to "1".
+    let mut core = queue_core(6, Some(1));
+    core.shuffle = true;
+    core.shuffle_history = vec![3, 5, 1];
+    core.shuffle_cursor = 2;
+    assert!(matches!(
+        remove_from_queue(&mut core, 3),
+        RemoveOutcome::EmitOnly
+    ));
+    assert_eq!(core.current, Some(1), "current is unchanged");
+    assert_eq!(ids(&core), vec!["0", "1", "2", "4", "5"]);
+    let played = vec!["3".to_owned(), "5".to_owned(), "1".to_owned()];
+    let expected = unplayed_ids(&core, &played);
+    assert_eq!(play_rest(&mut core), expected);
+}
+
+/// Removing the playing track hands the caller the index that took its slot,
+/// which `play_index` anchors. The already-played tracks stay in the cycle, so
+/// only the replacement and the never-played tracks are left.
+#[test]
+fn removing_the_playing_track_replaces_it_without_restarting_the_cycle() {
+    // Played "0", then "2", then jumped to "4".
+    let mut core = queue_core(6, Some(4));
+    core.shuffle = true;
+    core.shuffle_history = vec![0, 2, 4];
+    core.shuffle_cursor = 2;
+    let RemoveOutcome::PlayIndex(i) = remove_from_queue(&mut core, 4) else {
+        panic!("removing the playing track must name a replacement");
+    };
+    assert_eq!(i, 4, "the track that took its slot");
+    jump(&mut core, i); // what `queue_remove`'s PlayIndex arm does
+    assert_eq!(core.queue[i].id, "5");
+    let played = vec!["0".to_owned(), "2".to_owned(), "4".to_owned()];
+    let expected = unplayed_ids(&core, &played);
+    assert_eq!(play_rest(&mut core), expected);
+}
+
+/// The one case where removing the playing track can put an already-played
+/// track back on: the replacement is the new last track, and that has played. It
+/// re-anchors at its place in the order, so Next replays the track that followed
+/// it before drawing the never-played ones — the same rule a direct jump follows
+/// — and the cycle still ends after those two.
+#[test]
+fn removing_the_last_playing_track_replays_from_its_place_in_the_order() {
+    let mut core = queue_core(6, Some(5));
+    core.shuffle = true;
+    core.shuffle_history = vec![0, 4, 1, 5];
+    core.shuffle_cursor = 3;
+    let RemoveOutcome::PlayIndex(i) = remove_from_queue(&mut core, 5) else {
+        panic!("removing the playing track must name a replacement");
+    };
+    assert_eq!(i, 4, "clamped to the new last track");
+    jump(&mut core, i); // "4" already played, so the cursor steps back to it
+    assert_eq!(play_rest(&mut core), vec!["1", "2", "3"]);
+}
+
+/// Insert-next renumbers everything past the insertion point, so the played set
+/// has to move with it; only the never-played tracks and the insert are left.
+#[test]
+fn inserting_next_keeps_the_rest_of_the_cycle() {
+    let mut core = shuffled_core(6, 0);
+    let mut played = vec![core.queue[0].id.clone()];
+    played.extend(skip_forward(&mut core, 3));
+    let cur = core.current.unwrap();
+    assert!(matches!(
+        insert_next(&mut core, vec![dummy_track(9)]),
+        AddOutcome::EmitOnly
+    ));
+    assert_eq!(
+        core.queue[cur + 1].id,
+        "9",
+        "lands right after the current track"
+    );
+    let expected = unplayed_ids(&core, &played);
+    assert_eq!(expected.len(), 3, "two never played plus the insert");
+    assert_eq!(play_rest(&mut core), expected);
+}
+
+/// A played track that sits *after* the insertion point is renumbered with the
+/// queue, so Previous still walks back to the track that actually played.
+#[test]
+fn insert_next_shifts_played_entries_past_the_current_track() {
+    // Played "4", then jumped back to "2"; "4" sits at index 4, past the insert.
+    let mut core = queue_core(6, Some(2));
+    core.shuffle = true;
+    core.shuffle_history = vec![4, 2];
+    core.shuffle_cursor = 1;
+    assert!(matches!(
+        insert_next(&mut core, vec![dummy_track(9)]),
+        AddOutcome::EmitOnly
+    ));
+    assert_eq!(ids(&core), vec!["0", "1", "2", "9", "3", "4", "5"]);
+    core.position = 0.0;
+    let prev = pick_prev(&mut core).expect("a previous track");
+    assert_eq!(
+        core.queue[prev].id, "4",
+        "the track that played before the current one"
+    );
+}
+
+/// A move permutes the queue; the cycle is about tracks, so it survives every
+/// reordering — the rest of the cycle is still exactly the tracks that never
+/// played, whichever way the queue was reshuffled.
+#[test]
+fn moving_any_track_keeps_the_rest_of_the_cycle_intact() {
+    for (from, to) in [(0, 5), (5, 0), (3, 1), (1, 4)] {
+        let mut core = shuffled_core(6, 0);
+        let mut played = vec![core.queue[0].id.clone()];
+        played.extend(skip_forward(&mut core, 3));
+        assert!(move_in_queue(&mut core, from, to));
+        let expected = unplayed_ids(&core, &played);
+        assert_eq!(expected.len(), 2, "four of six tracks had played");
+        assert_eq!(play_rest(&mut core), expected, "move {from} → {to}");
+    }
+
+    // Moving the playing track itself: it stays current (by identity, wherever
+    // it lands) and the cycle is still intact around it.
+    let mut core = shuffled_core(6, 0);
+    let mut played = vec![core.queue[0].id.clone()];
+    played.extend(skip_forward(&mut core, 3));
+    let cur = core.current.unwrap();
+    assert!(move_in_queue(&mut core, cur, 0));
+    assert_eq!(core.current, Some(0), "current follows the moved track");
+    let expected = unplayed_ids(&core, &played);
+    assert_eq!(play_rest(&mut core), expected, "the current track moved");
+}
+
+/// Previous walks back through the tracks that really played, in order, even
+/// when the queue was reordered under it.
+#[test]
+fn a_move_keeps_previous_walking_the_real_play_order() {
+    let mut core = shuffled_core(6, 0);
+    let mut played = vec![core.queue[0].id.clone()];
+    played.extend(skip_forward(&mut core, 3));
+    // Reorder the queue out from under the history: last track to the front.
+    assert!(move_in_queue(&mut core, 5, 0));
+    let mut back = Vec::new();
+    for _ in 0..3 {
+        core.position = 0.0;
+        let prev = pick_prev(&mut core).expect("a previous track");
+        advance(&mut core, prev);
+        back.push(core.queue[prev].id.clone());
+    }
+    assert_eq!(
+        back,
+        vec![played[2].clone(), played[1].clone(), played[0].clone()],
+        "Previous retraces the played order in reverse"
+    );
 }
 
 /// The seek bar's length while a track's stream is being fetched. `fetch_track`
