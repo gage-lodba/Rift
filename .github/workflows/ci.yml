@@ -109,16 +109,39 @@ jobs:
         with:
           tool: wasm-bindgen-cli@0.2.128
 
+      # `cargo tauri build --no-bundle` further down is a cargo *subcommand*:
+      # cargo resolves it to a `cargo-tauri` binary on PATH (or beside cargo
+      # itself), and nothing else here provides one — the hosted runners do not
+      # ship it, and it is not a dependency of this workspace (`tauri-cli`
+      # appears in no manifest and in no Cargo.lock). Without this step that
+      # build stops at its first line with "no such command: tauri" (exit 101)
+      # before compiling anything.
+      #
+      # A developer machine hides exactly that: a previous `cargo install
+      # tauri-cli` leaves `cargo-tauri` in ~/.cargo/bin, so the same command
+      # succeeds locally and fails here.
+      #
+      # `tauri-cli` is not one of install-action's managed tools, so this goes
+      # through its cargo-binstall fallback, which reads the binstall metadata
+      # the crate publishes (`cargo-tauri-<target>.tgz`/`.zip` attached to the
+      # `tauri-cli-v<version>` release) and, where no archive matches the
+      # runner's target — aarch64-apple-darwin, i.e. macos-15 — falls back to
+      # compiling it. Pinned to the `tauri` version Cargo.lock resolves, so the
+      # CLI driving the build is the one the app is linked against.
+      - name: Install tauri-cli
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: tauri-cli@2.11.5
+
       # The DOM the frontend's renderer tests mount into. A Node-side dependency
       # of the *test harness only* — `trunk build` never runs Node, and nothing
       # here reaches the wasm or the shipped bundle (ui/package.json says so).
       #
       # `npm ci` rather than `npm install` so the lockfile decides, which is the
       # same reason Cargo.lock is committed and `--locked` is used everywhere
-      # else in this file. Skipped on Windows with the test step below, since
-      # the suite cannot run there at all.
+      # else in this file. Every OS installs it: the suite below runs on all
+      # three, so all three need the DOM.
       - name: Install the frontend test harness's DOM
-        if: runner.os != 'Windows'
         working-directory: ui
         run: npm ci
 
@@ -126,9 +149,11 @@ jobs:
       # need, before anything compiles. Its two failure modes are a jsdom that
       # cannot load and a shim that loads without installing the globals — and
       # both otherwise surface as a `web-sys` panic that names a missing global
-      # rather than this file.
+      # rather than this file. Worth its second on every OS: the value that
+      # loads the shim lives in `.cargo/config.toml`'s `[env]` table, and if it
+      # is ever written in a form Cargo rewrites the shim silently stops loading
+      # (that file records the trap).
       - name: Check the DOM shim
-        if: runner.os != 'Windows'
         working-directory: ui
         run: node scripts/check-dom-shim.cjs
 
@@ -142,20 +167,24 @@ jobs:
         run: cargo clippy -p rift-ui --target wasm32-unknown-unknown --locked -- -D warnings
 
       # The frontend's tests, run on Node via wasm-bindgen-test-runner (wired up
-      # by the runner entry in .cargo/config.toml). They cover the IPC boundary's
-      # argument shapes, the reorder index math, and App's pure decisions — not
-      # rendering, and not computed style; see ui/README.md for what is
+      # by the runner entry and the `[env]` table in .cargo/config.toml). They
+      # cover the IPC boundary's argument shapes, the reorder index math, App's
+      # pure decisions, and the renderer itself through the DOM shim — not
+      # computed style, which needs a layout engine; see ui/README.md for what is
       # deliberately outside this harness.
       #
-      # Skipped on Windows, and not because it is untested there: it cannot run
-      # there at all. `wasm-bindgen-test-runner` 0.2.128 writes the benchmark
-      # path into the generated Node script with `Path::display()`, so on
-      # Windows it emits `'C:\Users\...'` inside a JS single-quoted string and
-      # Node dies parsing `\U` as an escape before a single test runs. That is
-      # a fixed defect in the runner, not in this repository, and the tests are
-      # platform-independent — the same wasm binary runs on either OS.
+      # Runs on all three operating systems, and that is the point: the DOM shim,
+      # the `NODE_OPTIONS` value that loads it, and the renderer tests are now
+      # exercised on every platform instead of on two of three. It could not
+      # always. `wasm-bindgen-test-runner` 0.2.128 writes the benchmark path into
+      # the generated Node script with `Path::display()` inside a *single-quoted*
+      # JS string, so on Windows it emitted `'C:\Users\...'` and Node rejected the
+      # file while parsing it — `\ui`, the package directory, is an invalid
+      # escape; `\U` is not (JS accepts it as a NonEscapeCharacter, exactly as it
+      # accepts `\Users`). `.cargo/config.toml` sidesteps it by pinning
+      # `WASM_BINDGEN_BENCH_RESULT` to a relative path, which keeps the literal
+      # free of backslashes. The upstream defect is real and unfixed there.
       - name: Test (frontend / wasm)
-        if: runner.os != 'Windows'
         run: cargo test -p rift-ui --target wasm32-unknown-unknown --locked
 
       - name: Clippy (backend)
@@ -178,7 +207,8 @@ jobs:
       # (icons, mainBinaryName, NSIS/WiX prerequisites) are otherwise exercised
       # only on a tag push, which surfaces a malformed icon or a bad
       # `targets: "all"` at release time on the wrong commit. `--no-bundle`
-      # keeps it to a compile, so no packaging toolchain is needed.
+      # keeps it to a compile, so no packaging toolchain is needed — but the
+      # CLI itself is, and is installed above.
       - name: Build the app (no bundle)
         working-directory: src-tauri
         run: cargo tauri build --no-bundle

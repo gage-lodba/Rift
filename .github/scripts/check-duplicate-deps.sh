@@ -19,6 +19,11 @@
 # of them coming back fails the build.
 #
 # To see the full picture: cargo tree -d --locked
+#
+# Run this where `cargo` is on PATH and the workspace resolves. Invoking it from
+# PowerShell on Windows resolves `bash` to WSL's, which has no cargo, and a
+# `CARGO_HOME` without the registry cannot resolve the lockfile either; both used
+# to exit silently (see the capture below).
 set -euo pipefail
 
 baseline=$(cat <<'EOF'
@@ -53,7 +58,25 @@ EOF
 
 # "<crate> <version>" per distinct version, skipping the repeated
 # feature-split nodes.
-current=$(cargo tree -d --locked 2>/dev/null |
+#
+# The capture is not cosmetic. `cargo tree` fails wherever cargo cannot resolve
+# the workspace — WSL's bash has no cargo at all, and a `CARGO_HOME` without the
+# registry cannot read the lockfile — and with `set -euo pipefail` plus stderr
+# sent to /dev/null that failure was *silent*: the pipeline died and the script
+# exited 1 having printed nothing, which reads exactly like a guard that never
+# ran. Failing without saying why is the shape this whole script exists to catch,
+# so the invocation is captured and checked first.
+status=0
+tree_output=$(cargo tree -d --locked) || status=$?
+if [ "$status" -ne 0 ]; then
+  echo "::error::'cargo tree -d --locked' failed (exit $status). This guard needs cargo on PATH and a"
+  echo "::error::resolvable workspace; run it from the repository root with that toolchain's shell."
+  echo "::error::On Windows that means Git Bash, not WSL's bash — WSL has no cargo. Nothing about the"
+  echo "::error::dependency graph was checked."
+  exit 1
+fi
+
+current=$(echo "$tree_output" |
   grep -E '^[a-zA-Z0-9_-]+ v[0-9]' |
   sed -E 's/^([a-zA-Z0-9_-]+) (v[0-9][^ ]*).*/\1 \2/' |
   sort -u |
