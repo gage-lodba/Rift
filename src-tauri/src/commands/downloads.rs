@@ -134,28 +134,34 @@ fn partition_retryable(
     (retry, dropped)
 }
 
-/// Split the failed batch, then release the tracks that did not survive it.
+/// Split the failed batch, release the tracks that did not survive it, and hand
+/// the resulting state to `announce` when anything was given up on.
 ///
-/// The split and the release are one decision, so they are one function: a
-/// caller that can take `retry` without acting on `dropped` is the defect
-/// itself. A dropped track is not merely un-queued — the failed pass called
-/// `downloads.fail` on it, which releases the in-flight claim but leaves it with
-/// no offline copy and no record of what happened. Its row would then look like
-/// a track the user never downloaded, with no retry on offer, and nothing would
-/// revisit it: the playlist was edited out from under it, which is why it was
-/// dropped. Marking it failed puts the manual retry back on the row.
+/// The split, the release and the announcement are one decision, so they are one
+/// function: a caller that can take `retry` without acting on `dropped` is the
+/// defect itself. A dropped track is not merely un-queued — the failed pass
+/// called `downloads.fail` on it, which releases the in-flight claim but leaves
+/// it with no offline copy and no record of what happened. Its row would then
+/// look like a track the user never downloaded, with no retry on offer, and
+/// nothing would revisit it: the playlist was edited out from under it, which is
+/// why it was dropped. Marking it failed puts the manual retry back on the row.
 ///
-/// Takes the store rather than an `AppHandle` so the released state can be
-/// driven for real in a test; emitting that state and logging stay with the
-/// caller, which is what the returned ids are for.
+/// The announcement is a callback rather than the caller's job because a release
+/// the UI is never told about is invisible: the row keeps offering nothing until
+/// some later, unrelated emit happens to carry the state. Taking the store and a
+/// closure (rather than the `AppHandle`) is what lets a test drive both halves.
 fn partition_and_release(
     downloads: &Downloads,
     failed: Vec<Track>,
     is_kept_offline: impl Fn(&str) -> bool,
+    announce: impl FnOnce(&rift_types::DownloadState),
 ) -> (Vec<Track>, Vec<String>) {
     let (retry, dropped) = partition_retryable(failed, is_kept_offline);
     for id in &dropped {
         downloads.mark_failed(id);
+    }
+    if !dropped.is_empty() {
+        announce(&downloads.state());
     }
     (retry, dropped)
 }
@@ -311,10 +317,13 @@ fn start_downloads_attempt(
         // The playlist may have been un-marked or edited during the wait; keep
         // only the tracks it still depends on, and give up on the rest.
         let batch = failed.clone();
-        let (retry, dropped) =
-            partition_and_release(&downloads, failed, |t| kept_offline(&app, t, &batch));
+        let (retry, dropped) = partition_and_release(
+            &downloads,
+            failed,
+            |t| kept_offline(&app, t, &batch),
+            |state| emit_downloads(&app, state),
+        );
         if !dropped.is_empty() {
-            emit_downloads(&app, &downloads.state());
             info!(
                 "gave up on {} kept-offline download(s) whose playlist no longer needs them",
                 dropped.len()
@@ -403,12 +412,16 @@ mod tests {
         assert!(!playlist_kept_offline(&pls, downloaded, "z", in_batch));
     }
 
-    /// The regression guard for the leaked in-flight claim. A track dropped from
-    /// the retry set must be *reported* as dropped, because each one still holds
-    /// the claim `downloads.fail` left on it — the caller releases it there, and
-    /// without that the row spins on "downloading" forever with no retry offered.
+    /// The regression guard for the dropped half of the split: the ids that did
+    /// not survive the requeue rule must come *back* to the caller rather than
+    /// being filtered away, because the release and the failure record both
+    /// happen outside this function. There is no claim left to release —
+    /// `downloads.fail` removed it already — so what is missing without the
+    /// returned ids is the record that lets the row offer a retry at all.
+    /// [`partition_and_release`] is the caller that acts on them, and the test
+    /// below drives it through a real [`Downloads`].
     #[test]
-    fn a_track_dropped_from_the_retry_set_is_reported_so_its_claim_can_be_released() {
+    fn a_track_dropped_from_the_retry_set_is_reported_rather_than_filtered_away() {
         let failed = vec![track("keep"), track("drop")];
         let (retry, dropped) = partition_retryable(failed, |id| id == "keep");
 
@@ -433,15 +446,20 @@ mod tests {
     }
 
     /// The other half of M3, and the one the split tests above cannot see: the
-    /// tracks the split gives up on have to be *released* in the store. Deleting
-    /// that release used to leave the whole suite green, because the tests
-    /// stopped at `partition_retryable` and never touched the store — so this
-    /// drives the call path the job actually uses, through a real [`Downloads`].
+    /// tracks the split gives up on have to be *recorded as failed* in the store
+    /// and *announced* to the UI. The in-flight claim was already released by
+    /// `fail`, so without the record the row is indistinguishable from one the
+    /// user never downloaded; without the announcement the row keeps looking
+    /// that way until some later, unrelated emit happens to carry the state.
+    /// Deleting either used to leave the whole suite green, because the tests
+    /// stopped at `partition_retryable` and never touched the store or the
+    /// callback — so this drives the call path the job actually uses, through a
+    /// real [`Downloads`].
     ///
     /// The state is the exact one the retry pass leaves a track in: claimed, then
     /// released by `fail` for a requeue that the playlist edit then cancelled.
     #[test]
-    fn a_track_dropped_from_the_retry_set_is_released_rather_than_silently_forgotten() {
+    fn a_track_dropped_from_the_retry_set_is_recorded_and_announced() {
         let dir = crate::util::testing::TempDir::new("dropped-claim");
         let downloads = Downloads::load(dir.path().to_path_buf());
         for id in ["kept", "drop"] {
@@ -449,10 +467,24 @@ mod tests {
             downloads.fail(id);
         }
 
-        let (retry, dropped) =
-            partition_and_release(&downloads, vec![track("kept"), track("drop")], |id| {
-                id == "kept"
-            });
+        let mut announced = false;
+        let (retry, dropped) = partition_and_release(
+            &downloads,
+            vec![track("kept"), track("drop")],
+            |id| id == "kept",
+            |state| {
+                announced = true;
+                assert!(
+                    !state.downloading.iter().any(|id| id == "drop"),
+                    "no in-flight claim may be left behind"
+                );
+                assert!(
+                    state.failed.iter().any(|id| id == "drop"),
+                    "the row must offer a manual retry, not look like a track that was never \
+                     downloaded"
+                );
+            },
+        );
 
         assert_eq!(
             retry.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
@@ -460,24 +492,32 @@ mod tests {
             "the still-kept-offline track is requeued"
         );
         assert_eq!(dropped, ["drop"]);
+        assert!(
+            announced,
+            "the give-up has to reach the UI, or the retry affordance never appears"
+        );
 
-        let state = downloads.state();
-        assert!(
-            !state.downloading.iter().any(|id| id == "drop"),
-            "no in-flight claim may be left behind"
-        );
-        assert!(
-            state.failed.iter().any(|id| id == "drop"),
-            "the dropped row must offer a manual retry, not look like a track that was never \
-             downloaded"
-        );
         assert!(
             downloads.begin("drop"),
-            "and that retry must be able to claim it again"
+            "the announced retry must be able to claim it again"
         );
         assert!(
             !downloads.state().failed.iter().any(|id| id == "drop"),
             "re-attempting clears the failed mark"
+        );
+
+        // Nothing dropped means nothing changed for the UI to hear about.
+        let mut announced_again = false;
+        let (_, nothing) = partition_and_release(
+            &downloads,
+            vec![track("kept")],
+            |_| true,
+            |_| announced_again = true,
+        );
+        assert!(nothing.is_empty());
+        assert!(
+            !announced_again,
+            "an unchanged state must not be re-emitted"
         );
 
         // The kept track is untouched: the requeue below re-claims it.
