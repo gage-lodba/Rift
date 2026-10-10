@@ -4,6 +4,7 @@ use rift_types::QueueSnapshot;
 use yew::prelude::*;
 
 use super::icons::{cover, icon};
+use super::key_on_nested_control;
 use super::reorder::use_reorder;
 
 #[derive(Properties, PartialEq)]
@@ -32,6 +33,11 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
         Callback::from(move |_: MouseEvent| flip.emit(()))
     };
     let toggle_key = Callback::from(move |e: KeyboardEvent| {
+        // "Clear queue" is a button inside this header; Enter on it is its own
+        // key, not a collapse. See `key_on_nested_control`.
+        if key_on_nested_control(&e) {
+            return;
+        }
         if e.key() == "Enter" || e.key() == " " {
             e.prevent_default();
             flip.emit(());
@@ -81,6 +87,11 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
                             Callback::from(move |_: MouseEvent| jump.emit(()))
                         };
                         let onkeydown = Callback::from(move |e: KeyboardEvent| {
+                            // The row's own remove button keeps its keys: Enter
+                            // there removes the row, it does not jump to it.
+                            if key_on_nested_control(&e) {
+                                return;
+                            }
                             if e.key() == "Enter" || e.key() == " " {
                                 e.prevent_default();
                                 jump.emit(());

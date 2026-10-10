@@ -1047,9 +1047,10 @@ input[type="range"] { accent-color: var(--accent); }
    There was no focus style anywhere in the app and four blanket
    `outline: none` declarations, so a keyboard user could not see where they
    were. `:focus-visible` restores an indicator for keyboard navigation while
-   leaving mouse users the clean look the `outline: none`s were for. The
-   element-level rules below are only needed where a component sets its own
-   `outline: none`, since that would otherwise win on specificity ties. */
+   leaving mouse users the clean look the `outline: none`s were for. Only
+   `.searchbox input` needs an element-level override (its selector outranks
+   `:focus-visible`); the rules after it exist for the inset offset and for the
+   controls that `:hover` alone used to reveal. */
 
 :focus-visible {
   outline: 2px solid var(--focus);
@@ -1057,18 +1058,37 @@ input[type="range"] { accent-color: var(--accent); }
   border-radius: 4px;
 }
 
-/* Inputs suppress the outline because the wrapper draws the focus ring; keep
-   that intent but make the wrapper show it. */
+/* `.searchbox` is the one input whose focus ring is drawn by its wrapper, so it
+   keeps the suppression and the wrapper shows the ring. The other three inputs
+   (`.side-new-input`, `.rename-input`, `.ytdlp-input`) need no rule here: their
+   own `outline: none` sits earlier in this file, and this block's
+   `:focus-visible` wins that specificity tie, so they get the standard ring.
+   Listing them here as well suppressed the ring on fields that have no wrapper
+   to draw one. */
 .searchbox:focus-within {
   border-color: var(--focus);
   box-shadow: 0 0 0 1px var(--focus);
 }
-.searchbox input:focus-visible,
-.side-new-input:focus-visible,
-.rename-input:focus-visible,
-.ytdlp-input:focus-visible {
+.searchbox input:focus-visible {
   outline: none;
 }
+
+/* Controls revealed by `:hover` are invisible to a keyboard user even though
+   they are in the tab order: `opacity: 0` hides the focus ring with the button,
+   and `.side-kebab`'s `display: none` takes it out of the tab order entirely —
+   so a playlist's menu could not be opened from the keyboard at all. Reveal
+   each control for the element that actually holds focus. */
+.trow-actions .menu-anchor:focus-within,
+.card-menu:focus-within,
+.trow-dl .ibtn:focus-visible,
+.qrow .ibtn:focus-visible {
+  opacity: 1;
+}
+
+/* The same swap `:hover` does, so focusing a playlist shows its kebab instead
+   of the song count and the row cannot grow around the outline. */
+.side-item:focus-within .side-kebab { display: inline-flex; }
+.side-item:focus-within .side-count { display: none; }
 
 /* Rows and cards are focusable containers; an inset ring reads better than one
    that bleeds into the neighbouring row. */

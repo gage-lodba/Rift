@@ -6,6 +6,7 @@ use rift_types::{DownloadState, Track};
 use yew::prelude::*;
 
 use super::icons::{artist_links, cover, fmt_secs, icon};
+use super::key_on_nested_control;
 use super::menu::{Menu, MenuAction};
 
 /// Per-render context shared by every track list on screen: the id sets that
@@ -147,6 +148,12 @@ fn track_row(props: &TrackRowProps) -> Html {
         Callback::from(move |_: MouseEvent| activate.emit(()))
     };
     let onkeydown = Callback::from(move |e: KeyboardEvent| {
+        // Enter/Space on the row's own buttons (like, kebab, download, album
+        // link) is theirs: activating the row here would both play the track
+        // and swallow their click. See `key_on_nested_control`.
+        if key_on_nested_control(&e) {
+            return;
+        }
         if e.key() == "Enter" || e.key() == " " {
             e.prevent_default();
             activate.emit(());

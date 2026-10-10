@@ -46,7 +46,10 @@ pub fn cover(url: &str, class: &'static str) -> Html {
     if url.is_empty() {
         html! { <div class={classes!(class, "cover-fallback")}>{ icon("music") }</div> }
     } else {
-        html! { <img class={class} src={url.to_string()} loading="lazy" /> }
+        // `alt=""`: the artwork is decorative — the album/artist/track name it
+        // sits beside is the accessible text, and without an alt a screen
+        // reader reads out the URL instead.
+        html! { <img class={class} src={url.to_string()} alt="" loading="lazy" /> }
     }
 }
 
@@ -61,6 +64,13 @@ pub fn logo_mark() -> Html {
 /// Render a track's artist credits, each one a profile link where YouTube
 /// provides a channel ID. Falls back to the plain joined string for tracks
 /// saved before per-artist credits existed.
+///
+/// A credit is a real `<button class="link">` rather than a `<span>`: `.link`
+/// resets the button chrome (see styles.css), which is what keeps it reading as
+/// the plain text it sits between, and the element itself is what puts the
+/// credit in the tab order with Enter/Space activation. As a span it was
+/// pointer-only, so an artist page was unreachable from a track row without a
+/// mouse.
 pub fn artist_links(artists: &[ArtistRef], fallback: &str, on_open: &Callback<String>) -> Html {
     if artists.is_empty() {
         return html! { { fallback.to_string() } };
@@ -80,7 +90,7 @@ pub fn artist_links(artists: &[ArtistRef], fallback: &str, on_open: &Callback<St
                     <>
                         if i > 0 { { ", " } }
                         if let Some(link) = link {
-                            <span class="link" onclick={link}>{ name }</span>
+                            <button class="link" onclick={link}>{ name }</button>
                         } else {
                             { name }
                         }

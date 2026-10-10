@@ -74,9 +74,10 @@ pub fn settings_view(props: &SettingsProps) -> Html {
             let ytdlp = ytdlp.clone();
             ytdlp.set(None);
             spawn_local(async move {
-                let status = api::invoke::<YtDlpStatus>("check_ytdlp", &json!({}))
-                    .await
-                    .unwrap_or_default();
+                // `invoke_or_default`, not a bare `unwrap_or_default`: a
+                // rejected probe used to render as "✗ Not found", telling the
+                // user yt-dlp is missing when the command itself had failed.
+                let status = api::invoke_or_default::<YtDlpStatus>("check_ytdlp", &json!({})).await;
                 ytdlp.set(Some(status));
             });
         })
@@ -118,10 +119,15 @@ pub fn settings_view(props: &SettingsProps) -> Html {
             let value = (*path_draft).clone();
             ytdlp.set(None);
             spawn_local(async move {
-                let status =
-                    api::invoke::<YtDlpStatus>("set_yt_dlp_path", &json!({ "path": value }))
-                        .await
-                        .unwrap_or_default();
+                // The rejection here is the *interesting* half: the backend
+                // validates the override (absolute, canonicalized, a regular
+                // file), and its message said why. It reaches the toast now
+                // instead of being replaced by a "not found" status.
+                let status = api::invoke_or_default::<YtDlpStatus>(
+                    "set_yt_dlp_path",
+                    &json!({ "path": value }),
+                )
+                .await;
                 ytdlp.set(Some(status));
             });
         })
@@ -139,9 +145,8 @@ pub fn settings_view(props: &SettingsProps) -> Html {
             let path_draft = path_draft.clone();
             downloading.set(true);
             spawn_local(async move {
-                let status = api::invoke::<YtDlpStatus>("download_ytdlp", &json!({}))
-                    .await
-                    .unwrap_or_default();
+                let status =
+                    api::invoke_or_default::<YtDlpStatus>("download_ytdlp", &json!({})).await;
                 if let Some(p) = &status.path {
                     path_draft.set(p.clone());
                 }
@@ -196,6 +201,11 @@ pub fn settings_view(props: &SettingsProps) -> Html {
                     class={classes!("switch", props.discord_rpc.then_some("on"))}
                     role="switch"
                     aria-checked={props.discord_rpc.to_string()}
+                    // The switch renders as an empty track and knob, and the
+                    // "Discord Rich Presence" text beside it is a plain `div`,
+                    // not a `<label>`: without this the control has no
+                    // accessible name at all.
+                    aria-label="Discord Rich Presence"
                     onclick={on_discord}>
                     <span class="switch-knob" />
                 </button>
@@ -215,6 +225,8 @@ pub fn settings_view(props: &SettingsProps) -> Html {
                                 max={MAX_CROSSFADE.to_string()}
                                 step="1"
                                 value={props.crossfade.to_string()}
+                                aria-label="Crossfade duration"
+                                aria-valuetext={format!("{} seconds", props.crossfade.round() as i32)}
                                 oninput={on_crossfade_slider} />
                             <span class="crossfade-value">
                                 { format!("{}s", props.crossfade.round() as i32) }
@@ -226,6 +238,7 @@ pub fn settings_view(props: &SettingsProps) -> Html {
                     class={classes!("switch", crossfade_on.then_some("on"))}
                     role="switch"
                     aria-checked={crossfade_on.to_string()}
+                    aria-label="Crossfade"
                     onclick={on_crossfade_toggle}>
                     <span class="switch-knob" />
                 </button>
@@ -275,6 +288,7 @@ pub fn settings_view(props: &SettingsProps) -> Html {
                     class={classes!("switch", props.update_notifications.then_some("on"))}
                     role="switch"
                     aria-checked={props.update_notifications.to_string()}
+                    aria-label="Update notifications"
                     onclick={on_update_toggle}>
                     <span class="switch-knob" />
                 </button>

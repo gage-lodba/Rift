@@ -190,8 +190,12 @@ pub fn menu(props: &MenuProps) -> Html {
                             };
                             html! {
                                 <>
+                                    // `data-action-index` is how ArrowRight maps
+                                    // the focused item back to the action it
+                                    // expands; see `focused_submenu`.
                                     <div class="menu-item" role="menuitem" tabindex="0"
                                          aria-haspopup="true" aria-expanded={is_open.to_string()}
+                                         data-action-index={i.to_string()}
                                          onclick={toggle} {onkeydown}>
                                         { icon(ic) }<span>{ label }</span>
                                         <span class="menu-caret">{ if is_open { "▾" } else { "▸" } }</span>
@@ -259,7 +263,19 @@ fn focused_submenu(container: &NodeRef) -> Option<usize> {
     let list = root.query_selector_all("[aria-haspopup=\"true\"]").ok()?;
     (0..list.length()).find_map(|i| {
         let node = list.item(i)?;
-        node.is_same_node(Some(&active)).then_some(i as usize)
+        if !node.is_same_node(Some(&active)) {
+            return None;
+        }
+        // Read the action index off the element rather than using `i`: this
+        // query only sees the submenus, so a submenu's position here is not its
+        // position in `actions` whenever a plain item precedes it — which is
+        // every menu in the app. Using `i` made ArrowRight expand a different
+        // entry than the focused one, or (with a single submenu) nothing at all.
+        node.dyn_into::<web_sys::Element>()
+            .ok()?
+            .get_attribute("data-action-index")?
+            .parse()
+            .ok()
     })
 }
 

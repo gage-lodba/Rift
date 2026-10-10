@@ -331,7 +331,13 @@ pub fn app() -> Html {
                             });
                         }
                     }
-                    Err(e) => web_sys::console::error_1(&format!("bootstrap: {e}").into()),
+                    // A bootstrap failure leaves an empty app; the toast is the
+                    // only thing that can say why. The sink is installed above,
+                    // before this future is spawned.
+                    Err(e) => {
+                        web_sys::console::error_1(&format!("bootstrap: {e}").into());
+                        api::report_error(format!("bootstrap: {e}"));
+                    }
                 }
             });
             || {}
@@ -595,21 +601,33 @@ pub fn app() -> Html {
         let query = search.query.clone();
         let toast = toast.clone();
         let toast_gen = toast_gen.clone();
+        let search_gen = search_gen.clone();
         Callback::from(move |t: SearchTab| {
             search_tab.set(t);
+            // These fetches follow the current search rather than starting one,
+            // so they capture its token instead of bumping it: a response that
+            // lands after a newer query (or after the box was cleared) would
+            // otherwise fill the tab with the *previous* query's results, under
+            // the new query's heading. The songs search guards itself the same
+            // way; this is the same race one level down.
+            let token = *search_gen.borrow();
             match t {
                 SearchTab::Artists if artist_results.is_none() => {
                     let results = artist_results.clone();
                     let query = query.clone();
                     let toast = toast.clone();
                     let toast_gen = toast_gen.clone();
+                    let search_gen = search_gen.clone();
                     spawn_local(async move {
-                        match api::invoke::<Vec<ArtistSummary>>(
+                        let result = api::invoke::<Vec<ArtistSummary>>(
                             "search_artists",
                             &json!({ "query": query }),
                         )
-                        .await
-                        {
+                        .await;
+                        if *search_gen.borrow() != token {
+                            return; // superseded by a newer search
+                        }
+                        match result {
                             Ok(v) => results.set(Some(v)),
                             Err(e) => {
                                 show_toast(toast, toast_gen, e, 6000);
@@ -623,13 +641,17 @@ pub fn app() -> Html {
                     let query = query.clone();
                     let toast = toast.clone();
                     let toast_gen = toast_gen.clone();
+                    let search_gen = search_gen.clone();
                     spawn_local(async move {
-                        match api::invoke::<Vec<AlbumSummary>>(
+                        let result = api::invoke::<Vec<AlbumSummary>>(
                             "search_albums",
                             &json!({ "query": query }),
                         )
-                        .await
-                        {
+                        .await;
+                        if *search_gen.borrow() != token {
+                            return; // superseded by a newer search
+                        }
+                        match result {
                             Ok(v) => results.set(Some(v)),
                             Err(e) => {
                                 show_toast(toast, toast_gen, e, 6000);
@@ -667,9 +689,11 @@ pub fn app() -> Html {
             let update_status = update_status.clone();
             update_status.set(None);
             spawn_local(async move {
-                let status = api::invoke::<UpdateStatus>("check_update", &json!({}))
-                    .await
-                    .unwrap_or_default();
+                // A rejection still resolves the status line (its `default`
+                // renders as "could not reach GitHub") but the reason itself
+                // reaches the user through the toast.
+                let status =
+                    api::invoke_or_default::<UpdateStatus>("check_update", &json!({})).await;
                 update_status.set(Some(status));
             });
         })
@@ -1191,7 +1215,12 @@ pub fn app() -> Html {
                     <>
                         <div class="view-head">
                             if let Some(draft) = editing {
+                                // Labelled for screen readers: the input replaces
+                                // the `<h2>` holding the playlist's name, so
+                                // there is no visible text it could borrow a
+                                // name from.
                                 <input class="rename-input" type="text" value={draft}
+                                       aria-label="Playlist name"
                                        autofocus=true oninput={rename_input}
                                        onkeydown={rename_key} onblur={rename_blur} />
                             } else {
@@ -1283,7 +1312,10 @@ pub fn app() -> Html {
                             <div class="page-kind">{ "All songs" }</div>
                             <h1 class="page-title">
                                 if let Some(p) = artist {
-                                    <span class="link" onclick={open_artist}>{ &p.name }</span>
+                                    // A real button: `.link` resets the button
+                                    // chrome (styles.css), so this looks like
+                                    // the link it is and is reachable by Tab.
+                                    <button class="link" onclick={open_artist}>{ &p.name }</button>
                                 }
                             </h1>
                             if let Some(t) = songs.filter(|t| !t.is_empty()) {
@@ -1323,10 +1355,13 @@ pub fn app() -> Html {
                                 <h1 class="page-title">{ &p.name }</h1>
                                 <div class="page-sub">
                                     if let Some(id) = p.artist_id.clone() {
-                                        <span class="link" onclick={{
+                                        // Same `.link` button as the "All songs"
+                                        // header above: keyboard-reachable, and
+                                        // the CSS supplies the link look.
+                                        <button class="link" onclick={{
                                             let cb = on_open_artist.clone();
                                             Callback::from(move |_| cb.emit(id.clone()))
-                                        }}>{ &p.artist }</span>
+                                        }}>{ &p.artist }</button>
                                     } else {
                                         { &p.artist }
                                     }

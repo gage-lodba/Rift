@@ -7,6 +7,7 @@ use web_sys::{DragEvent, HtmlInputElement};
 use yew::prelude::*;
 
 use super::icons::{eq_bars, icon};
+use super::key_on_nested_control;
 use super::menu::{Menu, MenuAction};
 use super::reorder::use_reorder;
 use super::View;
@@ -154,10 +155,15 @@ pub fn sidebar(props: &SidebarProps) -> Html {
         let on_nav = props.on_nav.clone();
         Callback::from(move |_: MouseEvent| on_nav.emit(view.clone()))
     };
-    // Same navigation, reachable from the keyboard.
+    // Same navigation, reachable from the keyboard. Shared by the plain nav
+    // items and the playlist rows, whose kebab is a nested button: Enter on that
+    // kebab opens its menu rather than navigating (see `key_on_nested_control`).
     let nav_key = |view: View| {
         let on_nav = props.on_nav.clone();
         Callback::from(move |e: KeyboardEvent| {
+            if key_on_nested_control(&e) {
+                return;
+            }
             if e.key() == "Enter" || e.key() == " " {
                 e.prevent_default();
                 on_nav.emit(view.clone());
@@ -413,6 +419,9 @@ struct SidebarPlaylistProps {
 #[function_component(SidebarPlaylist)]
 fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
     let menu_open = use_state(|| false);
+    // Where Escape returns focus: the kebab that opened the menu. Without it a
+    // keyboard user is dropped at the top of the document when the menu closes.
+    let kebab = use_node_ref();
 
     let nav = {
         let cb = props.on_nav.clone();
@@ -423,6 +432,10 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
         let cb = props.on_nav.clone();
         let id = props.id.clone();
         Callback::from(move |e: KeyboardEvent| {
+            // The row's kebab lives inside it; Enter there is the menu's key.
+            if key_on_nested_control(&e) {
+                return;
+            }
             if e.key() == "Enter" || e.key() == " " {
                 e.prevent_default();
                 cb.emit(View::Playlist(id.clone()));
@@ -498,8 +511,9 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
             <span class="side-count">{ props.count }</span>
             <div class="menu-anchor side-kebab">
                 <button class="ibtn" title="More" aria-haspopup="menu" aria-expanded={menu_open.to_string()}
-                        onclick={toggle}>{ icon("kebab") }</button>
-                <Menu open={*menu_open} on_close={close} actions={actions} align_right=true />
+                        ref={kebab.clone()} onclick={toggle}>{ icon("kebab") }</button>
+                <Menu open={*menu_open} on_close={close} actions={actions} align_right=true
+                      anchor={Some(kebab)} />
             </div>
         </div>
     }

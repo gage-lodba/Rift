@@ -2,7 +2,6 @@
 
 use rift_types::{events, PlaybackState, Progress, RepeatMode, Track};
 use serde_json::json;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 
@@ -117,15 +116,14 @@ pub fn player_bar(props: &PlayerBarProps) -> Html {
             api::fire("save_volume", json!({ "volume": v / 100.0 }));
         }
     });
+    // Same command as a row's heart, through the same error path: this used to
+    // be a bare `invoke` with its `Err` dropped, so a rejected like did nothing
+    // and said nothing (the row's goes through `fire`, which toasts).
     let toggle_like = {
         let track = props.track.clone();
         Callback::from(move |_| {
             if let Some(t) = &track {
-                let t = t.clone();
-                spawn_local(async move {
-                    let _ = api::invoke::<serde_json::Value>("toggle_like", &json!({ "track": t }))
-                        .await;
-                });
+                api::fire("toggle_like", json!({ "track": t }));
             }
         })
     };

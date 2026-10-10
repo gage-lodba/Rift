@@ -111,6 +111,29 @@ pub fn fire(cmd: &'static str, args: impl Serialize + 'static) {
     });
 }
 
+/// Await a command, reporting a rejection to the installed sink and falling
+/// back to `T::default()`.
+///
+/// For the call sites that need the command's *result*, so [`fire`] is not an
+/// option, and that have a placeholder status to fall back on. Swallowing the
+/// failure there is not the same as ignoring it: a rejected `set_yt_dlp_path`
+/// fell back to `YtDlpStatus::default()`, which renders as "✗ Not found — Not
+/// found on your PATH or in common install locations" — telling the user their
+/// path does not exist when the backend had in fact rejected it, with the
+/// reason ("not a file", "not absolute") discarded.
+pub async fn invoke_or_default<T>(cmd: &'static str, args: &impl Serialize) -> T
+where
+    T: DeserializeOwned + Default,
+{
+    match invoke::<T>(cmd, args).await {
+        Ok(v) => v,
+        Err(e) => {
+            report_error(format!("{cmd}: {e}"));
+            T::default()
+        }
+    }
+}
+
 thread_local! {
     /// Where a failed `fire` sends its message. `App` installs its toast here on
     /// mount; until then failures only reach the console.
@@ -134,8 +157,14 @@ pub(crate) fn unset_error_sink() {
     ERROR_SINK.with(|s| *s.borrow_mut() = None);
 }
 
-/// Report a frontend-side failure to the installed sink, if any.
-fn report_error(msg: String) {
+/// Report a frontend-side IPC failure to the installed sink, if any.
+///
+/// Public (crate-internal in practice — `api` is a private module) because
+/// [`fire`] and [`invoke_or_default`] are not the only way a command can fail:
+/// `App`'s bootstrap and "Check now" await their result themselves and used to
+/// leave a rejection in the console, where a user whose snapshot never loaded
+/// could not see it.
+pub fn report_error(msg: String) {
     ERROR_SINK.with(|s| {
         if let Some(cb) = s.borrow().as_ref() {
             cb.emit(msg);
