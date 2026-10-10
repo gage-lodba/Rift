@@ -25,5 +25,7 @@ mod components;
 pub(crate) mod dom;
 pub(crate) mod harness;
 mod hook_order;
+mod interact;
 mod render;
 mod reorder;
+mod rerender;

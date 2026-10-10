@@ -12,7 +12,9 @@
 
 use wasm_bindgen_test::wasm_bindgen_test;
 
-use crate::components::reorder::{drag_shift_style, slot_at_offset};
+use crate::components::reorder::{
+    drag_shift_style, keyboard_move_target, move_announcement, slot_at_offset,
+};
 
 /// Row height 100 + 40 gap, the shape the queue panel and sidebar both use.
 const SLOT: f64 = 140.0;
@@ -202,10 +204,7 @@ fn the_rows_between_step_one_slot_the_other_way() {
 /// Returns `None` for no transform, and panics on a transform it cannot parse —
 /// a silent `None` there would turn a formatting change into a passing test.
 fn slot_offset(style: Option<&str>, margin: i64) -> Option<i64> {
-    let style = match style {
-        None => return None,
-        Some(s) => s,
-    };
+    let style = style?;
     let inner = style
         .strip_prefix("transform: translateY(calc(")
         .and_then(|s| s.strip_suffix("));"))
@@ -286,4 +285,62 @@ fn the_preview_destination_matches_the_hovered_slot() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// keyboard_move_target — where does Alt+Up / Alt+Down move the row?
+// ---------------------------------------------------------------------------
+
+/// **The boundaries of the keyboard reorder, which are the whole correctness
+/// question.**
+///
+/// Two ways to be wrong, and neither is visible in a diff: moving off the top of
+/// the list (there is nothing to swap with) and moving off the bottom — the
+/// latter needs `from + 1 < len`, because `from + 1 <= len` would report a
+/// destination one past the end and the caller would reorder with an index that
+/// does not exist. The table is the function's whole contract; the mounted path
+/// (focus a row, dispatch Alt+ArrowDown, see `on_move`) is covered in
+/// `interact.rs`.
+#[wasm_bindgen_test]
+fn keyboard_move_target_reports_the_boundaries() {
+    let cases: &[(&str, usize, usize, Option<usize>)] = &[
+        ("ArrowUp", 0, 3, None),
+        ("ArrowUp", 1, 3, Some(0)),
+        ("ArrowUp", 2, 3, Some(1)),
+        ("ArrowDown", 0, 3, Some(1)),
+        ("ArrowDown", 1, 3, Some(2)),
+        ("ArrowDown", 2, 3, None),
+        // A single-row list can move in neither direction.
+        ("ArrowUp", 0, 1, None),
+        ("ArrowDown", 0, 1, None),
+        // Anything that is not an arrow is not a reorder, whatever the caller
+        // does with modifiers.
+        ("Enter", 1, 3, None),
+        ("ArrowLeft", 1, 3, None),
+        ("", 1, 3, None),
+    ];
+    for (key, from, len, expected) in cases {
+        assert_eq!(
+            keyboard_move_target(key, *from, *len),
+            *expected,
+            "{key:?} from {from} of {len}"
+        );
+    }
+}
+
+/// **The live region's sentence is one-based and counts the whole list.**
+///
+/// A screen reader hears exactly this, so `to + 1` is the difference between
+/// "position 2" and the row actually being second. The `len` of 1 is the case
+/// that catches a "position N of N" written from the wrong end.
+#[wasm_bindgen_test]
+fn move_announcement_is_one_based_and_counts_the_whole_list() {
+    assert_eq!(
+        move_announcement("Chill", 1, 5),
+        "Chill moved to position 2 of 5"
+    );
+    assert_eq!(
+        move_announcement("Focus", 0, 1),
+        "Focus moved to position 1 of 1"
+    );
 }

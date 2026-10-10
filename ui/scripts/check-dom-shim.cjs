@@ -64,6 +64,7 @@ check('the DOM constructors `web-sys` casts through are global', () => {
     'Event',
     'EventTarget',
     'MouseEvent',
+    'KeyboardEvent',
     'Document',
     'MutationObserver',
     'CustomEvent',
@@ -96,16 +97,57 @@ check('a container round-trips innerHTML and querySelector', () => {
   container.remove();
 });
 
-check('events dispatch through a real listener', () => {
+check('events dispatch through a real listener: click, keydown and contextmenu', () => {
+  // The three kinds `interact.rs` drives, through the same route `dom.rs` uses:
+  // the DOM's own constructors with `bubbles: true`, not a bare `Event` carrying
+  // a property. Yew delegates events to the subtree root, so a non-bubbling
+  // dispatch would never reach a handler, and a `KeyboardEvent` built as a plain
+  // `Event` would fail Yew's cast.
+  //
+  // `contextmenu` is here because it is the row-level way into a kebab menu: a
+  // test that needs a menu open *inside a row* cannot click a button for it.
   const target = document.createElement('button');
   document.body.appendChild(target);
-  let seen = 0;
-  target.addEventListener('click', () => {
-    seen += 1;
-  });
-  target.dispatchEvent(new globalThis.MouseEvent('click', { bubbles: true }));
-  assert.strictEqual(seen, 1, 'the listener did not fire');
+  const seen = [];
+  target.addEventListener('click', () => seen.push('click'));
+  target.addEventListener('keydown', (e) => seen.push(`keydown:${e.key}`));
+  target.addEventListener('contextmenu', () => seen.push('contextmenu'));
+
+  const fire = (constructor, type, key) => {
+    const init = { bubbles: true, cancelable: true };
+    if (key !== undefined) {
+      init.key = key;
+    }
+    target.dispatchEvent(new globalThis[constructor](type, init));
+  };
+  fire('MouseEvent', 'click');
+  fire('KeyboardEvent', 'keydown', 'Enter');
+  fire('MouseEvent', 'contextmenu');
+
+  assert.deepStrictEqual(seen, ['click', 'keydown:Enter', 'contextmenu']);
   target.remove();
+});
+
+check('focus() moves document.activeElement', () => {
+  // Every keyboard assertion in `interact.rs` reads `document.activeElement`, so
+  // the shim's ability to move focus is load-bearing.
+  const el = document.createElement('div');
+  el.setAttribute('tabindex', '0');
+  document.body.appendChild(el);
+  el.focus();
+  assert.strictEqual(document.activeElement, el, 'focus() did not move activeElement');
+
+  // Removing it moves focus back to the body, which is the spec's fixup and is
+  // *not* the reason a focus assertion can see a foreign node: `dom.rs` says
+  // "NOT inside this mount" when a test that panicked left its container behind,
+  // because a panic on wasm32 never runs `Drop`. Measured here so the two are not
+  // confused again.
+  el.remove();
+  assert.strictEqual(
+    document.activeElement,
+    document.body,
+    'removing the focused element should leave activeElement on the body'
+  );
 });
 
 check('CSSStyleDeclaration accepts a property assignment', () => {

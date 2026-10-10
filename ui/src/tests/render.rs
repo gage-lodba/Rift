@@ -44,39 +44,16 @@ use wasm_bindgen_test::wasm_bindgen_test;
 use yew::prelude::*;
 
 use crate::components::{PlayerBar, PlayerBarProps, QueuePanel};
-use crate::tests::dom::{flush, mount};
+use crate::tests::dom::{flush, mount, setter_channel, take_setter};
 use crate::tests::harness::{emit_for_test, playlist, track};
 
 // ---------------------------------------------------------------------------
 // Driving a mounted component from a test
 // ---------------------------------------------------------------------------
 
-/// A closure a mounted component publishes so the test can drive it.
-///
-/// `use_state` is per-instance and a test cannot reach into it. This is the
-/// other direction: the component hands out a `Callback` when it mounts and the
-/// test calls it — the same thing the app does to a component when state above
-/// it changes, not a way of poking a hook.
-type Setter<T> = Rc<RefCell<Option<Callback<T>>>>;
-
-/// A `Setter` plus the callback that fills it, for a component's props.
-fn setter_channel<T: 'static>() -> (Setter<T>, Callback<Callback<T>>) {
-    let cell: Setter<T> = Rc::new(RefCell::new(None));
-    let publish = cell.clone();
-    (
-        cell,
-        Callback::from(move |cb: Callback<T>| *publish.borrow_mut() = Some(cb)),
-    )
-}
-
-/// The closure `setter` holds, or a failure saying the component never published
-/// one.
-fn take_setter<T: Clone + 'static>(setter: &Setter<T>) -> Callback<T> {
-    setter
-        .borrow()
-        .clone()
-        .expect("the mounted component never published its setter")
-}
+// `Setter`, `setter_channel` and `take_setter` live in `dom.rs`: they are how any
+// render test reaches a component's props or state from above, and `rerender.rs`
+// needs them too. Importing them is what keeps one copy of the idea.
 
 // ---------------------------------------------------------------------------
 // The DOM the shim provides

@@ -60,10 +60,44 @@ offers, and `.cargo/config.toml`'s `[env]` table supplies it:
 
 ```toml
 [env]
-NODE_OPTIONS = { value = "--require ui/tests/dom-shim.cjs", relative = true }
+NODE_OPTIONS = "--require ./tests/dom-shim.cjs"
 ```
 
-Two things about that file are load-bearing and were each found by a broken run:
+The path is relative to the **runner's** working directory, and Cargo sets that to
+the package root, not to wherever you invoked Cargo. Measured with a probe runner
+from the repo root, from `ui/`, from `ui/src/`, and through `--manifest-path`:
+every one of them ran the runner with `cwd = ui/`, so `./tests/dom-shim.cjs` is
+`ui/tests/dom-shim.cjs`. The leading `./` is load-bearing — without it Node reads
+the value as a bare package specifier, searches `node_modules` and exits with
+`MODULE_NOT_FOUND` before the test module loads. Invoked from *outside* the repo
+with `--manifest-path`, Cargo does not read that file at all: it finds
+`.cargo/config.toml` by walking up from the working directory.
+
+**`relative = true` cannot be used for this value, and it is the trap this file
+fell into until 2026-09.** Cargo path-joins the *whole* value onto the config's
+base directory, flag included:
+
+```toml
+NODE_OPTIONS = { value = "--require ui/tests/dom-shim.cjs", relative = true }
+# => NODE_OPTIONS = "C:\Users\...\Rift\--require ui/tests/dom-shim.cjs"
+```
+
+Node **silently ignores** `NODE_OPTIONS` tokens that do not begin with `-`, so
+that is not a startup error. The shim simply never loads, and the four renderer
+tests fail with `the DOM shim installs \`window\` before any test runs` — a message
+about a missing global that names neither the variable nor the reason. Measured
+both ways: the value above gives `49 passed; 4 failed`, the value in the table
+gives all of them passing. **CI has never exercised the fixed table**, because the
+branch is unpushed — the Linux and macOS jobs have been running the broken value
+too, and their four renderer tests have been failing with it.
+
+`force` is deliberately left unset on the entry, so a `NODE_OPTIONS` you export
+yourself wins (Cargo warns that it is skipping this one) rather than being
+silently replaced. That is what isolated the bug: exporting the working value was
+enough to turn the four failures green.
+
+Two further things about the shim are load-bearing and were each found by a broken
+run:
 
 - **The shim must define `pre#output`.** `wasm-bindgen-test` decides between its
   Node and browser output formatters by looking for a `self` property on the
@@ -72,62 +106,90 @@ Two things about that file are load-bearing and were each found by a broken run:
   that element the run dies on `Cannot read properties of null` before a single
   test executes. With it, the shim mirrors those writes to stdout, so a CI log
   shows `test result: ok. 53 passed; …` rather than nothing at all.
+- **The mirror writes only the new text.** It re-printed the whole element on
+  every DOM mutation until 2026-09, which grows the log quadratically: a 53-test
+  run logged 369 lines, every one of them a longer prefix of the same report,
+  with the one line that matters buried at the end. It now writes the delta
+  against what it has already written (a common-prefix diff, so a rewrite of the
+  element is still handled), and a 73-test run logs 74 lines.
 - **The shim must not shadow `performance`, `crypto`, `fetch` and friends.**
   jsdom's own implementations delegate to the global one —
   `Performance-impl.js` is literally `performance.now() - this._nowAtOrigin` —
   so mirroring jsdom's wrapper over Node's built-in makes it call itself and the
   run dies with `Maximum call stack size exceeded` before any test executes.
 
+Two traps that are about *driving* the DOM rather than supplying it, both found
+while writing `interact.rs`:
+
+- **A test that panics leaves its mount in the document.** `Mount` removes its
+  container in `Drop`, but `wasm32-unknown-unknown` has no unwinding, so a failing
+  assertion never runs `Drop`: the container, its DOM and whatever it had focused
+  all survive into the next test. Down a red run, a later focus assertion can
+  therefore read a foreign node that looks exactly like the one it wanted.
+  `Mount::active_description` says "NOT inside this mount" when that happens. (It
+  is *not* jsdom keeping focus on a detached node — measured: jsdom moves
+  `activeElement` back to `<body>` when the focused element or its container is
+  removed, and `check-dom-shim.cjs` pins that.)
+- **Events are built with the DOM's own constructors, not web-sys's init
+  dictionaries.** `new_with_keyboard_event_init_dict` needs the
+  `KeyboardEventInit` feature, which nothing in this crate's graph enables, and
+  web-sys features are global rather than test-scoped — turning it on would put
+  those bindings in the app build too. `dom.rs` reaches `new KeyboardEvent(...)`
+  and `new MouseEvent(...)` through `Reflect` instead, with `bubbles: true`
+  (load-bearing: Yew delegates to the subtree root). `click`, `keydown` and
+  `contextmenu` are all proven. The third is not incidental: it is the row-level
+  way into a kebab menu, so a test that needs a menu open *inside a row* has to
+  dispatch one.
+
 `node scripts/check-dom-shim.cjs` checks the shim on its own, in about a second,
-without compiling anything: it loads the shim, builds elements, dispatches an
-event, and reads a style property back. Run it first if a renderer test fails in
-a way that mentions a missing global.
+without compiling anything: it loads the shim, builds elements, dispatches all
+three event kinds the interaction tests use (`click`, `keydown`, `contextmenu`)
+through the DOM's own constructors, reads a style property back, and pins what
+`focus()` does — including that removing the focused element puts
+`activeElement` back on the body. Run it first if a renderer test fails in a way
+that mentions a missing global.
 
-### On Windows, run them under WSL
+### Two ways this suite dies on Windows, and they are not the same failure
 
-They do not run on Windows, and this is not a gap in the harness.
-`wasm-bindgen-test-runner` 0.2.128 formats the benchmark path into the generated
-Node script with `Path::display()` and wraps it in single quotes, so a Windows
-path becomes `'C:\Users\...'` — and Node rejects `\U` as an invalid Unicode
-escape while *parsing* the file, before any test runs:
+Both were live until 2026-09 and both are fixed in `.cargo/config.toml`; they are
+kept here because the messages they produce say nothing about their cause.
 
-```
-SyntaxError: Invalid Unicode escape sequence
-    at .../run.cjs:55
-        const benchmark_import = await fs.readFile('C:\Users\...\wbg_benchmark.json');
-```
+1. **The generated script does not parse, so *no* test runs.** The runner writes
+   the benchmark baseline path into the Node script it generates, with
+   `Path::display()` inside a single-quoted JS string:
 
-It is upstream, it is unconditional (the `readFile` sits inside `if (false)`,
-which is still parsed), and 0.2.129 has not fixed it. `WASM_BINDGEN_BENCH_RESULT`
-does not help: the path is re-encoded through `PathBuf` on the way in, so the
-backslashes come back. There is no environment variable that avoids it.
+   ```js
+   const benchmark_import = await fs.readFile('C:\...\Rift\ui\target\wbg_benchmark.json');
+   ```
 
-CI therefore runs this step on Linux and macOS only. The tests are
-platform-independent — the same wasm module, the same assertions — so the
-Windows gap is in *reproducing* a failure locally, not in coverage. If you need
-to run them on a Windows machine:
+   and `\ui` is an invalid Unicode escape — `\u` must be followed by four hex
+   digits — so Node rejects the file while parsing it. (The trigger is `\ui`, not
+   `\U`: JS accepts `'\U'` and `'\Users'` as `NonEscapeCharacter`s and the caret
+   in Node's error points at the package directory. The earlier version of this
+   file blamed `\U` and was wrong about the character, right about the class.)
+   The `readFile` sits in an `if (is_bench)` branch a `cargo test` run never
+   takes, which changes nothing: a syntax error is a syntax error whether or not
+   its branch executes. Fixed by pinning `WASM_BINDGEN_BENCH_RESULT` to the same
+   location in a form that always parses — `target/wbg_benchmark.json`, relative
+   to the runner's cwd, so it is the path the runner would have chosen itself.
+   Only `cargo bench` ever reads it.
+
+2. **The shim does not load, so the four renderer tests fail.** The
+   `NODE_OPTIONS` trap above, which is not Windows-specific at all: it was broken
+   on every platform and looked like a platform problem because the four failures
+   it causes are about a missing DOM.
+
+Neither needs WSL. Earlier revisions of this file recommended running the suite
+under WSL and explained the four failures as a Windows path reaching a Linux Node;
+that diagnosis was wrong — the path never got as far as Node — and the note has
+been removed rather than corrected in place, because "run it somewhere else" was
+never the fix.
+
+The suite runs on this Windows machine with the toolchain already on `PATH`:
 
 ```sh
-wsl -e bash -lc 'cd /mnt/c/.../Rift && cargo test -p rift-ui --target wasm32-unknown-unknown'
+cargo test -p rift-ui --target wasm32-unknown-unknown --locked
 ```
-
-(WSL needs its own `wasm-bindgen-cli`, Node and `jsdom`; the toolchain comes from
-`rust-toolchain.toml`.)
-
-**One wrinkle when running under WSL against a Windows checkout.**
-`.cargo/config.toml` resolves the shim path relative to itself, so from WSL it is
-the *Windows* path `C:\Users\…\ui\tests\dom-shim.cjs`, which WSL's Node cannot
-load. The four renderer tests then fail — with the message in
-`the_dom_shim_is_loaded`, which says exactly this — while the other 49 pass. Set
-`NODE_OPTIONS` explicitly for that run:
-
-```sh
-wsl -e bash -lc 'cd /mnt/c/.../Rift && \
-  NODE_OPTIONS="--require $PWD/ui/tests/dom-shim.cjs" \
-  cargo test -p rift-ui --target wasm32-unknown-unknown'
-```
-
-A WSL-native checkout, and every other platform, needs no override.
 
 ## What is covered
 
@@ -138,7 +200,9 @@ A WSL-native checkout, and every other platform, needs no override.
 | `app.rs` | `src/tests/app.rs` | `shuffled_start` (a shuffled Play must not start out of range), `fmt_total_duration`, `playlist_fully_downloaded` (the offline pin behind two user-visible behaviours). |
 | Components, first render | `src/tests/components.rs` | That `QueuePanel` and `PlayerBar` render at all, and render what their props describe — the empty queue rendering nothing, a one-track queue rendering exactly one row, a loaded track's title and artist reaching the bar. A panic in a first render is a blank screen, so this is worth having. Also `track_key`, the dependency `H4`'s re-seed effect is keyed on: distinct tracks must produce distinct keys, or the effect stops re-running on a track change. |
 | **Components, second render** | `src/tests/render.rs` | The real Yew **client** renderer in a real DOM: that the harness runs effects and re-renders at all; that the queue panel survives **empty-then-populated**, the transition `C1` broke and the one the app actually starts on; and that `PlayerBar` re-seeds from the app's props across a **track change**, using the PROGRESS subscription path (`harness::emit_for_test`) rather than calling a callback directly. What this does *not* catch is listed below. |
-| Hook order, statically | `src/tests/hook_order.rs` | That no hook is called after an early return, in any component source. This is the defect class behind `C1`. A token scanner over the component files, biased toward silence; it reports only what it can prove from brace depth, and its blind spots are listed in the module doc. The same module documents the **manual** check that a re-injected defect is caught by the render harness — it cannot be a test, for the reason in the next section. |
+| **A keyed list re-decorated, and how coarse a pass is** | `src/tests/rerender.rs` | Two rows whose playing / liked / offline decoration is moved from the first to the second in one update, so the *right* row is what changes — `H4`'s bug one level down, where the component below is keyed on a track and the value above it is not. Plus the measurement that bounds the whole file: **one microtask hop carries a render and its effects**, asserted by showing the change has not been applied before the hop and has been applied after it. |
+| **Clicks and keystrokes, on real components** | `src/tests/interact.rs` | The menu's keyboard path (open → focus the first item → Arrow keys with wrap, Home/End, ArrowRight/ArrowLeft on a submenu, Escape returning focus to its anchor, Enter activating an item and closing), the backdrop closing it, one control→callback wiring per component (queue rows, the remove button, the clear button, a track row's like button, an artist credit), and the two guards that decide whether a keystroke belongs to a row or to a control inside it. Every assertion here is a real `click()` or a real dispatched, bubbling `keydown`/`contextmenu` through Yew's delegated listeners. |
+| Hook order, statically | `src/tests/hook_order.rs` | That no hook is called after an early return, in any component source. This is the defect class behind `C1`. A token scanner over the component files, biased toward silence; it reports only what it can prove from brace depth, and its blind spots are listed in the module doc. Its *own* false positive — a `return` inside a keydown closure read as an early return from the component — is fixed and pinned by two regression tests built from the exact shape that misfired. The same module documents the **manual** check that a re-injected defect is caught by the render harness — it cannot be a test, for the reason in the next section. |
 ### How components are rendered
 
 Two renderers, on purpose:
@@ -156,7 +220,7 @@ Two renderers, on purpose:
   in both directions.
 
 Every one of these has been mutation-tested: the fix was reverted and the test
-watched to fail. Three mutations *survived* and are recorded here rather than
+watched to fail. Four mutations *survived* and are recorded here rather than
 quietly fixed, because they are the honest boundary of the suite:
 
 - **Dropping `.floor()` or `.max(0.0)` from `slot_at_offset` changes nothing.**
@@ -170,6 +234,14 @@ quietly fixed, because they are the honest boundary of the suite:
   by a test, and the original defect lived in exactly that position. The
   remaining call-site closures are still only guarded by the text-level check in
   `src-tauri/tests/ipc_contract.rs` — see the gap section below.
+- **Removing `.trow-actions`' `stop_propagation` on its own changes nothing
+  observable.** Every interactive child inside that container stops the event
+  itself — the like button, the kebab, and the menu panel — so the container's
+  guard is redundant with theirs, and theirs with it:
+  `clicking_like_likes_the_track_and_does_not_play_it` only fails when *both* are
+  removed. Measured. The pair is kept, because which one is load-bearing is a
+  property of the markup that a future row could change; what the test pins is
+  the behaviour, that a click on Like does not also play the track.
 - **Removing the track key from `PlayerBar`'s re-seed effect does not fail any
   test in `render.rs`.** Measured, by building it both ways. The stale `live`
   values are masked on every render by `track_changed`, which stays `true`
@@ -177,19 +249,30 @@ quietly fixed, because they are the honest boundary of the suite:
   track's own duration and a zeroed position, which is what it shows for the one
   render *before* the effect fires anyway. The defect and the fix therefore
   differ for exactly one render, and this harness cannot sample it: Yew renders
-  and runs effects in the same scheduler pass, which a single microtask drains
-  in full (measured, hop by hop). That is recorded as open below, not papered
-  over.
+  and runs effects in the same scheduler pass, which one microtask drains in
+  full. That is now a **test** rather than a note —
+  `rerender.rs::one_microtask_hop_carries_a_render_and_its_effects` shows the
+  change has not been applied before the hop and has been applied after it — and
+  it is recorded as open below, not papered over.
 
 ## What is *not* covered, and why
 
-**A single render is not observable.** `flush()` yields to the microtask queue
-until the scheduler is quiescent, and Yew renders a component and runs its
-effects inside one scheduler pass — so there is no point at which a test can
-observe "rendered but effects not yet run". That window is exactly where `H4`'s
-remaining difference lives (see the third surviving mutation above). Seeing it
-needs a real frame boundary, i.e. a browser, which is the computed-style
-purchase below rather than a separate one.
+**A single render is not observable, and that is now measured rather than
+asserted.** `flush()` yields to the microtask queue until the scheduler is
+quiescent, and Yew renders a component and runs its effects inside one scheduler
+pass. The narrower question — *can a test sample the DOM after a render but
+before that render's effects?* — reduces to how much work one turn of the JS job
+queue carries, and `rerender.rs::one_microtask_hop_carries_a_render_and_its_effects`
+answers it with both data points in one test: immediately after a state change
+nothing has been applied (the log is empty and the DOM still shows the old
+value), and after exactly one hop the render **and** its effect have both run. A
+test can only resume between turns of the job queue, so there is no point at
+which it can observe that window. That window is exactly where `H4`'s remaining
+difference lives (see the fourth surviving mutation above). Seeing it needs a
+real frame boundary — an animation frame is not a microtask — i.e. a browser,
+which is the computed-style purchase below rather than a separate one. If a Yew
+upgrade ever splits a render from its effects across two hops, that test fails
+and its message says the `H4` detector has become possible.
 
 **Nothing can assert that a panic happened.** On `wasm32-unknown-unknown` there
 is no unwinding: `panic = "abort"` is the only strategy and
@@ -201,21 +284,87 @@ harness installs a panic hook that prints the message before the abort
 detector is a manual procedure in `hook_order.rs` and why no test here asserts on
 a panic.
 
-**Second-render behaviour, generally.** The component tests in `components.rs`
-render each component **once**, through SSR, which drives a component instance a
-single time and does not run effects — two attempts to force a second pass are
-recorded as dead ends in that file. `render.rs` does reach second renders, but
-only through the one `flush()` granularity described above.
+**Second-render behaviour beyond the three files that have it.**
+`components.rs` renders each component **once**, through SSR, which drives a
+component instance a single time and does not run effects — two attempts to force
+a second pass are recorded as dead ends in that file. `render.rs` covers
+`QueuePanel` and `PlayerBar`, `rerender.rs` covers `TrackList`, and
+`interact.rs` reaches every re-render a click causes. Every other component
+(Sidebar, SettingsView, HomeView, the grids, Titlebar, UpdateBanner) has only
+first-render or pure-function coverage. Nothing stops the next one from getting a
+second-render test; nobody has needed one yet.
+
+**One CSR `PlayerBar` per test process, and that is a harness limit.** `LISTENERS`
+in `harness.rs` records every event subscription for the life of the process —
+there is no unsubscribe, because the stub replaces the transport and the real
+`listen_event` has no teardown to mirror. `render.rs`'s `H4` test therefore
+asserts that `emit_for_test` reaches **exactly one** PROGRESS listener, and any
+*second* test that mounts `PlayerBar` through the client renderer makes that
+count two and fails it. `interact.rs` deliberately does not mount `PlayerBar`
+for that reason, and asserts on components that subscribe to nothing. The honest
+fix is a per-test reset in `harness.rs` plus a subscription that can be dropped;
+neither was needed for this session's work, so neither is here.
+
+**Real activation of `<button>`s, and CSS-only reveal, are invisible here.**
+jsdom performs no default activation, so Enter or Space on a real `<button>`
+does nothing: `interact.rs` asserts button behaviour with `click()` and
+keyboard behaviour on the *handler's* effect, and says so in each test. The
+review's "the sidebar kebab was unreachable by Tab" class is CSS —
+`.side-item:focus-within .side-kebab { display: … }` — and jsdom's
+`getComputedStyle` does not do `:focus-within` or layout, so the reveal itself is
+review-only. What a test *can* pin without a browser is that a `button[role="switch"]`
+has a name (`aria-label`) and `aria-checked`, and that a failed download button
+has a title; `interact.rs` does the ones it mounts.
 
 **Computed style — the class of bug that already shipped.** The white album text
-came from a `<button>` inheriting `buttonface`, and nothing here can see it.
-jsdom has no layout engine, so `getComputedStyle` answers from inline and
-stylesheet declarations only, and an *inherited* value is not observable. This
-needs a real browser (`getComputedStyle` with a layout engine): chromedriver or
-`wasm-bindgen-test`'s in-browser mode, plus its installation and version pinning
-on three operating systems. **This gap is open, and the DOM shim does not close
-it** — it is the stepping stone toward it, not the thing itself. The harness is
-deliberately not described as covering it.
+came from a `<button>` whose colour was left to the UA, and the fix (in
+`styles.css`) is `.link { color: inherit; background: none; font: inherit }`.
+Measured, on this machine, with the same markup in both engines:
+
+| value | jsdom (through the shim) | Edge, headless |
+|---|---|---|
+| the album text's `color`, no colour declared (the defect) | `"buttontext"` | `rgb(0, 0, 0)` — and the render shows it invisible on the dark body |
+| the same element with a colour declared on the button | `"rgb(230, 230, 230)"` | `rgb(230, 230, 230)` |
+| the same element with `color: inherit` (what the fix says) | `"inherit"` | `rgb(230, 230, 230)` |
+| the same element with `color: var(--text)` | `"var(--text)"` | `#ececef` |
+
+So the accurate statement is narrower than "nothing here can see it", and wider
+than "this is closed": jsdom **does** apply the cascade and inherit declared
+values, but it reports unresolved tokens (`buttontext`, `inherit`,
+`var(--text)`) rather than resolved colours, and it resolves nothing against a
+layout. A test could therefore assert "a colour declaration reached this element"
+by loading the real `styles.css` into the shim's document and checking that the
+value is not the UA keyword — a proxy for the shipped defect, not a rendering.
+
+**What that would take, concretely** — three steps and one measured caveat, so
+the next session does not re-derive it:
+
+1. Inject `ui/styles.css` into the shim's document as a `<style>` node. The shim
+   already resolves files through `createRequire`, so this is a `readFileSync`
+   plus `document.createElement('style')`; without it `getComputedStyle` has no
+   rules to cascade.
+2. Mount the component that carries the defect (`TrackList` for the album button,
+   `PlayerBar` for its own) and assert the element's computed colour is **not**
+   `"buttontext"`. That is the assertable half, and the two states are
+   distinguishable here: the shipped fix is `color: inherit` (`styles.css:363`),
+   which jsdom reports as `"inherit"`, and the defect reports the UA keyword.
+3. Prove it with a mutation: delete `color: inherit` from `.link` in `styles.css`
+   and watch the assertion fail.
+
+The caveat is measured rather than assumed: jsdom hands back `var(--text)` and
+`inherit` as raw tokens, so assert on "not the UA keyword", never on a specific
+colour, and pick an element that does not depend on a custom property being
+resolved. The 1139-line stylesheet also gets parsed on every run, which is worth
+weighing before wiring it in. That is **not built**, and the measurement is
+recorded here so the next person starts from facts instead of the old claim.
+
+The real-browser route is cheaper than it looks, and was used for the numbers
+above: `msedge --headless=new --screenshot=<png> --window-size=1000,300 <url>`
+renders and screenshots with **no driver and no dependency** (Edge is on Windows,
+Chrome is on the CI runners). Reading the value back out of a screenshot is fine
+for a one-off measurement and useless for a suite; wiring it into CI still means
+a driver and a version pin, which is why the harness does not claim computed
+style.
 
 **Other call sites' argument shapes.** `src-tauri/tests/ipc_contract.rs` parses
 the frontend's `api::fire("cmd", json!({...}))` calls as text and compares key
@@ -226,8 +375,15 @@ and it does not see through a helper that builds its payload somewhere else
 `play_*` commands — the ones with a history — end to end; the rest of the 55 IPC
 call sites have the text check and nothing else.
 
-**Component props and callback wiring.** Which callback a button is bound to, and
-whether it emits the right value, is renderer territory — but no test drives a
-click yet. The DOM makes it possible (`dispatch_event` works under the shim, and
-`check-dom-shim.cjs` proves it); nothing does it. Recorded as open.
+**A guard that decides by tag cannot see a role.** `key_on_nested_control`
+matches the keydown's target tag (`BUTTON | INPUT | SELECT | TEXTAREA | A`). A
+row's kebab menu renders *inside* the row and its items are
+`<div role="menuitem" tabindex="0">` — a `DIV` — so the guard said "not a nested
+control" and Enter on a menu item activated both the menu item and the row.
+Found by the verifier against the previous session's commit and now pinned by
+`interact.rs::enter_on_a_menu_item_inside_a_row_does_not_play_the_row`, whose
+control case (the same dispatch aimed at the row *must* fire) is what makes the
+negative non-vacuous. The general lesson is in that test, not in the guard: a
+tag list is a heuristic, and only a renderer-level test can see what a role-based
+control actually does.
 
