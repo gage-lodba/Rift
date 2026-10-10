@@ -120,6 +120,18 @@ fn command_params(text: &str, name: &str) -> BTreeSet<String> {
     out
 }
 
+/// Whether a string literal could be a command name.
+///
+/// A command name is a Rust identifier, so digits and uppercase are legal in
+/// one: a `v2_import` or `getArtist` command must not be invisible to every test
+/// in this file. The old filter required lowercase, which silently skipped such
+/// names — latent rather than live today, since every command is snake_case, and
+/// that is exactly why it survived. Anything with `/`, `.`, `:` or `-` (a MIME
+/// type, a URL, a plugin permission) still falls out.
+fn looks_like_command_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Every command name the frontend passes to `invoke`/`fire`, with the argument
 /// keys it sends for each.
 fn frontend_calls() -> BTreeMap<String, BTreeSet<BTreeSet<String>>> {
@@ -139,7 +151,7 @@ fn frontend_calls() -> BTreeMap<String, BTreeSet<BTreeSet<String>>> {
                 continue;
             };
             let cmd = &stmt[close + 1..open];
-            if cmd.is_empty() || !cmd.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            if !looks_like_command_name(cmd) {
                 continue;
             }
             if !stmt.contains("invoke") && !stmt.contains("fire") {
@@ -175,6 +187,13 @@ fn frontend_calls() -> BTreeMap<String, BTreeSet<BTreeSet<String>>> {
 }
 
 /// Every command name registered in `invoke_handler`.
+///
+/// Keyed on the literal `commands::` prefix and takes the identifier that
+/// follows it, which is the shape `commands/mod.rs` re-exports everything in.
+/// A nested path — `commands::playback::play_track` — would register as
+/// `playback`, and `every_registered_command_exists` would then report a
+/// confusing name rather than a missing command. Latent, not live, and it fails
+/// loudly rather than passing vacuously.
 fn registered_commands() -> BTreeSet<String> {
     let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"))
         .expect("read main.rs");
@@ -194,6 +213,21 @@ fn registered_commands() -> BTreeSet<String> {
             (!name.is_empty()).then_some(name)
         })
         .collect()
+}
+
+/// The scanner's acceptance rule, tested on its own because it is the one part
+/// of the frontend scan that can silently narrow what the tests above *see*.
+#[test]
+fn a_command_name_may_contain_digits_and_uppercase() {
+    assert!(looks_like_command_name("play_track"));
+    assert!(looks_like_command_name("v2_import"));
+    assert!(looks_like_command_name("getArtist"));
+
+    // Not command names: a MIME type, a URL, a plugin permission, nothing.
+    assert!(!looks_like_command_name("application/json"));
+    assert!(!looks_like_command_name("https://example.com"));
+    assert!(!looks_like_command_name("plugin:dialog|save"));
+    assert!(!looks_like_command_name(""));
 }
 
 #[test]
@@ -237,6 +271,17 @@ fn every_command_the_frontend_calls_is_registered() {
 /// code (L4) while the call site still sent `"radio": false`; both sides
 /// compiled and the command failed at runtime. Every frontend argument key must
 /// name a real parameter, and every parameter must be supplied.
+///
+/// Known blind spot, recorded rather than papered over: this reads the `json!`
+/// object that sits *inside* the `invoke`/`fire` call. A call site that builds
+/// its payload into a local first —
+/// `let args = json!({ "track": t, "radio": false }); fire("play_track", args)`
+/// — matches nothing here and survives this test; so would the historical
+/// `"radio"` defect, reintroduced that way. The compensating guard is the
+/// frontend harness test `play_track_sends_only_the_track_argument`
+/// (`ui/src/tests/api.rs`), which drives the real `app::fire_play_track` call
+/// site and asserts the exact key set. A text scanner cannot see through a
+/// binding, and making it try would trade a recorded gap for an unreliable one.
 #[test]
 fn every_frontend_argument_key_matches_a_backend_parameter() {
     let backend = backend_commands();
