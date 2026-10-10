@@ -336,20 +336,34 @@ pub fn tracks(resp: &Value) -> Vec<Track> {
         // other is a genuine empty search. Counting *rows anywhere in the
         // document* (not just in the shelves we understand) is what makes the
         // difference visible even when the shelf itself moved.
+        //
+        // Rows this parser dropped on purpose — UGC-typed, or badged
+        // "Video"/"Episode" — are not evidence of anything, so they do not
+        // count: a response made entirely of videos is an *explained* empty
+        // result, and warning about it would train the reader to ignore the
+        // warning on exactly the searches that return mostly videos.
         let mut rows = Vec::new();
         find_all(resp, "musicResponsiveListItemRenderer", &mut rows);
-        warn_on_silent_degradation("track", rows.len());
+        let explained = rows
+            .iter()
+            .filter(|n| {
+                n.get("musicResponsiveListItemRenderer")
+                    .is_some_and(is_non_audio_row)
+            })
+            .count();
+        warn_on_silent_degradation("track", rows.len() - explained);
     }
     parsed
 }
 
-/// Warn when the response carried rows but nothing could be extracted from them.
+/// Warn when the response carried rows that nothing could be extracted from.
 ///
 /// Innertube renames renderers without notice, and a parser that quietly
 /// returns an empty list turns that into "no results" — indistinguishable from
 /// a real empty search for whoever is looking at the UI. Logging the
 /// discrepancy is the difference between a five-minute diagnosis and a
-/// debugging session.
+/// debugging session. `rows_seen` is therefore the count of rows the parser did
+/// *not* drop on purpose; see [`tracks`].
 fn warn_on_silent_degradation(what: &str, rows_seen: usize) {
     if rows_seen > 0 {
         warn!(
@@ -372,12 +386,44 @@ fn is_non_audio_type(node: &Value) -> bool {
 /// Whether a track is a user upload (`MUSIC_VIDEO_TYPE_UGC`) rather than an
 /// official YouTube Music catalog entry. UGC items are remixes/re-uploads by
 /// arbitrary channels, not the artist's own music.
+///
+/// This is the *typed* signal, read from the row's own
+/// `watchEndpointMusicConfig.musicVideoType`, and it is authoritative wherever
+/// it travels: it is title-independent, so a UGC upload called "Blinding
+/// Lights" is dropped exactly like one called "Blinding Lights (Official
+/// Video)". Every path that carries the field — search, album, artist and
+/// playlist rows parsed here — goes through [`is_non_audio_row`].
+///
+/// It cannot be the whole rule. `Track` carries no type, so a track that comes
+/// back from Rift's own JSON export, or from the on-disk library, has no
+/// `musicVideoType` to consult; the title-marker fallback in
+/// `src-tauri/src/commands/convert.rs` exists for exactly those paths and is
+/// deliberately *weaker*, not equivalent. The split is asserted on both sides:
+/// this module pins "the type alone drops a clean-titled UGC row", and
+/// `convert.rs` pins "the title fallback cannot, and keeps it".
 fn is_ugc(node: &Value) -> bool {
     let mut found = Vec::new();
     find_all(node, "musicVideoType", &mut found);
     found
         .iter()
         .any(|n| n.get("musicVideoType").and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_UGC"))
+}
+
+/// Whether a row's own metadata says it is not an audio track.
+///
+/// Two independent pieces of evidence, strongest first:
+///
+/// 1. [`is_ugc`] — the typed `musicVideoType`, which is title-independent.
+/// 2. [`is_non_audio_type`] — the leading subtitle badge ("Video"/"Episode"),
+///    which is prose the layout can rename.
+///
+/// The title-marker rule ("(Official Video)") is *not* applied here. It lives in
+/// `convert.rs` because it is the only rule the signal-less paths can use, and
+/// applying it here as well would mean the innertube path and the JSON-import
+/// path agree by luck rather than by construction. Doing the drop here would
+/// also hide from the caller a row it may legitimately want to see.
+fn is_non_audio_row(node: &Value) -> bool {
+    is_non_audio_type(node) || is_ugc(node)
 }
 
 /// The byline to show for a row with no linked artist.
@@ -434,7 +480,7 @@ pub fn unlinked_artist(node: &Value) -> String {
 
 fn track_from_mrlir(node: &Value) -> Option<Track> {
     let id = video_id(node)?;
-    if is_non_audio_type(node) || is_ugc(node) {
+    if is_non_audio_row(node) {
         return None;
     }
     // A row whose title is absent or the wrong JSON type is a row shape this
@@ -984,10 +1030,94 @@ fn renderer_matching<'a>(renderers: &[&'a Value], video_id: &str) -> Option<&'a 
 #[cfg(test)]
 mod tests {
     use super::{
-        album_type_from_shelf, is_subtitle_noise, is_type_badge, parse_count, parse_duration,
-        track_credits, tracks, unlinked_artist,
+        album_type_from_shelf, audience, is_non_audio_row, is_subtitle_noise, is_type_badge,
+        parse_count, parse_duration, track_credits, tracks, trailing_year, unlinked_artist,
     };
     use serde_json::{json, Value};
+
+    /// One search-shaped row: a title column, a subtitle column carrying the
+    /// type badge, and a playable video id typed with `musicVideoType` — the
+    /// three things a row needs to be a candidate track at all.
+    fn search_row(video_id: &str, title: &str, badge: &str, music_video_type: &str) -> Value {
+        json!({
+            "musicResponsiveListItemRenderer": {
+                "flexColumns": [
+                    { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                        { "text": title }
+                    ] } } },
+                    { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                        { "text": badge }, { "text": " • " }, { "text": "Some Artist" }
+                    ] } } }
+                ],
+                "overlay": {
+                    "musicItemThumbnailOverlayRenderer": { "content": { "musicPlayButtonRenderer": {
+                        "playNavigationEndpoint": { "watchEndpoint": {
+                            "videoId": video_id,
+                            "watchEndpointMusicSupportedConfigs": { "watchEndpointMusicConfig": {
+                                "musicVideoType": music_video_type
+                            } }
+                        } }
+                    } } }
+                }
+            }
+        })
+    }
+
+    /// A response whose single shelf holds `rows`, read by a path `shelf_items`
+    /// checks explicitly (so the assertion cannot depend on key ordering).
+    fn one_shelf(rows: Vec<Value>) -> Value {
+        json!({
+            "contents": { "sectionListRenderer": { "contents": [
+                { "musicShelfRenderer": { "contents": rows } }
+            ] } }
+        })
+    }
+
+    /// L10's exact regression: a UGC-typed row with a **clean** title must be
+    /// dropped on the paths that carry the typed signal.
+    ///
+    /// Both inputs here look identical to the title fallback in
+    /// `src-tauri/src/commands/convert.rs` — badge "Song", no "Official Video"
+    /// marker, non-empty title — so only `musicVideoType` distinguishes them.
+    /// Before this was pinned, the row was kept: the app-level filter can see a
+    /// title and nothing else, and nothing carried the type far enough to stop
+    /// it. Reverting `is_non_audio_row` to the badge check alone brings the UGC
+    /// row back and fails this test.
+    #[test]
+    fn a_ugc_typed_row_with_a_clean_title_is_dropped() {
+        const UGC_ID: &str = "ugc-clean-title";
+        const UGC_TITLE: &str = "Blinding Lights (Cover)";
+
+        let official = search_row(
+            "atv-official",
+            "Blinding Lights",
+            "Song",
+            "MUSIC_VIDEO_TYPE_ATV",
+        );
+        let ugc = search_row(UGC_ID, UGC_TITLE, "Song", "MUSIC_VIDEO_TYPE_UGC");
+        let resp = one_shelf(vec![official, ugc]);
+
+        // The shape is parseable — the ATV row comes through — so the UGC row's
+        // absence below cannot be blamed on a row this parser cannot read.
+        let parsed = tracks(&resp);
+        assert_eq!(
+            parsed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["atv-official"],
+            "the official audio row is kept and the clean-titled UGC row is not"
+        );
+        assert!(
+            !parsed.iter().any(|t| t.title == UGC_TITLE),
+            "a UGC upload must not reach the caller on the strength of its title"
+        );
+
+        // And the reason is the type alone, not the badge or the title.
+        let ugc_row = search_row(UGC_ID, UGC_TITLE, "Song", "MUSIC_VIDEO_TYPE_UGC");
+        let ugc_row = ugc_row.get("musicResponsiveListItemRenderer").unwrap();
+        assert!(
+            is_non_audio_row(ugc_row),
+            "the typed signal alone must classify the row as non-audio"
+        );
+    }
 
     #[test]
     fn parses_durations() {
@@ -1383,5 +1513,141 @@ mod tests {
                 "credits: {name} produced a byline"
             );
         }
+    }
+
+    /// M14: the backward scan must skip a run that carries no string `text`
+    /// rather than abandon the whole search.
+    ///
+    /// The subscriber count sits *before* a structural run in document order, so
+    /// the loop meets the textless run first. With `?` in place of `continue`,
+    /// the count that is present one run earlier is silently lost.
+    #[test]
+    fn audience_skips_textless_runs_instead_of_abandoning_the_scan() {
+        let row = json!({
+            "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "The Weeknd" }] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Artist" },
+                    { "text": " • " },
+                    { "text": "78.8M monthly audience" },
+                    { "navigationEndpoint": { "browseEndpoint": { "browseId": "UCdecoy" } } }
+                ] } } }
+            ]
+        });
+        assert_eq!(
+            audience(&row),
+            Some(78_800_000),
+            "a textless run after the count must not hide the count"
+        );
+    }
+
+    /// M14 for the year: the same backward scan, the same requirement. A
+    /// textless run — including one whose `text` is the wrong JSON type — is
+    /// skipped, not fatal.
+    #[test]
+    fn trailing_year_skips_textless_runs_instead_of_abandoning_the_scan() {
+        let runs = vec![
+            json!({ "text": "Album" }),
+            json!({ "text": " • " }),
+            json!({ "text": "2013" }),
+            json!({ "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREb_x" } } }),
+        ];
+        assert_eq!(trailing_year(&runs), Some(2013));
+
+        let null_then_year = vec![json!({ "text": "2013" }), json!({ "text": null })];
+        assert_eq!(trailing_year(&null_then_year), Some(2013));
+
+        assert_eq!(trailing_year(&[json!({ "text": "not a year" })]), None);
+        assert_eq!(trailing_year(&[]), None);
+    }
+
+    /// 3.8: a response that carries rows but yields no tracks must say so.
+    ///
+    /// "The renderer was renamed" and "the search found nothing" are identical
+    /// from the caller's side, and the warning is the only thing that tells them
+    /// apart. Asserting on it needs a capturing subscriber: `tracing` ships no
+    /// test subscriber and this crate must not gain a `tracing-subscriber`
+    /// dependency for one test, so the five required methods are implemented
+    /// here. The dispatcher is thread-local, so parallel tests cannot see each
+    /// other's events.
+    #[test]
+    fn a_response_with_rows_that_yield_nothing_warns_once() {
+        use std::sync::{Arc, Mutex};
+
+        /// Collects the `message` field of every event recorded through it.
+        #[derive(Clone, Default)]
+        struct CapturedWarnings(Arc<Mutex<Vec<String>>>);
+
+        struct MessageVisitor(String);
+
+        impl tracing::field::Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl tracing::Subscriber for CapturedWarnings {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut visitor = MessageVisitor(String::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        // A row renderer the parser cannot read: no title, no id. The row was
+        // there, so this is a layout change, not an empty result.
+        let unreadable_row = json!({
+            "musicResponsiveListItemRenderer": { "playlistItemData": { "videoId": "abc" } }
+        });
+        // A response with no rows at all: a genuine "no results", which must not
+        // cry wolf.
+        let no_results = json!({
+            "contents": { "sectionListRenderer": { "contents": [
+                { "itemSectionRenderer": { "contents": [
+                    { "messageRenderer": { "text": { "runs": [{ "text": "No results found" }] } } }
+                ] } }
+            ] } }
+        });
+        // A response whose only row this parser dropped on purpose (a UGC
+        // upload). Empty, but explained — a video-heavy search must not look
+        // like a layout change.
+        let only_dropped_on_purpose = one_shelf(vec![search_row(
+            "ugc-only",
+            "Some Cover",
+            "Song",
+            "MUSIC_VIDEO_TYPE_UGC",
+        )]);
+
+        let warnings = CapturedWarnings::default();
+        let captured = warnings.clone();
+        tracing::subscriber::with_default(warnings, || {
+            assert!(tracks(&unreadable_row).is_empty());
+            assert!(tracks(&no_results).is_empty());
+            assert!(tracks(&only_dropped_on_purpose).is_empty());
+        });
+
+        let logged = captured.0.lock().unwrap().clone();
+        assert_eq!(
+            logged.len(),
+            1,
+            "exactly one warning: the unreadable row. The empty search and the \
+             all-UGC page are explained results. Got {logged:?}"
+        );
+        assert!(
+            logged[0].contains("row(s) in the response but none could be parsed"),
+            "unexpected warning text: {logged:?}"
+        );
     }
 }

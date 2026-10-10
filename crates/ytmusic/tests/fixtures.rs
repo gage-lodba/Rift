@@ -139,6 +139,11 @@ fn search_albums_keeps_an_unlinked_byline() {
 
 /// The UGC filter is what keeps remixes and re-uploads out of results; if it
 /// regresses, this fixture's UGC rows come back.
+///
+/// The ids are named rather than merely counted: a count alone cannot say
+/// *which* row came back, so a regression would read as "one extra track" with
+/// nothing to point at. The two `MUSIC_VIDEO_TYPE_UGC` rows below are the typed
+/// signal's own; the `OMV` and podcast-episode rows are dropped by their badge.
 #[test]
 fn search_tracks_drops_ugc_and_video_rows() {
     let tracks = raw::tracks(&fixture("search_tracks.json"));
@@ -149,6 +154,23 @@ fn search_tracks_drops_ugc_and_video_rows() {
     for t in &tracks {
         assert!(!t.id.is_empty());
         assert!(!t.title.is_empty(), "title lost for {}", t.id);
+    }
+
+    // Rows the fixture carries and the parser must not return. The first two
+    // are typed `MUSIC_VIDEO_TYPE_UGC`, the third `MUSIC_VIDEO_TYPE_OMV`, and
+    // the last three are podcast episodes.
+    for dropped in [
+        "Dp-MTReQl0A",
+        "0OQq9jEeLvI",
+        "Mx92lTYxrJQ",
+        "LfCDDbRl9_Y",
+        "KEz-w6-NU78",
+        "4GmQengq5F8",
+    ] {
+        assert!(
+            !tracks.iter().any(|t| t.id == dropped),
+            "{dropped} survived the audio filter: {tracks:#?}"
+        );
     }
 }
 
