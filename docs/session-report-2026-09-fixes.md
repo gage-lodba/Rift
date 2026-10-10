@@ -17,17 +17,27 @@ happened when it was fixed.
 
 ## 1. What changed
 
-**Frozen revision `754e4e1`** — 25 commits on top of `38aea9f`. The review's own
-fixes landed in an earlier block (`7df0c81..baa5af8`, recorded item by item in
-`docs/code-review-2026-09.md`); this session closed the items that block deferred,
-fixed what re-verification found, finished the accessibility work, and wired the
-CI. Every claim below is one of those 25 commits or is attributed to the run that
-produced it.
+**Product source frozen at `754e4e1`; the session's head is `4005a4e`** — 28 commits
+on top of `38aea9f`. The review's own fixes landed in an earlier block
+(`7df0c81..baa5af8`, recorded item by item in `docs/code-review-2026-09.md`); this
+session closed the items that block deferred, fixed what re-verification found,
+finished the accessibility work, and wired the CI.
+
+Three revisions appear in this report and they are not interchangeable. `754e4e1` is
+the freeze the acceptance numbers were measured on. `e28730c` is the verifier's
+revision, **byte-identical** to it in product source. `4005a4e` adds the test that
+closes the last guard gap (§3); its only product-tree difference is `#[cfg(test)]`
+seam plumbing that no release build contains — and its backend count is 163 rather
+than 162 because a test arrived, not because behaviour moved.
+
+Two commits in the range are not fix work and are listed apart rather than in the
+table: `11b6258` is the CI change this report describes (the `tauri-cli` install, the
+Windows unskips, the guards), and `e28730c` records the session in these documents.
 
 One note on the numbers themselves, because it is this session's theme: an interim
-count of these commits read thirteen, then fourteen, and settled at 25 — each figure
-was right at the moment it was counted and stale by the time it was quoted. The
-table below is `git log --oneline 38aea9f..754e4e1`, which is the only form that
+count of these commits read thirteen, then fourteen, then 25, and settled at 28 —
+each figure right at the moment it was counted and stale by the time it was quoted.
+The table below is `git log --oneline 38aea9f..4005a4e`, which is the only form that
 cannot drift, and every count in this report names the revision it was measured on.
 
 | Item | Commit(s) | One line |
@@ -165,6 +175,25 @@ wasm32-unknown-unknown --locked` exit 0 in both the CI form and with `--all-targ
 backend **162 passed / 0 failed** (13 + 90 + 3 + 4 + 37 + 15); frontend **84 passed /
 0 failed**; the DOM-shim check 10 ok; the three CI guards exit 0 under Git Bash.
 
+### The verifier's run on `e28730c`, attributed
+
+The same block, run independently with a private target directory and no environment
+overrides, with the same results: fmt 0; clippy backend 0; clippy `rift-ui` in both
+forms 0; backend **162 passed / 0 failed** (13 + 90 + 3 + 4 + 37 + 15); frontend
+**84 passed / 0 failed**; DOM-shim 10 ok; three guards 0. Their revision is not the
+freeze revision, so they confirmed by diff that product source is **byte-identical**
+between them — `git diff --stat 754e4e1..e28730c` over `src-tauri/src`, `crates`,
+`types` and `ui/src` is empty, which I re-ran to check. Two independent runs of the
+same block agreeing on the same product source is as close to a reproduced acceptance
+as this session can produce.
+
+**And one number after that, which is a test arriving rather than behaviour moving:**
+with `4005a4e` the backend is **163 passed / 0 failed** (ytmusic 38 + 15). The only
+product-tree difference between `754e4e1` and `4005a4e` is `#[cfg(test)]` seam
+plumbing — the loopback substitution for `context::home()` and the client's test
+router — so it does not exist in a release build. Where this report says 162, it means
+`754e4e1`/`e28730c`; 163 is `4005a4e`.
+
 ### Phase 6, verified rather than read
 
 | Claim | Evidence | Verdict |
@@ -260,11 +289,16 @@ it returns a green result, so what it damages is confidence.
   described. Writing the regression guard is what exposed the false claim; the
   guard now asserts the real end state, "no in-flight claim may be left behind"
   (`src-tauri/src/commands/downloads.rs:441-476`).
-- **H2's guard stops at the helper.** `crates/ytmusic/src/context.rs:178-182`
-  exercises `resolve_client_version` — where the caching rule lives — and says so:
-  `client_version` short-circuits on the process-wide cache before ever reaching
-  it. The helper is pinned; the call site that decides whether to reach the helper
-  is not.
+- **H2's guard stopped at the helper — the last gap to close** (`4005a4e`). The
+  committed test exercised `resolve_client_version`, where the caching rule lives,
+  and said so: `client_version` short-circuits on the process-wide cache before ever
+  reaching it, so reintroducing the defect at the *shipped* entry point left every
+  crate test green. It took three passes to notice because each earlier guard was
+  **true and narrower than its name** — the helper-level test really did pin the
+  helper. The new test drives the shipped `client_version` against the loopback
+  server with the first home-page scrape failing and the next answered, asserting the
+  fallback is returned once and **not** cached, so the call-site mutation now fails
+  it while the helper-level test stays green: the gap and its closure in one run.
 - **`download_ytdlp` had no coverage at all.** `src-tauri/src/fetch.rs:675-679`:
   "Nothing else in the repo drives `download_ytdlp` at all, so moving the
   verification after `create_dir_all` and the write leaves every other test green —
@@ -304,12 +338,14 @@ it returns a green result, so what it damages is confidence.
   identical: make the guard say exactly what is true, and it starts finding what is
   not.
 
-Two of these are *recorded* gaps rather than closed ones — the scanner's blind spot
-and H2's call site — and the two verifier findings at the end of the list are still
-to be closed or recorded. That is the honest shape, and it is the one worth
-carrying forward: a guard whose coverage is narrower than its name, written down
-where the next reader will find it, is worth more than a guard that claims the
-whole property and silently holds half of it.
+Seventeen of these closed with tests, most of them only after the verifier
+demonstrated the mutation surviving. **One is a *recorded* gap rather than a closed
+one** — the `ipc_contract` scanner's blind spot — and it stays that way on purpose: a
+text scanner cannot see through a binding, and making it try would trade a recorded
+gap for an unreliable one. That is the honest shape, and it is the one worth carrying
+forward: a guard whose coverage is narrower than its name, written down where the
+next reader will find it, is worth more than a guard that claims the whole property
+and silently holds half of it.
 
 One more instance, one level up from the code — **the review's own citations aged
 out.** M10's entry cited `queue.rs:66, :158, :165, :196` for `remap_history`'s call
@@ -343,6 +379,14 @@ to do with this repository's tooling at all.
   from, so two checkouts building into one directory can serve each other's
   binaries: a mutation run can "pass" without running the mutated code, or fail
   against a change it never saw.
+- **A test's environment is part of its evidence.** The first version of H2's new
+  call-site test omitted the loopback setup, so `context::home()` still pointed at
+  the real site and the call returned a **live** client version from
+  music.youtube.com: an assertion that could have been satisfied by the wrong thing,
+  with a real network request inside a suite that is supposed to need none. It was
+  caught, and the committed version asserts the planned failure page was actually
+  consumed (`4005a4e`). Same family as the two above — the thing that made the
+  observation true was outside the code under test.
 - **A guard invocation that failed silently because of *how* it was run.** The lead
   invoked `check-duplicate-deps.sh` from PowerShell, where `bash` resolves to WSL's —
   which has no `cargo`. With `set -euo pipefail` and cargo's stderr sent to
@@ -361,14 +405,15 @@ to do with this repository's tooling at all.
     recorded here too.
 
 **A mutation result is only evidence if the mutated source was compiled, and the
-procedure that reverts it must make that provable.** These three broke that rule
-from different ends — one by never compiling the mutation, one by making the
-reversion invisible, one by never reaching the check at all — and in every case "the
-mutation went red" and "the restore went green" were equally untrustworthy while
-looking exactly like evidence. The mitigation this session adopted (a private
-`CARGO_TARGET_DIR`, §5) addresses the second; the first needs the restore step
-itself to leave a provable change signal, and the third needs the guard to fail
-loudly when it cannot run.
+procedure that reverts it must make that provable.** These four broke that rule from
+different ends — one by never compiling the mutation, one by making the reversion
+invisible, one by never reaching the check at all, one by proving the wrong
+environment — and in every case "the mutation went red" and "the restore went green"
+were equally untrustworthy while looking exactly like evidence. The mitigation this
+session adopted (a private `CARGO_TARGET_DIR`, §5) addresses the second; the first
+needs the restore step itself to leave a provable change signal, the third needs the
+guard to fail loudly when it cannot run, and the fourth needs the test to assert the
+environment it set up.
 
 ---
 
@@ -380,12 +425,12 @@ loudly when it cannot run.
   says so rather than implying coverage.
 - **The launch-time update probe stays silent on failure** — a background probe on
   a possibly-offline launch is the common case, and a toast per launch is worse.
-- **Two guard gaps are recorded rather than closed**, deliberately: the
-  `ipc_contract` text scanner cannot see a payload built into a local
-  (`src-tauri/tests/ipc_contract.rs:275-284`), and H2's regression guard stops at the
-  helper while the call site short-circuits before it
-  (`crates/ytmusic/src/context.rs:178-182`). §3 argues that a gap which says so is
-  worth more than a guard that claims the whole property.
+- **One guard gap is recorded rather than closed**, deliberately: the `ipc_contract`
+  text scanner cannot see a payload built into a local
+  (`src-tauri/tests/ipc_contract.rs:275-284`). H2's call-site gap was in this list
+  until `4005a4e` closed it with a test that drives the shipped entry point; §3
+  argues that a gap which says so is worth more than a guard that claims the whole
+  property, and that the scanner is the one where saying so is the right answer.
 - **The shuffle fairness quirk** — a pick dropped without playing stays in the
   played set, so that track waits for the next cycle. The history cannot distinguish
   a reservation from a genuine play, and un-recording it would corrupt the replay

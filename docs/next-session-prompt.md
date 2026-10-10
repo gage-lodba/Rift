@@ -1,10 +1,10 @@
 # Fix the defects found in the September 2026 code review
 
-> **COMPLETED — this prompt has been run.** The work is frozen at revision `754e4e1`
-> (25 commits on top of `38aea9f`). The session's report is
-> [`docs/session-report-2026-09-fixes.md`](session-report-2026-09-fixes.md): what
-> changed, what was verified and by which run, what could not be reproduced, and what
-> was deliberately left. The per-item record stays in
+> **COMPLETED — this prompt has been run.** Product source is frozen at `754e4e1`;
+> the session's head is `4005a4e`, 28 commits on top of `38aea9f`. The session's
+> report is [`docs/session-report-2026-09-fixes.md`](session-report-2026-09-fixes.md):
+> what changed, what was verified and by which run, what could not be reproduced, and
+> what was deliberately left. The per-item record stays in
 > [`docs/code-review-2026-09.md`](code-review-2026-09.md), which is the authority on
 > any single item. The text below is the prompt exactly as it was issued — nothing
 > rewritten — with two of its items (1.4 and 1.5) carrying corrections inline,
