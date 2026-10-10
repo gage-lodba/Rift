@@ -494,6 +494,12 @@ mod tests {
     /// headers, so a change here is visible in one place.
     const CLIENT_VERSION: &str = "1.20250901.00.00";
 
+    /// Home-page requests that should answer without a client version. Set by the
+    /// H2 guard and decremented as it is spent; zero for every other test, so the
+    /// shared server behaves exactly as it always did.
+    static HOME_SCRAPE_FAILURES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
     fn home_html() -> String {
         format!(
             r#"<script>window["ytcfg"].set({{"INNERTUBE_CONTEXT_CLIENT_VERSION":"{CLIENT_VERSION}"}});</script>"#
@@ -628,15 +634,31 @@ mod tests {
 
             routes.insert(
                 "/".to_owned(),
-                Box::new(|_: &Request| Response {
-                    status: 200,
-                    // `identity::fetch` reads visitor data from this cookie
-                    // before scraping the HTML, so it is what fills the pool.
-                    headers: vec![(
-                        "Set-Cookie".to_owned(),
-                        format!("__Secure-YEC={HOME_VISITOR}; Path=/; Secure"),
-                    )],
-                    body: home_html(),
+                Box::new(|_: &Request| {
+                    // A planned failure answers a page with no version in it, so
+                    // the scrape returns nothing. Every other test leaves the
+                    // counter at zero and gets the versioned page.
+                    let failing = HOME_SCRAPE_FAILURES
+                        .fetch_update(
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                            |left| left.checked_sub(1),
+                        )
+                        .is_ok();
+                    Response {
+                        status: 200,
+                        // `identity::fetch` reads visitor data from this cookie
+                        // before scraping the HTML, so it is what fills the pool.
+                        headers: vec![(
+                            "Set-Cookie".to_owned(),
+                            format!("__Secure-YEC={HOME_VISITOR}; Path=/; Secure"),
+                        )],
+                        body: if failing {
+                            "<html></html>".to_owned()
+                        } else {
+                            home_html()
+                        },
+                    }
                 }),
             );
 
@@ -1212,6 +1234,56 @@ mod tests {
         assert_eq!(
             followed, limit,
             "the walk must spend its request budget and no more"
+        );
+    }
+
+    /// H2's regression guard, at the entry point the app actually calls.
+    ///
+    /// The unit test in `context.rs` drives `resolve_client_version`, which
+    /// restates the caching rule and cannot see this call site — and the defect
+    /// the review recorded lived *here*: `client_version` pinning the fallback
+    /// when the scrape failed, so one bad home page made every later request in
+    /// the process send a stale `clientVersion`, which innertube answers with 400
+    /// (a status the 403-only retry does not cover). The plan below fails the
+    /// scrape once and then answers properly: the fallback may serve the first
+    /// call, but it must not be remembered.
+    ///
+    /// The installed cache is what makes this test possible at all: the
+    /// process-global one cannot be cleared, so sharing it would make the
+    /// assertions depend on whether another test had already scraped a version.
+    /// It also means this test can never fill the global for anyone else.
+    #[tokio::test]
+    async fn a_failed_client_version_scrape_is_not_remembered() {
+        let _gate = visitor_gate().await;
+        // Point `context::home()` at the loopback server before scraping.
+        // Without this the scrape would go to the real YouTube Music — the one
+        // way this test can pass for a reason that has nothing to do with the
+        // code under test.
+        let _server = server();
+        let _fresh = context::FreshClientVersionCache::install();
+        HOME_SCRAPE_FAILURES.store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let http = reqwest::Client::builder().build().expect("http client");
+        let first = context::client_version(&http, USER_AGENT).await;
+        assert_eq!(
+            first,
+            context::FALLBACK_VERSION,
+            "a home page carrying no version must fall back rather than invent one"
+        );
+        assert!(
+            HOME_SCRAPE_FAILURES.load(std::sync::atomic::Ordering::SeqCst) == 0,
+            "the planned bad home page must have been the one this call read"
+        );
+
+        let second = context::client_version(&http, USER_AGENT).await;
+        assert_ne!(
+            second,
+            context::FALLBACK_VERSION,
+            "a failed scrape must not be cached: the next call has to try again"
+        );
+        assert_eq!(
+            second, CLIENT_VERSION,
+            "the second scrape reads the value the page now carries"
         );
     }
 

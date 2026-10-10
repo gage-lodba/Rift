@@ -39,9 +39,77 @@ pub(crate) fn set_home_for_test(url: &str) {
 }
 
 /// Last-resort client version when the home page can't be scraped.
-const FALLBACK_VERSION: &str = "1.20240101.01.00";
+pub(crate) const FALLBACK_VERSION: &str = "1.20240101.01.00";
 
 static CLIENT_VERSION: OnceLock<String> = OnceLock::new();
+
+/// The cache [`client_version`] reads and writes.
+///
+/// A shipped build has exactly one, [`CLIENT_VERSION`]. A test may install a
+/// private one for the length of its body instead: H2's defect lived in this
+/// entry point's *wiring* rather than in the caching rule, so the guard has to
+/// drive the entry point itself, and the process-global cell cannot be cleared —
+/// any test sharing it would pass or fail on which test ran first. Test-only
+/// plumbing rather than a production parameter, for the same reason [`home`] is
+/// compile-time gated: nothing a user runs can point the client version
+/// somewhere else.
+fn client_version_cache() -> &'static OnceLock<String> {
+    #[cfg(test)]
+    if let Some(installed) = test_cache::installed() {
+        return installed;
+    }
+    &CLIENT_VERSION
+}
+
+/// A private client-version cache for one test, restored when it is dropped.
+#[cfg(test)]
+pub(crate) struct FreshClientVersionCache(Option<&'static OnceLock<String>>);
+
+#[cfg(test)]
+impl FreshClientVersionCache {
+    /// Install a cache that starts empty, whatever the process-global one holds.
+    pub(crate) fn install() -> Self {
+        // Leaked because the accessor needs a `&'static`: one cell per test, not
+        // one per request.
+        let fresh: &'static OnceLock<String> = Box::leak(Box::new(OnceLock::new()));
+        Self(test_cache::swap(Some(fresh)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for FreshClientVersionCache {
+    fn drop(&mut self) {
+        test_cache::swap(self.0);
+    }
+}
+
+#[cfg(test)]
+mod test_cache {
+    use super::OnceLock;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// The cache installed by the test running on this thread, if any.
+        ///
+        /// Thread-local rather than a second process-global: a swap that every
+        /// test could see would reintroduce exactly the order-dependence this
+        /// exists to remove. Safe because the transport tests drive the client
+        /// on a current-thread runtime, so the install and the calls it wraps
+        /// stay on one thread.
+        static INSTALLED: RefCell<Option<&'static OnceLock<String>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn installed() -> Option<&'static OnceLock<String>> {
+        INSTALLED.with(|slot| *slot.borrow())
+    }
+
+    /// Point the accessor at `cache`, returning what it pointed at before.
+    pub(super) fn swap(
+        cache: Option<&'static OnceLock<String>>,
+    ) -> Option<&'static OnceLock<String>> {
+        INSTALLED.with(|slot| slot.replace(cache))
+    }
+}
 
 /// Build the `context` object merged into every innertube request body.
 pub fn context_object(visitor_data: &str, client_version: &str) -> Value {
@@ -61,11 +129,11 @@ pub fn context_object(visitor_data: &str, client_version: &str) -> Value {
 
 /// Fetch and cache the current `WEB_REMIX` client version from the home page.
 pub async fn client_version(http: &reqwest::Client, user_agent: &str) -> String {
-    if let Some(v) = CLIENT_VERSION.get() {
+    if let Some(v) = client_version_cache().get() {
         return v.clone();
     }
     let scraped = scrape(http, user_agent).await;
-    resolve_client_version(&CLIENT_VERSION, || scraped)
+    resolve_client_version(client_version_cache(), || scraped)
 }
 
 /// Resolve the client version, caching only a *successful* scrape.
