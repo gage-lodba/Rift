@@ -88,32 +88,50 @@ impl Client {
     /// there truncated the import at the first video-only page — the rest of the
     /// playlist silently missing, with no error to show for it.
     ///
-    /// What does end the walk, in order: the caller's `limit`, the absence of a
-    /// continuation token, a page that carried no items at all, and a token that
-    /// comes back unchanged (which is the spin the old track-based guard was
-    /// actually protecting against — a page with no rows and a token that never
-    /// advances).
+    /// What does end the walk, in order: the caller's `limit`; the absence of a
+    /// continuation token; the request budget (below), which is what keeps a run
+    /// of track-less pages from making the walk unbounded; a page that carried no
+    /// items at all; and a token that comes back unchanged, which is the spin the
+    /// old track-based guard was actually protecting against — a page with no
+    /// rows and a token that never advances.
     pub async fn playlist(&self, playlist_id: &str, limit: usize) -> Result<Playlist> {
         let first = self.browse_raw(&format!("VL{playlist_id}")).await?;
         let page = parse::playlist_page(&first);
         let name = page.name.unwrap_or_default();
         let mut tracks = page.tracks;
         let mut continuation = page.continuation;
+        // Continuation requests this call may still make.
+        //
+        // A page that yields tracks advances `tracks` by at least one, so those
+        // pages are already bounded by `limit`. What that bound does not cover is
+        // a page whose rows were all filtered out: it advances nothing, so the
+        // walk would keep going for exactly as long as the server keeps handing
+        // out *fresh* tokens — one round trip per page, with no ceiling at all.
+        // Budgeting `limit` requests for the whole call makes it finite without
+        // inventing a constant: a caller asking for N tracks is also a caller
+        // agreeing to wait for at most N round trips, and a playlist whose pages
+        // each carry real tracks needs far fewer than that. Hitting the budget
+        // returns what was found so far, exactly as running out of tokens does.
+        let mut requests_left = limit;
 
         while tracks.len() < limit {
             let Some(token) = continuation else { break };
+            if requests_left == 0 {
+                break;
+            }
+            requests_left -= 1;
             let next = self
                 .post("browse", json!({ "continuation": token }))
                 .await?;
             let page = parse::playlist_page(&next);
             // A page whose rows were all filtered out is explained, not empty:
-            // keep following its token.
+            // keep following its token, budget permitting.
             if page.items_seen == 0 {
                 break;
             }
             // ... but only while the token actually advances. Following a token
-            // that comes back unchanged would spin forever, and with the
-            // track-based guard gone that is otherwise unguarded.
+            // that comes back unchanged would spin, and it is not the budget's
+            // job to notice that.
             if page.continuation.as_deref() == Some(token.as_str()) {
                 break;
             }
@@ -540,6 +558,12 @@ mod tests {
     /// gives up.
     const STUCK_TOKEN_LIMIT: usize = 5;
 
+    /// Fruitless pages the "endless" route serves, each with a *fresh* token,
+    /// before a real track finally arrives. Higher than any cap a `playlist`
+    /// call should follow, so a missing budget is visible as that track being
+    /// reached — and as this many requests — rather than as a hang.
+    const ENDLESS_FILTERED_PAGES: usize = 40;
+
     /// A playlist page: a named header, some rows, and optionally a continuation
     /// token. Rows and a token coexist on a real page — the shape the guard in
     /// `playlist` exists for is a page with a token but *no* rows, expressed by
@@ -721,6 +745,42 @@ mod tests {
                         } else {
                             playlist_page("Stuck", vec![track_row("stuck-late", "Late", "A")], None)
                         });
+                    }
+                    // A playlist with an unbounded run of *fruitless* pages: every
+                    // one carries a UGC row only, and every one hands out a fresh
+                    // token, so neither the itemless guard nor the no-advance guard
+                    // can end the walk. The run stops after
+                    // `ENDLESS_FILTERED_PAGES`, where a real track arrives, so a
+                    // walk that follows every token is caught by an assertion in
+                    // `playlist_pagination_bounds_a_run_of_fruitless_pages`
+                    // instead of running until the harness gives up.
+                    if let Some(tx) = id
+                        .strip_prefix("VL")
+                        .unwrap_or(id)
+                        .strip_prefix("PLtest_endless_")
+                    {
+                        return Response::json(playlist_page(
+                            "Endless",
+                            vec![ugc_row(&format!("e{tx}-ugc-0"))],
+                            Some(&format!("{tx}:endless-1")),
+                        ));
+                    }
+                    if let Some((tx, n)) = token.split_once(":endless-") {
+                        if let Ok(n) = n.parse::<usize>() {
+                            return Response::json(if n < ENDLESS_FILTERED_PAGES {
+                                playlist_page(
+                                    "Endless",
+                                    vec![ugc_row(&format!("e{tx}-ugc-{n}"))],
+                                    Some(&format!("{tx}:endless-{}", n + 1)),
+                                )
+                            } else {
+                                playlist_page(
+                                    "Endless",
+                                    vec![track_row(&format!("e{tx}-late"), "Late", "A")],
+                                    None,
+                                )
+                            });
+                        }
                     }
                     // `playlist()` requests `VL<id>`, so the prefix is stripped
                     // before matching.
@@ -1107,6 +1167,51 @@ mod tests {
             playlist.tracks.is_empty(),
             "a token that does not advance must end the walk: {:?}",
             playlist.tracks
+        );
+    }
+
+    /// The walk is finite even when *no* page yields a track.
+    ///
+    /// Following a filtered page fixed the truncation but on its own removed the
+    /// only bound there was: a page whose rows all filter out advances no track,
+    /// so the walk ended only when the playlist did — one round trip per page,
+    /// for as long as the server kept issuing fresh tokens, with neither the
+    /// itemless guard nor the no-advance guard able to fire. The route here
+    /// serves [`ENDLESS_FILTERED_PAGES`] such pages and then a real track, so a
+    /// missing budget shows up as that track arriving and as a request count of
+    /// 40, rather than as a hang.
+    #[tokio::test]
+    async fn playlist_pagination_bounds_a_run_of_fruitless_pages() {
+        let _gate = visitor_gate().await;
+        let fake = server();
+        let c = client();
+        let tx = tx();
+        let limit = 5;
+        let playlist = c
+            .playlist(&format!("PLtest_endless_{tx}"), limit)
+            .await
+            .expect("playlist");
+
+        // Nothing on any of those pages was audio, so the walk stops with
+        // nothing — the point is what it did *not* do: reach the late track.
+        assert!(
+            playlist.tracks.is_empty(),
+            "no page yielded audio, so nothing may come back: {:?}",
+            playlist.tracks
+        );
+        assert!(
+            !playlist.tracks.iter().any(|t| t.id.ends_with("-late")),
+            "the walk must stop at the budget, not at the late track"
+        );
+
+        let prefix = format!("{tx}:endless-");
+        let followed = logged(&fake.requests)
+            .iter()
+            .filter(|r| r.continuation().starts_with(&prefix))
+            .count();
+        assert_eq!(
+            followed, limit,
+            "the walk must spend its request budget and no more"
         );
     }
 
