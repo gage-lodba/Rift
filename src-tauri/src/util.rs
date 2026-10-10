@@ -122,9 +122,45 @@ impl Persister {
 /// Write via a temp file + rename so a crash mid-write can't leave a truncated
 /// file behind.
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let tmp = temp_path_for(path)?;
+    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        // Neither a failed write nor a failed rename should leave scratch next
+        // to the user's data — it would accumulate for every failed save.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// The temp path [`atomic_write`] publishes from: a unique name *constructed in
+/// the target's own directory*, so the rename stays within one filesystem (the
+/// property the atomicity depends on) by construction rather than by relying on
+/// `Path::with_extension` happening to be lexical.
+///
+/// The process id plus an in-process counter keep the name unique per call.
+/// A predictable shared temp name — what `with_extension("tmp")` produced —
+/// lets two writers to the same target interleave: the winner's rename can
+/// publish the loser's half-written bytes, or fail outright because the loser
+/// already renamed the one temp file away. Unique names also mean a temp orphaned
+/// by a hard crash is never picked up and published by a later write.
+fn temp_path_for(path: &Path) -> std::io::Result<PathBuf> {
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no file name to write", path.display()),
+        ));
+    };
+    // A bare relative name has `""` as its parent, which joins to a sibling
+    // resolved against the same working directory — the same directory either way.
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(dir.join(format!(
+        ".{}.{}-{unique}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
 }
 
 /// Check network connectivity with a lightweight HTTP request. Used to skip
@@ -286,12 +322,139 @@ mod tests {
         atomic_write(&path, b"second").expect("overwrite");
         assert_eq!(std::fs::read(&path).expect("read"), b"second");
 
-        // The temp file lives *beside* the target (a lexical `with_extension`),
-        // which is what makes the rename atomic within one filesystem.
-        assert_eq!(path.with_extension("tmp").parent(), path.parent());
-        assert!(
-            !path.with_extension("tmp").exists(),
+        // Nothing but the target may be left in the directory: a leftover temp
+        // means a rename was skipped, and junk next to the user's state is a bug.
+        assert_eq!(
+            dir_names(&dir),
+            vec!["playback.json".to_owned()],
             "the temp file must be renamed away, not left behind"
         );
+        // The rewrite replaces the target in place rather than, say, appending.
+        assert_eq!(std::fs::read(&path).expect("read"), b"second");
+    }
+
+    #[test]
+    fn the_temp_path_is_a_unique_sibling_of_the_target() {
+        let dir = TempDir::new("util-temp-path");
+        let path = dir.join("settings.json");
+
+        let first = temp_path_for(&path).expect("temp path");
+        let second = temp_path_for(&path).expect("temp path");
+
+        // Beside the target by construction: same directory, so the rename
+        // cannot cross a filesystem boundary and lose its atomicity.
+        assert_eq!(
+            first.parent(),
+            path.parent(),
+            "the temp file must be constructed in the target's own directory"
+        );
+        assert_ne!(first, path, "the temp file must not be the target itself");
+        assert!(
+            first
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("settings.json")),
+            "the temp name should still identify the file it belongs to: {}",
+            first.display()
+        );
+        // Unique: a shared temp name is what lets two concurrent writers publish
+        // each other's half-written bytes.
+        assert_ne!(first, second, "every call must get its own temp path");
+
+        // A bare relative name has no parent directory component, and still
+        // resolves to a sibling in the same working directory.
+        let bare = temp_path_for(Path::new("settings.json")).expect("temp path");
+        assert_eq!(bare.parent(), Some(Path::new("")));
+    }
+
+    #[test]
+    fn a_path_with_no_file_name_is_rejected_rather_than_guessed_at() {
+        // `.`, `..` and the empty path have no file name, so there is no sibling
+        // to write beside; erroring beats inventing a name in some other folder.
+        for target in [PathBuf::from("."), PathBuf::from(".."), PathBuf::new()] {
+            let err =
+                temp_path_for(&target).expect_err("a path with no file name must be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn a_failed_publish_does_not_leave_scratch_behind() {
+        let dir = TempDir::new("util-atomic-fail");
+        // A directory sitting at the target path makes the final rename fail on
+        // every platform, which pins the cleanup instead of an OS-specific error.
+        let path = dir.join("target");
+        std::fs::create_dir(&path).expect("seed directory");
+
+        atomic_write(&path, b"data").expect_err("renaming a file over a directory must fail");
+
+        assert_eq!(
+            dir_names(&dir),
+            vec!["target".to_owned()],
+            "a failed publish must not leave its temp file behind"
+        );
+    }
+
+    #[test]
+    fn the_persister_writes_and_drops_an_identical_payload() {
+        let dir = TempDir::new("util-persister");
+        let path = dir.join("playback.json");
+        let persister = Persister::spawn();
+
+        persister
+            .write(path.clone(), vec![1u8, 2, 3], |v| v.clone())
+            .expect("queue write");
+        drain(&persister, &dir);
+        assert_eq!(std::fs::read(&path).expect("read"), [1, 2, 3]);
+
+        // An identical payload is dropped, and that is observable: delete the
+        // file, re-queue the same bytes, and it must not come back. (M8's write
+        // burst came from the queue snapshot being emitted twice unchanged.)
+        std::fs::remove_file(&path).expect("remove");
+        persister
+            .write(path.clone(), vec![1u8, 2, 3], |v| v.clone())
+            .expect("queue duplicate");
+        drain(&persister, &dir);
+        assert!(
+            !path.exists(),
+            "an unchanged payload must not be written to disk again"
+        );
+
+        // A changed payload is written, so the dedupe can't wedge the file.
+        persister
+            .write(path.clone(), vec![9u8], |v| v.clone())
+            .expect("queue change");
+        drain(&persister, &dir);
+        assert_eq!(std::fs::read(&path).expect("read"), [9]);
+    }
+
+    /// Block until the persister has finished every job queued so far.
+    ///
+    /// Jobs are drained in order on one thread, so a marker job's serialization
+    /// closure running means everything before it is already on disk. The older
+    /// tests slept and hoped; this cannot race.
+    fn drain(persister: &Persister, dir: &TempDir) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        persister
+            .write(dir.join("drain-marker"), (), move |_| {
+                let _ = tx.send(());
+                Vec::new()
+            })
+            .expect("queue drain marker");
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the persister thread did not drain in time");
+    }
+
+    fn dir_names(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
     }
 }
