@@ -150,6 +150,17 @@ const YTDLP_BIN: &str = "yt-dlp";
 /// even though it works under `cargo tauri dev` from a terminal. We look in an
 /// explicit override, then `PATH`, then the usual install dirs, and fall back
 /// to the bare name so the "not found" error still reads sensibly.
+/// Upper bound on the `yt-dlp --version` probe.
+///
+/// The probe is a local, trivial invocation, so this ceiling is not about a slow
+/// one — it is about one that never finishes: a binary on a stalled network
+/// mount, an executable held open by AV, or a wrapper script that waits on
+/// something. `check_ytdlp` is the Settings view's "is yt-dlp usable?" check and
+/// its spinner is the only feedback the view has, so an unbounded wait there is
+/// a permanent "checking…" — the exact wedge [`YTDLP_TIMEOUT`] exists to prevent
+/// on the fetch path, which this second subprocess wait was left out of.
+const YTDLP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Probe the system for a usable yt-dlp: resolve its path, then run
 /// `yt-dlp --version` to confirm it actually executes (a resolved path that
 /// fails to run — wrong arch, missing perms — reports `found: false`).
@@ -162,17 +173,64 @@ pub async fn detect_ytdlp() -> rift_types::YtDlpStatus {
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    match cmd.output().await {
-        Ok(out) if out.status.success() => rift_types::YtDlpStatus {
+    let out = match run_version_probe(cmd, YTDLP_PROBE_TIMEOUT).await {
+        Ok(out) => out,
+        Err(ProbeError::TimedOut) => {
+            warn!(
+                "yt-dlp --version did not finish within {}s; reporting it as unusable",
+                YTDLP_PROBE_TIMEOUT.as_secs()
+            );
+            return not_found(&path, path_str);
+        }
+        Err(ProbeError::Io(e)) => {
+            debug!("could not run the yt-dlp probe at {}: {e}", path.display());
+            return not_found(&path, path_str);
+        }
+    };
+
+    if out.status.success() {
+        rift_types::YtDlpStatus {
             found: true,
             path: Some(path_str),
             version: Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
-        },
-        _ => rift_types::YtDlpStatus {
-            found: false,
-            path: path.is_file().then_some(path_str),
-            version: None,
-        },
+        }
+    } else {
+        not_found(&path, path_str)
+    }
+}
+
+/// `found: false`, keeping the resolved path visible when the file does exist so
+/// Settings can say "there, but it doesn't run".
+fn not_found(path: &Path, path_str: String) -> rift_types::YtDlpStatus {
+    rift_types::YtDlpStatus {
+        found: false,
+        path: path.is_file().then_some(path_str),
+        version: None,
+    }
+}
+
+/// Why a version probe produced no version.
+#[derive(Debug)]
+enum ProbeError {
+    /// The child was still running when the ceiling fired; dropping the
+    /// timed-out future kills it (see [`run_version_probe`]).
+    TimedOut,
+    /// The child could not be spawned, or its output could not be read.
+    Io(std::io::Error),
+}
+
+/// Run a version probe, waiting at most `limit` for the child.
+async fn run_version_probe(
+    mut cmd: tokio::process::Command,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, ProbeError> {
+    // A child that outlives the wait must not be left running: `kill_on_drop`
+    // reaps it as the timed-out future is dropped.
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(ProbeError::Io(e)),
+        Err(_) => Err(ProbeError::TimedOut),
     }
 }
 
@@ -405,7 +463,48 @@ fn probe_ytdlp_locations() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_stem, validate_ytdlp_override};
+    use super::{run_version_probe, safe_stem, validate_ytdlp_override, ProbeError};
+
+    /// A command that keeps running far longer than any ceiling this test
+    /// applies, so only the ceiling can end the wait.
+    #[cfg(windows)]
+    fn sleeper_command() -> tokio::process::Command {
+        // One loopback request per second, `-n` of them: no network needed.
+        let mut cmd = tokio::process::Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn sleeper_command() -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd
+    }
+
+    /// The Settings probe must give up on a child that never finishes.
+    /// `check_ytdlp` can only report "not usable" once the probe *returns*, and
+    /// its spinner is the only feedback the view has, so an unbounded wait there
+    /// is a permanent "checking…". This pins the one subprocess wait H3's
+    /// ceiling did not cover: revert it and this test waits out the sleeper and
+    /// then fails on `Ok`.
+    #[tokio::test]
+    async fn a_version_probe_that_never_finishes_times_out_instead_of_waiting() {
+        let started = std::time::Instant::now();
+        let result =
+            run_version_probe(sleeper_command(), std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            matches!(result, Err(ProbeError::TimedOut)),
+            "expected a timeout, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "the probe must return as soon as the ceiling fires, not when the child ends \
+             (took {:?})",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn safe_stem_preserves_real_ids_and_neutralizes_traversal() {
