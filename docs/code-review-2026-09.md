@@ -37,10 +37,12 @@
 > Both are fixed (`baa5af8`), and the suite was confirmed stable over 20
 > consecutive runs rather than once.
 >
-> **Deferred, with reasons:** L7 (regex caching), L10 (typed UGC signal), M10
-> (shuffle-history remapping), and the `with_extension` shape in M9. Each is
-> noted at its item. L16's `rust-version` and L17's `client.rs` transport tests
-> were deferred and have since been done.
+> **Deferred, with reasons — all four since closed:** L7 regex caching
+> (`a3a55f1`), L10's typed UGC signal (`9de9f22`), M10 shuffle-history remapping
+> (`9a5679f`) and the `with_extension` shape in M9 (`1d2bc94`). Each item carries
+> what closing it took, and two of the four needed their original reasoning
+> corrected rather than merely completed. L16's `rust-version` and L17's
+> `client.rs` transport tests were deferred and have since been done.
 >
 > **Added after this review closed — the frontend harness.** `rift-ui` was the
 > one crate with no tests, so every UI change was unverifiable except by running
@@ -136,6 +138,15 @@ if props.queue.tracks.is_empty() { return html! {}; }
 > a fresh one. Selection is split into `reusable_id` and tested; both tests fail
 > if the eviction is removed (verified). L12's `lock().unwrap()` on the same pool
 > is fixed with a poison-recovering helper.
+>
+> **Follow-up (`a3a55f1`) — here the *guards*, not the fix, were the defect.** The
+> visitor pool is process-global, and `identity::tests`' own lock and
+> `client::tests`' gate did not exclude each other, so under `--test-threads=1` (or
+> an unlucky schedule) the identity tests failed **on unmodified code**. One gate
+> now covers both modules, and every identity test seeds a known pool through
+> `seed_pool_for_test` instead of assuming an empty one; removing that seeding
+> reproduces the reported failure exactly. The same "green for the wrong reason"
+> shape this document already records for the L17 client harness.
 
 `crates/ytmusic/src/identity.rs:25-35`, with `client.rs:186-189`
 
@@ -155,7 +166,7 @@ yield a different id. Fix: drop the id on ban (`p.ids.retain(|i| i != id)`).
 
 ### H2. A stale client version is cached for the whole process
 
-> **FIXED** (`7df0c81`). Only a successful scrape is cached; the fallback stays per-call. The caching rule is extracted as a synchronous helper so both branches are tested without a network. Writing that test found that `OnceLock::get_or_init` alone memoizes its closure's `None` too � the first implementation still cached the fallback.
+> **FIXED** (`7df0c81`). Only a successful scrape is cached; the fallback stays per-call. The caching rule is extracted as a synchronous helper so both branches are tested without a network. Writing that test found that `OnceLock::get_or_init` alone memoizes its closure's `None` too — the first implementation still cached the fallback.
 `crates/ytmusic/src/context.rs:15, 44-49`
 
 ```rust
@@ -249,7 +260,46 @@ right — its comment is accurate.)
 
 ### M2. `is_online` returns *true* when it cannot reach the network
 
-> **FIXED** (`5ab2a7d`). A non-success status is offline, and the response must also carry YouTube's own `x-youtube-client-name` � a portal answers with a perfectly good 200. Split into a pure helper and tested without a round trip.
+> **FIXED** (`5ab2a7d`). A non-success status is offline, and the response must also carry YouTube's own `x-youtube-client-name` — a portal answers with a perfectly good 200. Split into a pure helper and tested without a round trip.
+>
+> **CORRECTED — the discriminator does not exist, and requiring it made
+> `is_online()` permanently `false`.** YouTube's web root never sends
+> `x-youtube-client-name`: a live `HEAD https://www.youtube.com/` answers `200`
+> with `server: ESF` and `content-type: text/html`, and no such header.
+> `crates/ytmusic/src/client.rs:759` shows where the name really appears — it is a
+> header **Rift sends** on innertube requests, not one the HTML root returns. So
+> the probe answered "offline" on a machine that was online, and
+> `src-tauri/src/commands/downloads.rs:267` then aborted every kept-offline retry
+> pass with `offline; giving up on N kept-offline download(s)`. The ~7.5-minute
+> backoff this item exists to avoid became a permanent refusal instead.
+> Falsified live from this machine. **FIXED** (`e867b34`): the probe now requires
+> a 2xx whose *final URL host* is `youtube.com` or a subdomain, compared with a
+> label boundary so `notyoutube.com` does not pass. `server: ESF` is recorded as
+> corroboration and deliberately not required, and the host comes from the
+> redirect chain rather than a mutable Google header, so a header rename cannot
+> silently invert the answer — the hardening this needed
+> (`src-tauri/src/util.rs:169` `is_online`, `:219` `came_from_youtube`, `:279` the
+> live-shape test). Mutations verified: restoring the header rule, restoring the
+> pre-M2 2xx-only rule, dropping the host gate, and a naive `ends_with` each fail
+> a named test.
+>
+> **Corrected once more** (`754e4e1`, the frozen revision) — the *status* was still
+> in the gate, so a 403, 429 or 503 from YouTube's own edge read as offline, and
+> rate limiting is exactly when the download retry pass runs: the same
+> false-offline class returned, with a more plausible trigger.
+> `came_from_youtube` (`src-tauri/src/util.rs:226`) now answers on the final URL
+> host alone, the status deliberately still in the signature and documented as
+> ignored so the test stating the indifference ("a 301 from YouTube is online")
+> keeps it visible and re-adding a gate fails immediately instead of being
+> invisible. A transport failure is the only "offline" now, decided inside the
+> tested rule rather than in an untestable branch of `is_online` (`:169`), which
+> logs the status at debug for diagnosis. Tests cover 200/204/301/302/403/429/500/503
+> from a YouTube host, a portal's host with the same statuses, the near-miss host
+> boundaries, and no response at all; the old
+> `non_success_statuses_are_offline_even_from_youtube` was deleted rather than left
+> pinning behaviour that had been removed. Three rounds on one small probe is this
+> item's own lesson: each fix was defensible and each was wrong about what "online"
+> has to mean to the caller.
 `src-tauri/src/util.rs:101-110`
 
 ```rust
@@ -265,7 +315,7 @@ YouTube.
 
 ### M3. In-flight download claims are never released on the retry path
 
-> **FIXED** (`5ab2a7d`). Dropped tracks are `mark_failed`'d and emitted. The split is extracted as `partition_retryable` and tested, since the bug was precisely that the dropped ids were filtered away instead of reported.
+> **FIXED** (`5ab2a7d`). Dropped tracks are `mark_failed`'d and emitted. The split is extracted as `partition_retryable` and tested, since the bug was precisely that the dropped ids were filtered away instead of reported; `e47986b` then made the release structurally inseparable from the split (`partition_and_release`), so the two cannot drift apart again.
 `src-tauri/src/commands/downloads.rs:264-272`
 
 ```rust
@@ -274,15 +324,28 @@ let retry: Vec<Track> = failed.into_iter().filter(|t| kept_offline(&app, &t.id, 
 if retry.is_empty() { return; }
 ```
 
-`downloads.fail(id)` released the claim earlier, but any track dropped by this
-filter is gone from the retry set while its row may still show a spurious
-"downloading" state, and `mark_failed` is never called for it — so the user gets
-no retry affordance. Also, if the playlist is edited during the backoff the track
-is silently abandoned. Fix: `mark_failed` the dropped ids and `emit_downloads`.
+`downloads.fail(id)` releases the claim first, so a track dropped by this filter
+is gone from the retry set with **no claim, no offline copy and no failure
+record** — its row looks like a track the user never downloaded, offers no retry,
+and nothing revisits it. The playlist was edited out from under it, which is why
+it was dropped. Fix: `mark_failed` the dropped ids and `emit_downloads`.
+
+> **CORRECTED — this item described a state the code cannot reach.** It said a
+> dropped track "may still show a spurious 'downloading' state" because of a claim
+> `downloads.fail` left on it. **It leaves none:** `Downloads::fail`
+> (`src-tauri/src/downloads.rs:88-92`) *removes* the in-flight claim, so there is
+> no spinner and nothing spurious. The defect is the opposite one — the absence of
+> any state at all, which is worse than a wrong one, because a row with no state
+> offers nothing to click and nothing revisits it. Found by `backend-core` while
+> writing the regression guard; the code and both functions' docs now say this, and
+> a reader who goes looking for the leftover claim will not find it. The fix's
+> shape also changed in `e47986b`: the split and the release are now one function
+> (`partition_and_release`, `src-tauri/src/commands/downloads.rs:137-161`), because
+> a caller able to take `retry` without acting on `dropped` *is* the defect.
 
 ### M4. `api::fire` makes 41 of 55 IPC calls fire-and-forget
 
-> **FIXED** (`f323ed1`). `fire` reports failures to a sink `App` installs on mount, reusing the same toast the backend's `rift://error` events use � which also removes the inconsistency the review called the real problem.
+> **FIXED** (`f323ed1`). `fire` reports failures to a sink `App` installs on mount, reusing the same toast the backend's `rift://error` events use — which also removes the inconsistency the review called the real problem.
 `ui/src/api.rs:33-39`, plus 41 call sites
 
 `fire` logs to `web_sys::console` and returns, so `Err` values not mirrored by a
@@ -367,7 +430,7 @@ writing/chmod.
 
 ### M8. Persistent player state is written on the event loop
 
-> **FIXED** (`2cc59da`). Serialization moved to the persister's own thread, and an identical payload for the same path is dropped � which is exactly the double-emit case. The `Persister` doc now states the final-snapshot loss it previously only implied.
+> **FIXED** (`2cc59da`). Serialization moved to the persister's own thread, and an identical payload for the same path is dropped — which is exactly the double-emit case. The `Persister` doc now states the final-snapshot loss it previously only implied.
 `src-tauri/src/player/playback.rs:195`, `state.rs:101-117`
 
 `emit_queue` clones every `Track`, `serde_json::to_vec`s the snapshot and queues
@@ -379,7 +442,16 @@ debounce, or skip the write when the snapshot is unchanged.
 
 ### M9. `atomic_write`'s temp name is correct only by accident, and the whole write path is untested
 
-> **FIXED (tests)** (`5ab2a7d`). `util.rs` has a round-trip, a corrupt-file-backup and an atomic-write test, the last pinning the temp-is-beside-the-target property the rename depends on. **DEFERRED:** the `with_extension` shape itself is unchanged � the review verified it is not a live bug, and the test now pins the behaviour rather than leaving it incidental.
+> **FIXED (tests)** (`5ab2a7d`). `util.rs` has a round-trip, a corrupt-file-backup and an atomic-write test, the last pinning the temp-is-beside-the-target property the rename depends on. **DEFERRED:** the `with_extension` shape itself is unchanged — the review verified it is not a live bug, and the test now pins the behaviour rather than leaving it incidental.
+>
+> **CLOSED** (`1d2bc94`). The deferred half is done, and not by pinning the
+> incidental name: `atomic_write` now builds the temp path from the target's
+> `parent()` with a unique name (pid + counter), so "beside the target" — the
+> property the rename actually depends on — holds by construction, two writers
+> cannot collide, a failed write or rename removes the scratch file, and a path
+> with no file name is rejected instead of guessed at
+> (`src-tauri/src/util.rs:124`). The pinning test stays, and now asserts the
+> property rather than the name.
 `src-tauri/src/util.rs:92-96`
 
 `path.with_extension("tmp")` is purely lexical, so `settings.json` →
@@ -394,8 +466,12 @@ as a known loss.
 
 ### M10. Shuffle history is discarded on every queue edit
 
-> **DEFERRED.** The in-code rationale (indices shift) is sound and remapping through an edit is a behaviour change with its own design questions, not a defect. Left as recorded.
-`src-tauri/src/player/queue.rs:27-32, 106-108, 135-137`
+> **FIXED** (`9a5679f`). The remembered order is no longer thrown away: every mutator maps the old indices through its own edit with `remap_history` (`src-tauri/src/player/queue.rs:31`), called from all four edit paths — found by name rather than by line, because the call sites moved twice as this item was hardened (this entry's first draft cited `:66, :158, :165, :196`; they are now `:73, :165, :172, :203`) — so the "already played this cycle" set survives a removal, an insert or a reorder. The design questions this item flagged are answered in the helper's doc rather than deferred: an index with no survivor is dropped, and a partial survivor keeps its relative order.
+>
+> **HARDENED** (`a213f54`), and the guard was the interesting part. The property test's first failure — "the cursor must name the playing track" — was **not a bug**: between a prefetch and the play that consumes the pin, the cursor deliberately names the reserved track while `current` is still the previous one. The invariant was wrong, so it was replaced by three that are true (structural soundness; the playing track is in the played set under shuffle; nothing playing implies empty history) plus a strong form asserted at the commands where it must hold — with the permitted intermediate states written down at the assertion (`player/tests.rs:1133`) rather than the check being quietly relaxed. With the invariants right, 8 000 steps over four fixed seeds (`tests.rs:1243-1251`) found **two real defects in this area**: `toggle_shuffle` rewrote the history to `[current]` while leaving `pending_next` armed, so the track a pinned pick later started was missing from the played set and Next could restart it immediately (fixed by `anchor_playing`, `player/nav.rs:90, :112`); and a cycle rollover cleared the history while the old track was still playing, so the pool could hand a still-playing track straight back (fixed by carrying the playing track into the new cycle as its first entry). Each fix has a deterministic test and the property test at a named seed and step. Residual, documented rather than hidden: a pick dropped without playing stays in the played set for that cycle — a fairness quirk, not a safety one.
+>
+> **HARDENED AGAIN** (`1c1caf6`): a prefetched pick is dropped when shuffle is toggled, and the anchors that remain are covered by tests. Three rounds on one item is also why its citations aged — `9a5679f` → `a213f54` → `1c1caf6` moved `remap_history`'s call sites while the line numbers in this document stayed where they were written. Re-measure these references rather than trusting them.
+`src-tauri/src/player/queue.rs:31` (`remap_history`). The ranges this item cited when it was written — `:27-32, 106-108, 135-137` — no longer resolve: the item was hardened three times after they were measured, so they are recorded here rather than re-asserted.
 
 The in-code rationale (indices shift) is sound, but the user-visible effect is
 that removing one track throws away the "already played this cycle" set, so
@@ -404,7 +480,7 @@ through the edit would preserve the cycle.
 
 ### M11. `parse::tracks` uses the whole subtitle as the artist
 
-> **FIXED** (`226b537`), and `tests/fixtures.rs` no longer enshrines the defect. The rule is deliberately narrow � only structurally identifiable runs are dropped � because a bare year sits where a byline does on album rows and a band named "1975" or "2 Unlimited" would be a real name.
+> **FIXED** (`226b537`), and `tests/fixtures.rs` no longer enshrines the defect. The rule is deliberately narrow — only structurally identifiable runs are dropped — because a bare year sits where a byline does on album rows and a band named "1975" or "2 Unlimited" would be a real name.
 `crates/ytmusic/src/parse.rs:223-228`
 
 `runs_all` concatenates every run of the subtitle column, which for an unlinked
@@ -415,7 +491,7 @@ duration run before falling back.
 
 ### M12. `find_all(..).first()` is alphabetical, not document order
 
-> **FIXED** (`226b537`). Every known location is read by path with `find_all` kept as an explicit fallback, and `track_credits` matches the requested `videoId` � returning nothing when the response does not contain it, rather than another song's byline.
+> **FIXED** (`226b537`). Every known location is read by path with `find_all` kept as an explicit fallback, and `track_credits` matches the requested `videoId` — returning nothing when the response does not contain it, rather than another song's byline.
 `crates/ytmusic/src/parse.rs:11-28`, call sites `:395, 455, 472-478, 590-595, 611`
 
 `serde_json 1.0.151` is built without `preserve_order` (the lockfile shows no
@@ -452,7 +528,35 @@ first run lacking a string `text`, instead of continuing like `duration`
 
 ### M15. Packaged builds are never compiled or bundled in CI
 
-> **FIXED** (`7ddd789`). A `cargo tauri build --no-bundle` step, a tag-versus-manifest assertion in the release job (tested both ways), and tag pushes now publish � `releases/latest` excludes drafts, so a draft-only workflow meant the update banner could never fire.
+> **FIXED** (`7ddd789`). A `cargo tauri build --no-bundle` step, a tag-versus-manifest assertion in the release job (tested both ways), and tag pushes now publish — `releases/latest` excludes drafts, so a draft-only workflow meant the update banner could never fire.
+>
+> **CORRECTED — the build step this added could not run, anywhere.** It invoked
+> `cargo tauri build --no-bundle`, which is a cargo *subcommand*: cargo resolves
+> it to a `cargo-tauri` binary on `PATH` (or beside cargo itself), and CI
+> installed none — the hosted runners ship none, and `tauri-cli` is in no manifest
+> and no `Cargo.lock` here. It would have stopped at its first line with
+> `error: no such command: 'tauri'` (exit 101), before compiling anything.
+> Confirmed by running the same command with `CARGO_HOME` pointed at a directory
+> without it; a developer machine hides this because a previous
+> `cargo install tauri-cli` leaves one in `~/.cargo/bin`, which is exactly why
+> the local run recorded below passed. `ci.yml` now installs a pinned
+> `tauri-cli@2.11.5` (the `tauri` version `Cargo.lock` resolves) before the build.
+> It is the same lesson this document records twice already: a check that passed
+> by hand is not a check. Both it and the frontend suite's never-run job share the
+> reason they went unnoticed for so long: the branch carrying them was never
+> pushed, so CI ran neither step.
+>
+> **And the bundle inputs are now exercised for real** (a local Windows bundle run,
+> re-measured for this note): both installers were produced —
+> `bundle/msi/Rift_0.5.0_x64_en-US.msi` at 7,061,504 bytes and
+> `bundle/nsis/Rift_0.5.0_x64-setup.exe` at 5,119,744 — with
+> `rift-music.exe` at 18,282,496, so `mainBinaryName` and `targets: "all"` both
+> took effect; a scan of the 372-line log for licence/WiX/NSIS/warning/error terms
+> found nothing unexpected; and the plain-text `licenseFile` was **converted** to the
+> `LICENSE.rtf` WiX requires (`release/wix/LICENSE.rtf`, pointed at by
+> `release/wix/x64/main.wxs:48`), so the packaging question this area left open is
+> closed rather than deferred. WiX and NSIS were absent locally, so tauri-cli
+> fetched and hash-validated both toolchains itself.
 `.github/workflows/ci.yml`, `release.yml:84-100`
 
 CI runs `trunk build`, two clippy passes and the backend tests. Clippy links the
@@ -470,7 +574,7 @@ never fire.
 
 ### M16. Duplicate majors in one binary
 
-> **FIXED** (`7ddd789`). The direct `reqwest` is 0.13, matching what Tauri pulls in, so `reqwest` is gone from `cargo tree -d` entirely � as are `rand` and `zbus`. The CI guard is a script rather than bare `cargo tree -d`, which exits 0 either way and also flags same-version feature splits.
+> **FIXED** (`7ddd789`). The direct `reqwest` is 0.13, matching what Tauri pulls in, so `reqwest` is gone from `cargo tree -d` entirely — as are `rand` and `zbus`. The CI guard is a script rather than bare `cargo tree -d`, which exits 0 either way and also flags same-version feature splits.
 `Cargo.lock` vs `src-tauri/Cargo.toml:23,26,29`, `crates/ytmusic/Cargo.toml:12`
 
 `reqwest 0.12.28` (direct) **and** `0.13.4` (via tauri 2.11.5); `rand 0.8.8`
@@ -484,8 +588,10 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
 ## Low / Nits
 
 > **Status:** L1 **retracted**; L2 folded into M9; L3, L4, L5, L6, L8, L9, L11,
-> L12, L14, L15, L16, L17, L18 **fixed**; L7, L10 **deferred** (below); L13
-> **partly retracted, partly folded into H1**.
+> L12, L14, L15, L16, L17, L18 **fixed**; L7 (`a3a55f1`) and L10 (`9de9f22`)
+> **fixed** after being deferred — both needed their deferred reasoning corrected
+> rather than just completed, see their items; L13 **partly retracted, partly
+> folded into H1**.
 
 - **L1. `AudioCmd::Volume` ignores in-flight fade-outs** (`audio.rs:183-186`): the
   `fading` vec keeps ramping from the old `volume` captured at `:199`, so dragging
@@ -549,11 +655,13 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
 - **L7. Regex compiled per request** (`identity.rs:73`, `context.rs:68`) inside the
   request path; cache in a `OnceLock`.
 
-  > **DEFERRED.** Two regexes compiled per request against a host that is already
-  > doing a network round trip; the cost is real but negligible next to that, and
-  > caching them adds a `OnceLock` plus an error path for a compile that cannot
-  > fail on a literal pattern. Worth doing if the request path ever gets hot for
-  > another reason.
+  > **FIXED** (`a3a55f1`). Both are compiled once behind a helper, and the reason
+  > the deferral gave — the pattern is a literal, so compilation cannot fail — is
+  > now the reason that helper can return `&'static Regex` rather than a `Result`,
+  > which removes the error path the deferral was objecting to. Pinned with
+  > `ptr::eq` across two calls, so the mutation that leaks a fresh `Regex` per call
+  > fails a named test. The visitor extraction had no test at all before this; it
+  > has one now, as does L12's poison recovery, which was implemented untested.
 
 - **L8. `album_type` is an exact match on a server-controlled title**
   (`parse.rs:526-529`): `"Singles" => "Single", _ => "Album"`. I checked
@@ -579,11 +687,22 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
   Fine as a heuristic, but the typed signal (`MUSIC_VIDEO_TYPE_UGC`, already parsed
   at `parse.rs:209`) is strictly more reliable.
 
-  > **DEFERRED.** The review itself calls the current filter fine as a heuristic,
-  > and the typed signal only travels with innertube rows — imported playlists and
-  > exported JSON do not carry it, so `is_audio_track` would still need its
-  > title-based fallback. Switching only the rows that have the signal would make
-  > the two paths disagree about the same track.
+  > **FIXED** (`9de9f22`), with a correction to this deferral's reasoning. The
+  > typed signal is now enforced where it *does* travel: `is_non_audio_row`
+  > (typed `MUSIC_VIDEO_TYPE_UGC` **or** the non-audio badge) is applied at the
+  > point a row becomes a `Track`, so a UGC-typed row with a clean title is
+  > dropped instead of surviving because its title carries no marker. The
+  > signal-less paths (imported and exported JSON) keep the title fallback, and
+  > `commands/convert.rs`'s module doc now states the real split — so the two
+  > paths differ by decision rather than silently disagreeing, which is the
+  > objection the deferral actually rested on.
+  >
+  > The deferral was also wrong about the fixture: the recorded playlist has no
+  > `musicVideoType` keys at all, so playlist import genuinely carries no typed
+  > signal, and enforcing the typed half only where it exists does not create the
+  > disagreement it feared. Mutation evidence for how unpinned this was: removing
+  > the typed half brings the clean-title UGC row back and all 40 pre-existing
+  > tests stay green.
 
 - **L11. `parse_count` truncates** (`parse.rs:169`) — `.round()` would be correct.
 
@@ -630,6 +749,17 @@ Two TLS stacks and two rand generations ship in the same binary. Bump the direct
   > building above the floor means the oldest supported toolchain is never
   > exercised. Moved to 1.88.0, and `.github/scripts/check-toolchain-consistency.sh`
   > now fails if the pin, `rust-version`, and the workflow inputs disagree.
+>
+> **Follow-up found in the CI audit — the guard had a hole on the other side.** It
+> compared the pins that *exist*, so a workflow that deleted its `toolchain:`
+> input left the comparison with nothing to look at: the script still printed
+> "toolchain version is consistent across Cargo.toml, rust-toolchain.toml, and the
+> workflows" and exited **0**, which is the exact drift this item exists to
+> prevent (`@stable` with no input installs whatever `stable` is that week). It
+> now also counts `dtolnay/rust-toolchain` uses against `toolchain:` inputs, per
+> workflow file, and fails naming the file
+> (`.github/scripts/check-toolchain-consistency.sh:69-84`). The three paths were
+> tested by deleting one pin, both pins, and the release job's pin.
 
 - **L15. `src-tauri/gen/schemas/*.json` (~440 KB) is tracked** and not ignored;
   upstream's Tauri template ignores `/gen/schemas`. It churns on every dependency
@@ -720,8 +850,11 @@ Recorded because these are the places a reviewer expects trouble:
 - **Shuffle index arithmetic** (`nav.rs`, `queue.rs`). I traced every path that
   mutates `shuffle_history`/`shuffle_cursor` and could not produce an
   out-of-bounds access: `pick_prev` guards `cursor > 0` before decrementing,
-  `pick_next` guards `cursor + 1 < len`, and the three queue mutators reset the
-  pair together. The uncommitted diff's `seed_shuffle_anchor` is a real
+  `pick_next` guards `cursor + 1 < len`, and since `9a5679f` the queue mutators
+  *remap* the pair through the edit (`remap_history`,
+  `src-tauri/src/player/queue.rs:31`) rather than resetting it, which is a
+  stronger property than the one traced here — the history is carried, not
+  dropped. The uncommitted diff's `seed_shuffle_anchor` is a real
   improvement over `history = vec![index]`, and its new tests assert observable
   ordering rather than internals.
 - **`pick_next` reads `pending_next` before the repeat-one check**, so a prefetched
@@ -813,9 +946,11 @@ starts from the code rather than from scratch.
   generated artifacts are on disk after a build, and the resolution is a library
   call. The gap was that nothing asserted the *runtime* consequence of the ACL,
   only that its inputs looked right.
-- **`uploader`/`channel`-style rows are still filtered by title substring**
-  (`commands/convert.rs`) — see the deferred L10 above. The blocker is that the
-  typed signal does not travel with imported playlists.
+- **`uploader`/`channel`-style rows are filtered by title substring on the
+  signal-less paths only, and now by decision** (`commands/convert.rs`). The typed
+  signal is enforced where it travels (`9de9f22`, L10 above); imported and
+  exported JSON keep the fallback, and the module doc states the split instead of
+  leaving the two paths to disagree silently.
 - **`client.rs` transport, the 403 retry and playlist pagination are untested.**
   The parser now has a malformed-input table, but exercising the retry needs a
   mock HTTP server. `crates/ytmusic` has `tokio` as a dev-dependency already, so
@@ -852,6 +987,17 @@ starts from the code rather than from scratch.
   > [optimized] in 3m 30s` with `lto = true` and `codegen-units = 1`. The claim
   > held: the release profile and the bundle inputs the linker does not read are
   > exercised by this, and nothing in them is malformed.
+  >
+  > **CORRECTED — the first CI run could not have exercised it.** The local run
+  > above passed because a `cargo-tauri` binary was already in `~/.cargo/bin` from
+  > an earlier `cargo install`; a hosted runner has none, `tauri-cli` appears in no
+  > manifest and no `Cargo.lock` here, and the job installed nothing. So
+  > `cargo tauri build --no-bundle` would have stopped at its first line with
+  > `error: no such command: 'tauri'` (exit 101), before compiling anything —
+  > verified by running the same command with `CARGO_HOME` pointed at a directory
+  > without it. `ci.yml` now installs a pinned `tauri-cli@2.11.5` first. The
+  > lesson is the one this document records twice already: a check that passed by
+  > hand is not a check.
 - **A stale generated permission file survives a command removal.**
   `src-tauri/permissions/autogenerated/queue_add_tracks.toml` is still on disk
   after the command was deleted (L5); it is harmless because nothing grants it,
@@ -873,6 +1019,48 @@ starts from the code rather than from scratch.
   > been avoiding elsewhere. The honest place for this is the build docs: if you
   > rename or delete a command, the stale file is inert and safe to delete, and
   > nothing will regenerate it.
+
+### Found in the sessions that followed (CI, packaging, and the second UI pass)
+
+Six of these correct statements this document still makes. They are recorded here
+as well as in the session report, because the next reader comes from the code.
+
+- **CI's `cargo tauri build --no-bundle` step could never have run**: no
+  `tauri-cli` on any runner, none in the manifests, none installed by the job. See
+  the correction under M15 and the note in "Follow-ups found while fixing". Fixed
+  — `ci.yml` installs a pinned `tauri-cli@2.11.5`.
+- **`check-toolchain-consistency.sh` exited 0 with the `toolchain:` input
+  deleted.** See the correction under L14. Fixed, with the three failure paths
+  tested by mutation.
+- **The frontend `[env]` table never loaded the DOM shim on any platform**, so the
+  suite was red wherever it ran and the Linux/macOS CI job carrying it would have
+  failed had it ever been pushed — and it never was, so CI ran neither the step nor
+  the failure. That is the same reason M15's build step went unnoticed: the branch
+  was unpushed, which is precisely the "verified by reading, not running" theme
+  this document opens with. See "Three things worth knowing before trusting a green
+  run". Fixed (`49bb626`).
+- **`detect_ytdlp` was a second unbounded subprocess wait behind H3** — the same
+  defect H3 names, on the path H3 did not cover. Bounded by `3051d7c`
+  (`src-tauri/src/fetch.rs`, `run_version_probe`), with a test that spawns a real
+  sleeper and fails after ~29 s without the timeout.
+- **The hook-order scanner false-positived on a `return` inside a closure** — the
+  shape half of this codebase's callbacks have. Fixed in `49bb626`, with cases for
+  a closure `return`, a hook inside a closure, and the word `return` inside a
+  string or a comment (`ui/src/tests/hook_order.rs`).
+- **UI round two** (`f19e2ab`): Phase 5 was complete for the controls it named,
+  not for the way *into* them. Four row/header `onkeydown` handlers called
+  `prevent_default()` for Enter aimed at a nested `<button>`, so a focused kebab
+  played the track — now a shared `key_on_nested_control` guard
+  (`ui/src/components/mod.rs:79`), tag-based because Yew 0.21 delegates events to
+  the subtree root. The sidebar playlist kebab was `display:none` except on hover
+  and unreachable by Tab; four hover-revealed controls hid their own focus ring
+  under `opacity:0`; the submenu's ArrowRight indexed submenus instead of
+  `props.actions` (`ui/src/components/menu.rs`); five `api::invoke` sites
+  discarded the rejection, the worst replacing a backend reason with "not found"
+  (`ui/src/api.rs:124`, `invoke_or_default`) — the commit records these as silent
+  IPC failures M4 undercounted; the Artists/Albums tab fetches captured no
+  generation token; and the crossfade slider, three `role=switch` buttons, the
+  rename input and the cover images had no accessible name at all.
 
 
 ---
@@ -988,18 +1176,33 @@ time and never runs an effect; two attempts to force a second pass that way are
 recorded as dead ends in that file. `render.rs` reaches second renders, but only
 for the queue panel and the player bar, and only at `flush()` granularity.
 
-### Two things worth knowing before trusting a green run
+### Three things worth knowing before trusting a green run
 
-**The suite cannot run on Windows, for a reason outside this repo.**
-`wasm-bindgen-test-runner` 0.2.128 builds its Node script with
-`Path::display()` inside single quotes, so a Windows path becomes
-`'C:\Users\...'` and Node dies parsing `\U` as an escape *before any test runs*.
-It is unconditional (the `readFile` is inside `if (false)`, which is still
-parsed) and 0.2.129 does not fix it. `WASM_BINDGEN_BENCH_RESULT` does not help:
-the path is re-encoded through `PathBuf`, so the backslashes come back. CI
-therefore runs the step on Linux and macOS only. The tests themselves are
-platform-independent — the same wasm module and the same assertions — so this
-costs local reproduction, not coverage. Run them under WSL on Windows.
+**The suite runs on Windows; it could not always, and part of the reason recorded
+here was wrong.** The upstream defect is real: `wasm-bindgen-test-runner` 0.2.128
+builds its Node script with `Path::display()` inside a *single-quoted* JS string,
+so a Windows path became `'C:\Users\...'` and Node rejected the file while
+*parsing* it. It is unconditional (the `readFile` sits inside `if (false)`, which
+is still parsed) and 0.2.129 does not fix it. Two corrections to the note this
+replaces: the invalid escape is **`\ui`**, from the package directory — `\U` is a
+`NonEscapeCharacter` to JS, exactly as `\Users` is — and
+`WASM_BINDGEN_BENCH_RESULT` **does** help when it is pinned to a *relative* path.
+`.cargo/config.toml` now sets it to `target/wbg_benchmark.json`, which keeps the
+literal free of backslashes and puts the runner's bug out of reach.
+
+**The worse finding is that the `[env]` table never worked at all.**
+`NODE_OPTIONS = { value = "--require ui/tests/dom-shim.cjs", relative = true }`
+makes Cargo path-join the **whole value, flag included**, onto the config's base
+directory, so Node received `...\Rift\--require ui/tests/dom-shim.cjs` (measured
+with a probe crate), silently ignored every token that does not begin with `-`
+(measured: exit 0, where a real `--require` to a missing file exits 1), and the
+DOM shim never loaded — on any platform, in or out of CI. The four renderer tests
+were failing for that reason everywhere the suite ran, and the CI job that would
+have run them had never executed at all (the branch was unpushed), so nothing
+contradicted the note above. With the bare value in place the suite is **55
+passed / 0 failed on Windows** with no shell overrides, and CI now runs the shim
+check and the suite on all three operating systems. The "run them under WSL"
+advice is withdrawn.
 
 **The first harness design was wrong and the failures were confusing.** It used
 `spawn_local` and yielded to the event loop, on the assumption that
@@ -1011,6 +1214,16 @@ with. The fix was to stop racing an executor: `spawn` queues the future and
 `settle()` drains it on the test's own stack, which also made the async tests
 synchronous and therefore immune to interleaving. The same shape as the L17
 harness lesson — when a harness misbehaves, suspect the harness first.
+
+**A shared target directory can run another tree's artifact.** With
+`CARGO_TARGET_DIR` pointing somewhere a second checkout or worktree also builds
+into, `cargo test` can execute a binary compiled from *other* sources: the unit
+hash covers the cargo config and the build profile, not the path the sources were
+read from, so an artifact from a sibling tree is a legitimate cache hit. A
+mutation that was supposed to fail can therefore pass — the most dangerous shape a
+verification step can have, because the result looks like evidence rather than a
+miss. Every isolated run in this project now uses a private target directory for
+that reason, including the frontend suite run that confirmed the 55/55 above.
 
 ### The DOM shim: what it cost, and the three traps in it
 

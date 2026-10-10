@@ -1,5 +1,16 @@
 # Fix the defects found in the September 2026 code review
 
+> **COMPLETED — this prompt has been run.** The work is frozen at revision `754e4e1`
+> (25 commits on top of `38aea9f`). The session's report is
+> [`docs/session-report-2026-09-fixes.md`](session-report-2026-09-fixes.md): what
+> changed, what was verified and by which run, what could not be reproduced, and what
+> was deliberately left. The per-item record stays in
+> [`docs/code-review-2026-09.md`](code-review-2026-09.md), which is the authority on
+> any single item. The text below is the prompt exactly as it was issued — nothing
+> rewritten — with two of its items (1.4 and 1.5) carrying corrections inline,
+> because re-verification found the defects they described were not what the code
+> actually did.
+
 Paste this whole file as the prompt for a new session working in this repo.
 
 ---
@@ -124,11 +135,29 @@ errors; a captive portal answers with a 200/302/403, so the function meant to
 *skip* pointless retries instead burns the full ~7.5-minute backoff ladder. Treat
 a non-success status as offline.
 
+> **CORRECTED in the session that ran this prompt.** The diagnosis stands — a
+> non-success status is not offline — but the fix built on it was wrong in the
+> other direction: it also required an `x-youtube-client-name` response header,
+> which YouTube's web root never sends (it is a header Rift *sends*), so
+> `is_online()` became permanently `false` and kept-offline retries were aborted
+> on a working connection. The live measurement, the consequence and the re-fix
+> are under **M2** in `docs/code-review-2026-09.md`; read that before touching
+> this item.
+
 **1.5 — In-flight download claims leak on the retry path (MEDIUM)**
 `src-tauri/src/commands/downloads.rs:264-272`. Tracks dropped by the
 `kept_offline` filter are abandoned without `mark_failed`, so the row shows a
 spurious "downloading" state and gets no retry affordance. Mark them failed and
 `emit_downloads`.
+
+> **CORRECTED in the session that ran this prompt.** There is no leaked claim to
+> leak: `Downloads::fail` (`src-tauri/src/downloads.rs:88-92`) *removes* the
+> in-flight claim, so the row cannot show a spurious spinner. The real defect is
+> the absence of any state — no claim, no offline copy, no failed mark — so the row
+> offers nothing to click and nothing revisits the track. The diagnosis above is
+> right that `mark_failed` is missing; it is wrong about what the row shows. See
+> **M3** in `docs/code-review-2026-09.md` for the correction and the fix's final
+> shape.
 
 ---
 
