@@ -175,29 +175,59 @@ pub(crate) async fn is_online(http: &reqwest::Client) -> bool {
         .send()
         .await
     {
-        Ok(resp) => came_from_youtube(resp.status().as_u16(), |name| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        }),
+        // reqwest follows redirects, so `resp.url()` is where the request
+        // actually ended up — not just where it was aimed.
+        Ok(resp) => came_from_youtube(
+            resp.status().as_u16(),
+            resp.url().host_str().unwrap_or_default(),
+        ),
         // Transport failure: genuinely offline (or YouTube is unreachable).
         Err(_) => false,
     }
 }
 
-/// Whether a probe response really came from YouTube.
+/// Whether a probe response proves Rift reached YouTube.
 ///
-/// A captive portal or transparent proxy answers the HEAD with its own
-/// 200/302/403, and `.is_success()` alone would call that "online" — so the
-/// function meant to *skip* pointless retries would instead let the kept-offline
-/// loop burn its full ~7.5-minute backoff ladder against a portal. Requiring a
-/// success status *and* YouTube's own client header is what distinguishes the
-/// real service from whatever intercepted the request. Split out from
-/// [`is_online`] so the rule is testable without a network round trip.
-fn came_from_youtube(status: u16, header: impl Fn(&str) -> Option<String>) -> bool {
-    const CLIENT_HEADER: &str = "x-youtube-client-name";
-    (200..300).contains(&status) && header(CLIENT_HEADER).is_some()
+/// A captive portal or transparent proxy answers the HEAD itself — with its own
+/// 200 directly, or by redirecting to its login page — and `.is_success()` alone
+/// would call that "online", so the function meant to *skip* pointless retries
+/// would instead let the kept-offline loop burn its full ~7.5-minute backoff
+/// ladder against a portal. Requiring the *final URL host* to be YouTube's is
+/// what distinguishes the real service from whatever intercepted the request,
+/// and unlike a response header it is a property of the request/redirect chain
+/// rather than a string Google can rename out from under us.
+///
+/// This rule has already been wrong once in each direction, which is why it is
+/// split out from [`is_online`] to be testable without a network round trip:
+/// - `x-youtube-client-name` as the discriminator was a permanent false
+///   "offline". That is an *innertube API* request header (see
+///   `crates/ytmusic/src/client.rs`), and a live `HEAD https://www.youtube.com/`
+///   — HTTP/2, no User-Agent, through this same client — answers 200 OK with no
+///   such header at all, so every *online* machine was reported offline and the
+///   kept-offline loop gave up on its first failure toasting "you appear to be
+///   offline".
+/// - `server: ESF` (Google's edge frontend, present on every response of that
+///   probe) fixed that, but as the *sole* gate it is a single mutable string: if
+///   Google renames it, every user goes permanently offline with nothing in the
+///   suite to notice. The host check cannot fail that way.
+///
+/// Accepted residual: a proxy that MITMs HTTPS with a trusted certificate and
+/// answers the probe with its own 2xx *without* redirecting keeps the requested
+/// host, so it reads as online. That costs a wasted backoff ladder in the
+/// background; the alternative gate risks a false "offline" for everyone, which
+/// costs a misleading error and no retries at all.
+fn came_from_youtube(status: u16, final_host: &str) -> bool {
+    (200..300).contains(&status) && is_youtube_host(final_host)
+}
+
+/// Whether `host` is `youtube.com` or a subdomain of it.
+///
+/// The boundary matters: a bare `ends_with("youtube.com")` also accepts
+/// `notyoutube.com` and `youtube.com.example.net`, which a portal could be
+/// served from.
+fn is_youtube_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
 #[cfg(test)]
@@ -246,29 +276,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_200_without_youtube_headers_is_a_captive_portal() {
-        // The exact shape of a hotel/airport portal: a perfectly good 200 that
-        // did not come from YouTube. This is the case `.is_success()` got wrong.
-        assert!(!came_from_youtube(200, |_| None));
+    fn the_live_youtube_response_shape_counts_as_online() {
+        // Captured 2026-10-10 through this same client (HTTP/2, no User-Agent):
+        // `HEAD https://www.youtube.com/` answers 200 OK with `server: ESF`,
+        // `content-type: text/html`, and **no** `x-youtube-client-name`.
+        //
+        // The `server:` header is deliberately *not* part of the rule: it fixed
+        // the false "offline" above, but as the sole gate a rename at Google
+        // would silently put every user back there. The host is a property of
+        // the request, so a response from YouTube with no header this code has
+        // ever heard of still counts.
+        assert!(came_from_youtube(200, "www.youtube.com"));
+        assert!(came_from_youtube(200, "youtube.com"));
+        assert!(came_from_youtube(200, "m.youtube.com"));
+        assert!(came_from_youtube(204, "www.youtube.com"));
     }
 
+    /// The portal case this item exists for: the request is answered by
+    /// something that is not YouTube. A redirect to the portal's own https login
+    /// page is 2xx and the most common shape, so the host is what catches it.
     #[test]
-    fn a_youtube_client_header_identifies_the_real_service() {
-        assert!(came_from_youtube(200, |name| {
-            (name == "x-youtube-client-name").then(|| "1".to_owned())
-        }));
+    fn an_answer_that_did_not_end_at_youtube_is_not_online() {
+        for host in [
+            "portal.example.net",
+            "login.captive.app",
+            // Names that merely contain "youtube.com" are not YouTube, and a
+            // portal can be served from one.
+            "notyoutube.com",
+            "youtube.com.evil.example.net",
+            "www.youtube.com.phish.net",
+        ] {
+            assert!(
+                !came_from_youtube(200, host),
+                "{host} must not count as online"
+            );
+        }
     }
 
     #[test]
     fn non_success_statuses_are_offline_even_from_youtube() {
-        // A redirect to a portal login page, or an outright rejection. (2xx
-        // stays "online" — the header check is what catches a portal's 200.)
+        // A rejected or rate-limited response, or a redirect chain that has not
+        // finished. (2xx from a YouTube host is online.)
         for status in [301, 302, 403, 429, 500, 503] {
             assert!(
-                !came_from_youtube(status, |_| Some("1".to_owned())),
+                !came_from_youtube(status, "www.youtube.com"),
                 "status {status} must not count as online"
             );
         }
+    }
+
+    /// A trailing dot is a legal spelling of the same fully-qualified name.
+    #[test]
+    fn a_fully_qualified_youtube_host_is_still_youtube() {
+        assert!(came_from_youtube(200, "www.youtube.com."));
+        assert!(came_from_youtube(200, "YOUTUBE.COM"));
     }
 
     #[test]
@@ -425,6 +486,38 @@ mod tests {
             .expect("queue change");
         drain(&persister, &dir);
         assert_eq!(std::fs::read(&path).expect("read"), [9]);
+    }
+
+    /// M8's other half. `emit_queue` calls this on the event loop and the
+    /// snapshot can hold 1000 tracks, so `write` must hand the serialization to
+    /// the persist thread rather than doing it in the caller. Serialize inline
+    /// (the pre-M8 shape) and the closure runs on *this* thread, which is what
+    /// the thread-id assertion pins.
+    #[test]
+    fn the_persister_serializes_off_the_callers_thread() {
+        let dir = TempDir::new("util-persister-thread");
+        let path = dir.join("snapshot.json");
+        let persister = Persister::spawn();
+
+        let caller = std::thread::current().id();
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        persister
+            .write(path.clone(), (), move |_| {
+                let _ = ran_tx.send(std::thread::current().id());
+                b"payload".to_vec()
+            })
+            .expect("queue write");
+
+        let serialized_on = ran_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the persister thread should have serialized the payload");
+        assert_ne!(
+            serialized_on, caller,
+            "serialization must happen on the persister's own thread, not the caller's"
+        );
+
+        drain(&persister, &dir);
+        assert_eq!(std::fs::read(&path).expect("read"), b"payload");
     }
 
     /// Block until the persister has finished every job queued so far.
