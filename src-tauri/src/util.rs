@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, MutexGuard};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Read and parse a JSON state file, defaulting when missing. On a parse
 /// failure the corrupt file is renamed aside (`*.json.bad`) so a later save
@@ -176,48 +176,59 @@ pub(crate) async fn is_online(http: &reqwest::Client) -> bool {
         .await
     {
         // reqwest follows redirects, so `resp.url()` is where the request
-        // actually ended up — not just where it was aimed.
-        Ok(resp) => came_from_youtube(
-            resp.status().as_u16(),
-            resp.url().host_str().unwrap_or_default(),
-        ),
+        // actually ended up — not just where it was aimed. The status is
+        // recorded, not judged: see [`came_from_youtube`].
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            debug!("online probe: {status} from {}", resp.url());
+            came_from_youtube(Some(status), resp.url().host_str())
+        }
         // Transport failure: genuinely offline (or YouTube is unreachable).
-        Err(_) => false,
+        Err(e) => {
+            debug!("online probe failed: {e}");
+            came_from_youtube(None, None)
+        }
     }
 }
 
-/// Whether a probe response proves Rift reached YouTube.
+/// Whether a probe result proves Rift reached YouTube.
 ///
-/// A captive portal or transparent proxy answers the HEAD itself — with its own
-/// 200 directly, or by redirecting to its login page — and `.is_success()` alone
-/// would call that "online", so the function meant to *skip* pointless retries
-/// would instead let the kept-offline loop burn its full ~7.5-minute backoff
-/// ladder against a portal. Requiring the *final URL host* to be YouTube's is
-/// what distinguishes the real service from whatever intercepted the request,
-/// and unlike a response header it is a property of the request/redirect chain
-/// rather than a string Google can rename out from under us.
+/// No response at all (`None`, `None`) is the one thing that really is
+/// "offline". Otherwise the host is the whole answer, and **the status is
+/// deliberately not part of the gate** — it is in the signature so the caller can
+/// log it and so the tests below can state the indifference explicitly, and it is
+/// never consulted:
 ///
-/// This rule has already been wrong once in each direction, which is why it is
-/// split out from [`is_online`] to be testable without a network round trip:
-/// - `x-youtube-client-name` as the discriminator was a permanent false
-///   "offline". That is an *innertube API* request header (see
-///   `crates/ytmusic/src/client.rs`), and a live `HEAD https://www.youtube.com/`
-///   — HTTP/2, no User-Agent, through this same client — answers 200 OK with no
-///   such header at all, so every *online* machine was reported offline and the
-///   kept-offline loop gave up on its first failure toasting "you appear to be
-///   offline".
-/// - `server: ESF` (Google's edge frontend, present on every response of that
-///   probe) fixed that, but as the *sole* gate it is a single mutable string: if
-///   Google renames it, every user goes permanently offline with nothing in the
-///   suite to notice. The host check cannot fail that way.
+/// - Reaching YouTube at all is what this probe asks about. A 403 or 429 is the
+///   *most* likely status while a rate-limited download retry pass runs, and
+///   calling that "offline" tells the user to reconnect when their connection is
+///   fine — the false "offline" this rule has already been wrong about twice.
+///   The asymmetry decides it: a false "online" costs one background backoff
+///   ladder; a false "offline" costs a misleading error and no retries at all.
+/// - **The host is what catches an interception.** A captive portal or
+///   transparent proxy answers the probe itself — with its own 200 directly, or
+///   by redirecting to its login page — and its host is not YouTube's. Unlike a
+///   response header it is a property of the request/redirect chain rather than a
+///   string Google can rename out from under us.
+///
+/// That header is how this rule got here: `x-youtube-client-name` (an *innertube
+/// API* request header) is on no response the HTML root sends, so every online
+/// machine read as offline; `server: ESF` fixed that but was a single mutable
+/// string sitting in the gate. Both are recorded in this history so the next
+/// person tempted to gate on a header — or on a status — knows what it costs.
 ///
 /// Accepted residual: a proxy that MITMs HTTPS with a trusted certificate and
-/// answers the probe with its own 2xx *without* redirecting keeps the requested
-/// host, so it reads as online. That costs a wasted backoff ladder in the
-/// background; the alternative gate risks a false "offline" for everyone, which
-/// costs a misleading error and no retries at all.
-fn came_from_youtube(status: u16, final_host: &str) -> bool {
-    (200..300).contains(&status) && is_youtube_host(final_host)
+/// answers the probe without redirecting keeps the requested host, so it reads
+/// as online. That is the cheap direction by the asymmetry above.
+///
+/// Split out from [`is_online`] so the rule is testable without a network round
+/// trip.
+fn came_from_youtube(status: Option<u16>, final_host: Option<&str>) -> bool {
+    // Recorded by the caller, never a gate: the tests assert that a 403/429 from
+    // YouTube's own edge is still online, which is the behaviour this line is
+    // about. Re-adding a status check here fails them.
+    let _ = status;
+    final_host.is_some_and(is_youtube_host)
 }
 
 /// Whether `host` is `youtube.com` or a subdomain of it.
@@ -278,23 +289,37 @@ mod tests {
     #[test]
     fn the_live_youtube_response_shape_counts_as_online() {
         // Captured 2026-10-10 through this same client (HTTP/2, no User-Agent):
-        // `HEAD https://www.youtube.com/` answers 200 OK with `server: ESF`,
+        // `HEAD https://www.youtube.com/` answers 200 OK from
+        // `final_url=https://www.youtube.com/` with `server: ESF`,
         // `content-type: text/html`, and **no** `x-youtube-client-name`.
         //
-        // The `server:` header is deliberately *not* part of the rule: it fixed
-        // the false "offline" above, but as the sole gate a rename at Google
-        // would silently put every user back there. The host is a property of
-        // the request, so a response from YouTube with no header this code has
-        // ever heard of still counts.
-        assert!(came_from_youtube(200, "www.youtube.com"));
-        assert!(came_from_youtube(200, "youtube.com"));
-        assert!(came_from_youtube(200, "m.youtube.com"));
-        assert!(came_from_youtube(204, "www.youtube.com"));
+        // Neither the status nor any header is part of the rule: the host is a
+        // property of the request/redirect chain, so a response from YouTube with
+        // no header this code has ever heard of still counts.
+        assert!(came_from_youtube(Some(200), Some("www.youtube.com")));
+        assert!(came_from_youtube(Some(200), Some("youtube.com")));
+        assert!(came_from_youtube(Some(200), Some("m.youtube.com")));
+    }
+
+    /// The residual this rule was refined for: a response from YouTube's own edge
+    /// counts whatever it says. Rate-limiting is the likeliest reason a download
+    /// retry pass is running at all, and "you appear to be offline — reconnect"
+    /// is the wrong thing to tell a user whose connection is fine. A false
+    /// "online" only costs a background backoff ladder.
+    #[test]
+    fn any_status_from_youtube_is_online() {
+        for status in [200, 204, 301, 302, 403, 429, 500, 503] {
+            assert!(
+                came_from_youtube(Some(status), Some("www.youtube.com")),
+                "status {status} from YouTube must not read as offline"
+            );
+        }
     }
 
     /// The portal case this item exists for: the request is answered by
     /// something that is not YouTube. A redirect to the portal's own https login
-    /// page is 2xx and the most common shape, so the host is what catches it.
+    /// page is 2xx and the most common shape, so the host is what catches it —
+    /// and no status it invents rescues it.
     #[test]
     fn an_answer_that_did_not_end_at_youtube_is_not_online() {
         for host in [
@@ -306,30 +331,27 @@ mod tests {
             "youtube.com.evil.example.net",
             "www.youtube.com.phish.net",
         ] {
-            assert!(
-                !came_from_youtube(200, host),
-                "{host} must not count as online"
-            );
+            for status in [200, 302, 429] {
+                assert!(
+                    !came_from_youtube(Some(status), Some(host)),
+                    "{host} (status {status}) must not count as online"
+                );
+            }
         }
     }
 
+    /// A transport failure is the only genuine "offline": no response at all, so
+    /// no host to check.
     #[test]
-    fn non_success_statuses_are_offline_even_from_youtube() {
-        // A rejected or rate-limited response, or a redirect chain that has not
-        // finished. (2xx from a YouTube host is online.)
-        for status in [301, 302, 403, 429, 500, 503] {
-            assert!(
-                !came_from_youtube(status, "www.youtube.com"),
-                "status {status} must not count as online"
-            );
-        }
+    fn no_response_at_all_is_offline() {
+        assert!(!came_from_youtube(None, None));
     }
 
     /// A trailing dot is a legal spelling of the same fully-qualified name.
     #[test]
     fn a_fully_qualified_youtube_host_is_still_youtube() {
-        assert!(came_from_youtube(200, "www.youtube.com."));
-        assert!(came_from_youtube(200, "YOUTUBE.COM"));
+        assert!(came_from_youtube(Some(200), Some("www.youtube.com.")));
+        assert!(came_from_youtube(Some(200), Some("YOUTUBE.COM")));
     }
 
     #[test]
