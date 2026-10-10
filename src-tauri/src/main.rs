@@ -114,11 +114,20 @@ fn main() {
                 // a stalled socket would otherwise wedge a command forever —
                 // including a download worker holding a `Downloads::begin`
                 // claim that is then never released.
+                //
+                // Not `unwrap_or_default()`: reqwest's `Default` goes through
+                // `Client::new()`, which panics on this same failure with the
+                // message "Client::new()" — naming neither the cause nor the
+                // consequence. Nothing downstream of a broken TLS backend can
+                // reach YouTube, so failing here is right; it should just say so.
                 http: reqwest::Client::builder()
                     .connect_timeout(std::time::Duration::from_secs(5))
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
-                    .unwrap_or_default(),
+                    .expect(
+                        "could not build the HTTP client (TLS backend unavailable): \
+                         every metadata, update and download command needs it",
+                    ),
                 playback_path,
                 persist: util::Persister::spawn(),
                 last_session: Mutex::new(None),
