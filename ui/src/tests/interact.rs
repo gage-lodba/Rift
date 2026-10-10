@@ -54,7 +54,7 @@ use wasm_bindgen_test::wasm_bindgen_test;
 use yew::prelude::*;
 
 use crate::components::{
-    MenuAction, MenuButton, QueuePanel, QueuePanelProps, TrackList, TrackListCtx,
+    MenuAction, MenuButton, QueuePanel, QueuePanelProps, Sidebar, TrackList, TrackListCtx, View,
 };
 use crate::tests::dom::{flush, mount};
 use crate::tests::harness::{playlist, track};
@@ -1195,5 +1195,123 @@ async fn a_keyboard_reorder_is_announced_once_it_has_landed_and_focus_follows_it
         "focus must follow the moved row, or the next Alt+ArrowDown moves the row \
          that took its place; focus is on {}",
         case.active_description()
+    );
+}
+// ---------------------------------------------------------------------------
+// The sidebar host: the same rule, on a different row type
+// ---------------------------------------------------------------------------
+
+/// `SidebarProps` is not re-exported outside `components` (only the component and
+/// its `View` are), and `html!` builds a component's props without naming their
+/// type — the same wrapper trick as `MenuHarness` and `ListHarness`. Only the two
+/// inputs the test varies are props; everything else is a no-op or a recorder.
+#[derive(Properties, PartialEq)]
+struct SidebarHarnessProps {
+    playlists: Vec<(String, String, usize)>,
+    log: Rc<RefCell<Vec<String>>>,
+}
+
+#[function_component]
+fn SidebarHarness(props: &SidebarHarnessProps) -> Html {
+    let record = |name: &'static str| {
+        let log = props.log.clone();
+        Callback::from(move |_: String| log.borrow_mut().push(name.to_owned()))
+    };
+    let on_nav = {
+        let log = props.log.clone();
+        Callback::from(move |_: View| log.borrow_mut().push("NAV".to_owned()))
+    };
+    html! {
+        <Sidebar view={View::Home}
+                 playlists={props.playlists.clone()}
+                 {on_nav}
+                 on_new_playlist={Callback::noop()}
+                 on_import_playlist={Callback::noop()}
+                 on_import_file={Callback::noop()}
+                 on_rename_playlist={record("MENU_RENAME")}
+                 on_delete_playlist={record("MENU_DELETE")}
+                 on_export_playlist={record("MENU_EXPORT")}
+                 on_move_playlist={Callback::noop()}
+                 playing_source={Option::<String>::None}
+                 is_playing={false} />
+    }
+}
+
+/// **The sidebar half of the nested-control finding: the same rule, a different
+/// row type.**
+///
+/// `SidebarPlaylist` renders its `Menu` inside a `role="button"` row whose
+/// `onkeydown` calls the same tag-based `key_on_nested_control`, so the sidebar is
+/// the second host of the defect the verifier found on `TrackRow` — and the only
+/// one this suite never mounted. Adopted from the verifier's scratch test, control
+/// case included: Enter aimed at the row itself must navigate, or the negative
+/// below would pass for a dispatcher that delivered nothing.
+#[wasm_bindgen_test]
+async fn enter_on_a_playlist_menu_item_does_not_navigate() {
+    let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let case = mount::<SidebarHarness>(SidebarHarnessProps {
+        playlists: vec![("pl-1".to_string(), "My Playlist".to_string(), 3)],
+        log: log.clone(),
+    });
+    flush().await;
+
+    // `.side-item[data-index="0"]`, not the verifier's first `.side-item`: the
+    // sidebar's own nav entries share the class, and only a playlist row carries
+    // `data-index`, so this selects the row under test exactly.
+    let row = ".side-item[data-index=\"0\"]";
+
+    // Control.
+    case.keydown(row, "Enter");
+    flush().await;
+    assert_eq!(
+        seen(&log),
+        vec!["NAV".to_string()],
+        "control failed: Enter on the playlist row itself must open the \
+         playlist:\n{}",
+        case.inner_html()
+    );
+    log.borrow_mut().clear();
+
+    // The real case: open the row's own menu from its kebab, focus the first item,
+    // press Enter.
+    case.click(".side-item[data-index=\"0\"] button[title=\"More\"]");
+    flush().await;
+    assert_eq!(
+        case.attr(
+            ".side-item[data-index=\"0\"] button[title=\"More\"]",
+            "aria-expanded"
+        ),
+        "true",
+        "the kebab did not open the row's menu:\n{}",
+        case.inner_html()
+    );
+
+    let item = case.nth("[role='menuitem']", 0);
+    assert_eq!(
+        item.tag_name(),
+        "DIV",
+        "this test is only meaningful while a menu item is a DIV, which is the \
+         thing the tag-based guard cannot see"
+    );
+    case.focus_nth("[role='menuitem']", 0);
+    case.keydown_nth("[role='menuitem']", 0, "Enter");
+    flush().await;
+
+    let entries = seen(&log);
+    assert!(
+        entries.iter().any(|e| e.starts_with("MENU_")),
+        "the menu item's own action did not fire, so the interesting state was \
+         never reached: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e == "NAV"),
+        "the sidebar ROW also navigated for a keystroke aimed at its own menu item \
+         — the same role=\"menuitem\"-DIV blind spot as `TrackRow`, on a different \
+         row type: {entries:?}"
+    );
+    assert!(
+        case.query(".menu").is_none(),
+        "activating an item must close the menu:\n{}",
+        case.inner_html()
     );
 }
