@@ -132,7 +132,7 @@ fn track_row(props: &TrackRowProps) -> Html {
     let available = props.online || props.downloaded;
 
     // The row is a role="button" rather than a real `<button>`: it contains its
-    // own buttons (like, kebab, download) and a draggable reorder handle, and
+    // own buttons (like, kebab, download) and the album and artist links, and
     // nesting interactive elements inside a button is invalid. A role plus
     // `tabindex` gets the same keyboard behaviour with Enter/Space activation.
     let activate = {

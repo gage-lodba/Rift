@@ -2,9 +2,9 @@
 //!
 //! Each screen area lives in its own submodule; shared primitives sit in
 //! [`icons`] (SVGs + formatting), [`menu`] (popup menu), and [`reorder`]
-//! (drag-to-reorder state), plus [`key_on_nested_control`] for the rows that
-//! activate on a key themselves. The names the app shell reaches for are
-//! re-exported here so `use crate::components::*` picks them all up.
+//! (drag- and keyboard-reorder state), plus [`key_on_nested_control`] for the
+//! rows that activate on a key themselves. The names the app shell reaches for
+//! are re-exported here so `use crate::components::*` picks them all up.
 
 use wasm_bindgen::JsCast;
 use web_sys::{Element, KeyboardEvent};
@@ -74,8 +74,9 @@ pub enum View {
 ///
 /// The tag is what decides, not `current_target`: Yew delegates events to the
 /// subtree root, so `current_target` is the renderer's host element rather than
-/// the element the handler belongs to. This mirrors the tag list `App`'s global
-/// shortcut handler uses to detect that it is running inside a focused control.
+/// the element the handler belongs to. `App`'s global shortcut handler answers
+/// the same question from the other side, by skipping any focused control
+/// (`tabIndex >= 0`) rather than by tag.
 pub(crate) fn key_on_nested_control(e: &KeyboardEvent) -> bool {
     e.target()
         .and_then(|t| t.dyn_into::<Element>().ok())

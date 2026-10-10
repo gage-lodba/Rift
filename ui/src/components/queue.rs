@@ -1,4 +1,5 @@
-//! Collapsible "Up next" queue panel with drag-to-reorder rows.
+//! Collapsible "Up next" queue panel with rows reorderable by drag or by
+//! Alt+Up/Down.
 
 use rift_types::QueueSnapshot;
 use yew::prelude::*;
@@ -43,9 +44,16 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
             flip.emit(());
         }
     });
-    // Drag-to-reorder for the queue (shared with the sidebar playlists).
+    // Drag-to-reorder for the queue (shared with the sidebar playlists). The
+    // `(id, label)` pairs are the order by id plus the title a keyboard move
+    // names in its announcement.
     let reorder = use_reorder(
-        props.queue.tracks.iter().map(|t| t.id.clone()).collect(),
+        props
+            .queue
+            .tracks
+            .iter()
+            .map(|t| (t.id.clone(), t.title.clone()))
+            .collect(),
         0,
         props.on_move.clone(),
     );
@@ -79,7 +87,11 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
                 <div class={classes!("queue-list", reorder.reordering.then_some("reordering"), reorder.hover_calm.then_some("hover-calm"))}
                      ref={reorder.list_ref.clone()} ondragenter={reorder.dragover.clone()}
                      ondragover={reorder.dragover.clone()} ondrop={reorder.drop.clone()}
-                     onmousemove={reorder.calm_clear.clone()}>
+                     onmousemove={reorder.calm_clear.clone()}
+                     // Keyboard reorder lives on the list, not the row: the row
+                     // already has a keydown handler, and Alt+Up/Down is the
+                     // list's business either way.
+                     onkeydown={reorder.keyboard.clone()}>
                     { for props.queue.tracks.iter().enumerate().map(|(i, t)| {
                         let jump = { let cb = props.on_jump.clone(); Callback::from(move |_: ()| cb.emit(i)) };
                         let onclick = {
@@ -109,6 +121,13 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
                             <div class={classes!("qrow", current.then_some("current"), reorder.dragging(i).then_some("dragging"))}
                                  style={reorder.shift(i)}
                                  role="button" tabindex="0" aria-current={current.then_some("true")}
+                                 // `data-index` is how the list's Alt+Up/Down
+                                 // handler finds the focused row (see
+                                 // `Reorder::keyboard`); the ARIA pair is what
+                                 // tells a screen reader the shortcut exists.
+                                 data-index={i.to_string()}
+                                 aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+                                 title="Alt+Up / Alt+Down to reorder"
                                  draggable="true" onclick={onclick} onkeydown={onkeydown}
                                  ondragstart={reorder.dragstart(i)} ondragend={reorder.dragend()}>
                                 { cover(&t.cover, "qrow-cover") }
@@ -122,6 +141,14 @@ pub fn queue_panel(props: &QueuePanelProps) -> Html {
                     }) }
                 </div>
             }
+            // A keyboard reorder moves rows with no visual cue a screen reader
+            // can follow, so the move is announced here. Visually hidden, polite
+            // (it queues behind whatever is being read), and mounted empty from
+            // the start — a region that appears already carrying its first
+            // message is the one case screen readers routinely miss.
+            <div class="sr-only" role="status" aria-live="polite">
+                { reorder.announcement.clone().unwrap_or_default() }
+            </div>
         </section>
     }
 }

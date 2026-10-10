@@ -51,12 +51,13 @@ pub fn sidebar(props: &SidebarProps) -> Html {
     let importing = use_state(|| false);
     let import_ref = use_node_ref();
     // Drag-to-reorder for the playlist list (shared with the queue panel). The
-    // 3px margin matches the rows' margin-bottom.
+    // 3px margin matches the rows' margin-bottom, and the `(id, name)` pairs are
+    // the order by id plus the name a keyboard move names in its announcement.
     let reorder = use_reorder(
         props
             .playlists
             .iter()
-            .map(|(id, _, _)| id.clone())
+            .map(|(id, name, _)| (id.clone(), name.clone()))
             .collect(),
         3,
         props.on_move_playlist.clone(),
@@ -314,12 +315,17 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                 <div class={classes!("side-pl-list", reorder.reordering.then_some("reordering"), reorder.hover_calm.then_some("hover-calm"))}
                      ref={reorder.list_ref.clone()} ondragenter={reorder.dragover.clone()}
                      ondragover={reorder.dragover.clone()} ondrop={reorder.drop.clone()}
-                     onmousemove={reorder.calm_clear.clone()}>
+                     onmousemove={reorder.calm_clear.clone()}
+                     // Keyboard reorder lives on the list, not the row: the row
+                     // already has a keydown handler, and Alt+Up/Down is the
+                     // list's business either way.
+                     onkeydown={reorder.keyboard.clone()}>
                 { for props.playlists.iter().enumerate().map(|(i, (id, name, count))| html! {
                     <SidebarPlaylist
                         id={id.clone()}
                         name={name.clone()}
                         count={*count}
+                        index={i}
                         active={props.view == View::Playlist(id.clone())}
                         playing={props.playing_source.as_deref() == Some(format!("playlist:{id}").as_str())}
                         is_playing={props.is_playing}
@@ -333,6 +339,16 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                         on_export={props.on_export_playlist.clone()}
                     />
                 }) }
+                </div>
+
+                // A keyboard reorder moves rows with no visual cue a screen
+                // reader can follow, so the move is announced here. Visually
+                // hidden, polite (it queues behind whatever is being read), and
+                // mounted empty from the start — a region that appears already
+                // carrying its first message is the one case screen readers
+                // routinely miss.
+                <div class="sr-only" role="status" aria-live="polite">
+                    { reorder.announcement.clone().unwrap_or_default() }
                 </div>
 
                 if *creating {
@@ -399,6 +415,9 @@ struct SidebarPlaylistProps {
     id: String,
     name: String,
     count: usize,
+    /// This row's position in the list. Only the keyboard reorder needs it: the
+    /// list's handler reads it back off the focused row (see `Reorder::keyboard`).
+    index: usize,
     active: bool,
     /// This playlist is the source of the playing queue.
     playing: bool,
@@ -504,6 +523,12 @@ fn sidebar_playlist(props: &SidebarPlaylistProps) -> Html {
         <div class={classes!("side-item", props.active.then_some("active"), (*menu_open).then_some("menu-open"), props.dragging.then_some("dragging"))}
              style={props.shift.clone()}
              role="button" tabindex="0" aria-current={props.active.then_some("true")}
+             // `data-index` is how the list's Alt+Up/Down handler finds the
+             // focused row (see `Reorder::keyboard`); the ARIA pair is what tells
+             // a screen reader the shortcut exists.
+             data-index={props.index.to_string()}
+             aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+             title="Alt+Up / Alt+Down to reorder"
              draggable="true" onclick={nav} onkeydown={nav_key} oncontextmenu={context}
              ondragstart={props.on_dragstart.clone()} ondragend={props.on_dragend.clone()}>
             { lead }

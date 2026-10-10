@@ -68,20 +68,31 @@ pub fn home_view(props: &HomeProps) -> Html {
                         },
                     ];
                     html! {
-                        <button class="card" onclick={Callback::from(move |_| on_nav.emit(v.clone()))}>
+                        // A `div`, not a `<button>`: this card holds the kebab
+                        // below, and a button inside a button is not defined by
+                        // any engine. The primary action is the transparent
+                        // `.card-action` overlay instead, so the kebab is a
+                        // sibling. See the CSS for the stacking.
+                        <div class="card">
                             { cover(cover_url, "card-cover") }
                             <div class="card-foot">
                                 <div class="card-text">
                                     <div class="card-name">{ &p.name }</div>
                                     <div class="card-sub">{ format!("{} songs", p.tracks.len()) }</div>
                                 </div>
-                                // The kebab is its own button; stop the click
-                                // from bubbling into the card's navigation.
-                                <div class="card-menu" onclick={|e: MouseEvent| e.stop_propagation()}>
+                                // No `stop_propagation` here any more: the kebab
+                                // is no longer a descendant of a click handler,
+                                // and `MenuButton`'s own toggle stops the click.
+                                <div class="card-menu">
                                     <MenuButton actions={actions} align_right=true />
                                 </div>
                             </div>
-                        </button>
+                            // Covers the whole card so pointer and keyboard reach
+                            // the same target, and it is a real button, so Enter
+                            // and Space work without a role/tabindex trio.
+                            <button class="card-action" aria-label={format!("Open playlist {}", p.name)}
+                                    onclick={Callback::from(move |_| on_nav.emit(v.clone()))} />
+                        </div>
                     }
                 }) }
             </div>

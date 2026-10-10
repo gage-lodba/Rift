@@ -46,8 +46,16 @@ pub struct MenuProps {
 ///
 /// Operable by keyboard: `role="menu"`/`menuitem`, focus moves to the first item
 /// on open, Up/Down (and Home/End) walk the items, Left/Right and Enter expand a
-/// submenu, and Escape closes the whole menu and restores focus to its anchor.
-/// Pointer behaviour is unchanged.
+/// submenu, Escape closes the whole menu and restores focus to its anchor, and
+/// focus leaving the popup (Tab) closes it too. Pointer behaviour is unchanged.
+///
+/// **Every key the popup handles stops propagating.** A menu is rendered inside
+/// the row that opened it, and those rows are `role="button"` containers that
+/// activate on Enter/Space. Their guard (`key_on_nested_control`) recognizes
+/// tag-based controls only, and a menu item is a `div` with a role — so without
+/// the stops, Enter on "Play next" ran the action *and* started the track. The
+/// rule is stated here rather than at each handler because the next item kind
+/// added has to follow it.
 #[function_component(Menu)]
 pub fn menu(props: &MenuProps) -> Html {
     let expanded = use_state(|| None::<usize>);
@@ -75,27 +83,39 @@ pub fn menu(props: &MenuProps) -> Html {
             || ()
         });
     }
-    // Escape closes from anywhere in the popup, including a submenu; focus
-    // returns to whatever opened it.
-    let onkeydown = {
+    // Close the popup and hand focus back to whatever opened it. Escape and an
+    // activated item both need this: the menu unmounts, so the element that had
+    // focus goes with it and a keyboard user is otherwise dropped at the top of
+    // the document.
+    let close_and_restore = {
         let close = props.on_close.clone();
         let anchor = props.anchor.clone();
+        Callback::from(move |_: ()| {
+            close.emit(());
+            if let Some(node) = anchor
+                .as_ref()
+                .and_then(NodeRef::cast::<web_sys::HtmlElement>)
+            {
+                let _ = node.focus();
+            }
+        })
+    };
+    // Escape closes from anywhere in the popup, including a submenu.
+    let onkeydown = {
+        let close_and_restore = close_and_restore.clone();
         let items = items.clone();
         let expanded = expanded.clone();
+        // Every arm that handles a key stops it there (see the component doc):
+        // nothing above the popup has any business with a key aimed inside it.
         Callback::from(move |e: KeyboardEvent| match e.key().as_str() {
             "Escape" => {
                 e.prevent_default();
                 e.stop_propagation();
-                close.emit(());
-                if let Some(node) = anchor
-                    .as_ref()
-                    .and_then(NodeRef::cast::<web_sys::HtmlElement>)
-                {
-                    let _ = node.focus();
-                }
+                close_and_restore.emit(());
             }
             "ArrowDown" | "ArrowUp" | "Home" | "End" => {
                 e.prevent_default();
+                e.stop_propagation();
                 let list = menu_items(&items);
                 if list.is_empty() {
                     return;
@@ -115,11 +135,19 @@ pub fn menu(props: &MenuProps) -> Html {
                 // Expand the focused submenu, if it is one.
                 if let Some(index) = focused_submenu(&items) {
                     e.prevent_default();
+                    e.stop_propagation();
                     expanded.set(Some(index));
                 }
             }
             "ArrowLeft" if expanded.is_some() => {
                 e.prevent_default();
+                e.stop_propagation();
+                // Collapsing unmounts the options, and removing the focused
+                // element drops focus to the body — which would also close this
+                // menu, since focus leaving is what closes it now. Hand focus
+                // back to the submenu's own header first. A no-op when the
+                // header itself has focus, which is the other way in.
+                focus_open_submenu_header(&items);
                 expanded.set(None);
             }
             _ => {}
@@ -130,6 +158,30 @@ pub fn menu(props: &MenuProps) -> Html {
     }
     let close = props.on_close.clone();
     let backdrop_close = close.clone();
+    // Focus leaving the popup closes it. Escape alone only works while focus is
+    // still *inside* the menu: tab past the last item and the menu used to stay
+    // open with no keyboard way out, since its backdrop answers a pointer only.
+    // This does not move focus — by the time `focusout` fires, Tab's own default
+    // action has already put it where the user asked.
+    let onfocusout = {
+        let close = props.on_close.clone();
+        let items = items.clone();
+        Callback::from(move |e: FocusEvent| {
+            let root = items.cast::<web_sys::Node>();
+            let next = e
+                .related_target()
+                .and_then(|t| t.dyn_into::<web_sys::Node>().ok());
+            // No related target means focus went nowhere (the window lost it, or
+            // the focused element was removed) — that counts as leaving too.
+            let still_inside = match (root.as_ref(), next.as_ref()) {
+                (Some(root), Some(next)) => root.contains(Some(next)),
+                _ => false,
+            };
+            if !still_inside {
+                close.emit(());
+            }
+        })
+    };
 
     html! {
         <>
@@ -138,7 +190,7 @@ pub fn menu(props: &MenuProps) -> Html {
                  oncontextmenu={let c = close.clone(); Callback::from(move |e: MouseEvent| { e.prevent_default(); e.stop_propagation(); c.emit(()); })}>
             </div>
             <div class={classes!("menu", props.align_right.then_some("menu-right"))}
-                 role="menu" tabindex="-1" ref={items} {onkeydown}
+                 role="menu" tabindex="-1" ref={items} {onkeydown} {onfocusout}
                  onclick={|e: MouseEvent| e.stop_propagation()}>
                 { for props.actions.iter().enumerate().map(|(i, a)| {
                     match a {
@@ -146,10 +198,16 @@ pub fn menu(props: &MenuProps) -> Html {
                         MenuAction::Item { icon: ic, label, danger, cb } => {
                             let activate = {
                                 let cb = cb.clone();
-                                let close = close.clone();
+                                // Activating closes the menu, and the popup
+                                // unmounting takes the activated item with it:
+                                // without the focus restore, choosing an entry
+                                // with Enter drops focus at the top of the
+                                // document (the review's Escape finding, one
+                                // step further).
+                                let close_and_restore = close_and_restore.clone();
                                 Callback::from(move |_: ()| {
                                     cb.emit(());
-                                    close.emit(());
+                                    close_and_restore.emit(());
                                 })
                             };
                             let onclick = {
@@ -158,9 +216,19 @@ pub fn menu(props: &MenuProps) -> Html {
                             };
                             // A `div` with a role is focusable and Enter/Space
                             // activate it, without the default button chrome.
+                            //
+                            // `stop_propagation` is not decoration: a menu is
+                            // rendered *inside* the row that opened it, and rows
+                            // activate on Enter/Space themselves. Their guard
+                            // (`key_on_nested_control`) recognizes tag-based
+                            // controls only, and a menu item is a `div` — so
+                            // without this, Enter on "Play next" ran the action
+                            // *and* started the track. The key belongs to the
+                            // control it was aimed at.
                             let onkeydown = Callback::from(move |e: KeyboardEvent| {
                                 if e.key() == "Enter" || e.key() == " " {
                                     e.prevent_default();
+                                    e.stop_propagation();
                                     activate.emit(());
                                 }
                             });
@@ -184,6 +252,10 @@ pub fn menu(props: &MenuProps) -> Html {
                                 Callback::from(move |e: KeyboardEvent| {
                                     if e.key() == "Enter" || e.key() == " " {
                                         e.prevent_default();
+                                        // Same reason as a plain item below:
+                                        // expanding is this control's action, and
+                                        // the host row must not also activate.
+                                        e.stop_propagation();
                                         expanded.set(if is_open { None } else { Some(i) });
                                     }
                                 })
@@ -205,11 +277,15 @@ pub fn menu(props: &MenuProps) -> Html {
                                             { for options.iter().map(|(id, name)| {
                                                 let activate = {
                                                     let cb = cb.clone();
-                                                    let close = close.clone();
+                                                    // Same focus handoff as a
+                                                    // top-level item: the popup
+                                                    // (and this option with it)
+                                                    // unmounts on close.
+                                                    let close_and_restore = close_and_restore.clone();
                                                     let id = id.clone();
                                                     Callback::from(move |_: ()| {
                                                         cb.emit(id.clone());
-                                                        close.emit(());
+                                                        close_and_restore.emit(());
                                                     })
                                                 };
                                                 let onclick = {
@@ -219,6 +295,11 @@ pub fn menu(props: &MenuProps) -> Html {
                                                 let onkeydown = Callback::from(move |e: KeyboardEvent| {
                                                     if e.key() == "Enter" || e.key() == " " {
                                                         e.prevent_default();
+                                                        // Same as a top-level
+                                                        // item: the option owns
+                                                        // the key, not the host
+                                                        // row.
+                                                        e.stop_propagation();
                                                         activate.emit(());
                                                     }
                                                 });
@@ -286,6 +367,36 @@ fn active_element() -> web_sys::Node {
         .and_then(|d| d.active_element())
         .map(|el| el.unchecked_into::<web_sys::Node>())
         .unwrap_or(wasm_bindgen::JsValue::NULL.unchecked_into())
+}
+
+/// Move focus to the header of the submenu whose option has focus, if any.
+///
+/// Returns whether focus moved. A submenu collapse unmounts its options, and
+/// removing the focused element sends focus to the body, so ArrowLeft from an
+/// option has to hand focus to the header that owns it first. The header is the
+/// list's previous element sibling: the two are rendered side by side inside the
+/// menu.
+fn focus_open_submenu_header(container: &NodeRef) -> bool {
+    let Some(root) = container.cast::<web_sys::Node>() else {
+        return false;
+    };
+    let Some(option) = active_element().dyn_into::<web_sys::Element>().ok() else {
+        return false;
+    };
+    let Some(list) = option.closest(".menu-sub-list").ok().flatten() else {
+        return false;
+    };
+    // Only this menu's submenu: `active_element` is document-wide.
+    if !root.contains(Some(list.unchecked_ref::<web_sys::Node>())) {
+        return false;
+    }
+    let Some(header) = list
+        .previous_element_sibling()
+        .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return false;
+    };
+    header.focus().is_ok()
 }
 
 /// A kebab (⋮) button that owns its open state and shows a [`Menu`].

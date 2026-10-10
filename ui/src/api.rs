@@ -54,10 +54,25 @@ mod bridge {
 }
 
 #[cfg(test)]
-pub(crate) use crate::tests::harness::{spawn, tauri_invoke};
+pub(crate) use crate::tests::harness::tauri_invoke;
 
 #[cfg(not(test))]
 pub use bridge::tauri_invoke;
+
+// The executor seam, alongside the bridge above: production runs the future on
+// the page's executor, the test build queues it for `Test::settle` to drive.
+//
+// Command call sites use `api::spawn` rather than
+// `wasm_bindgen_futures::spawn_local` for that reason. A future spawned by hand
+// never runs under the harness, so everything it awaited was unreachable by any
+// test — the Settings yt-dlp probes, the artist/album fetches, the search tabs,
+// the launch-time update check. Pure UI timers (`show_toast`'s dismiss delay)
+// deliberately stay on `spawn_local`: there is nothing to assert about them, and
+// leaving them undriven is what keeps a toast on screen for a test to read.
+#[cfg(test)]
+pub(crate) use crate::tests::harness::spawn;
+#[cfg(not(test))]
+pub use wasm_bindgen_futures::spawn_local as spawn;
 
 /// Subscribe to a backend event for the lifetime of the page.
 ///
@@ -95,7 +110,7 @@ pub async fn invoke<R: DeserializeOwned>(cmd: &str, args: &impl Serialize) -> Re
 
 /// Fire-and-forget command invocation.
 ///
-/// "Fire-and-forget" is about the return value, not about the failure: 41 of
+/// "Fire-and-forget" is about the return value, not about the failure: 42 of
 /// this app's 55 IPC calls go through here, and a bare `console.error` meant
 /// every `Err` not mirrored by a backend `rift://error` event reached nobody.
 /// Concretely, clicking play on an empty collection did nothing at all, and
@@ -135,12 +150,13 @@ where
 }
 
 thread_local! {
-    /// Where a failed `fire` sends its message. `App` installs its toast here on
-    /// mount; until then failures only reach the console.
+    /// Where a failed command sends its message: `fire`, `invoke_or_default`,
+    /// and `App`'s bootstrap, which reports by hand. `App` installs its toast
+    /// here on mount; until then failures only reach the console.
     static ERROR_SINK: RefCell<Option<Callback<String>>> = const { RefCell::new(None) };
 }
 
-/// Install the sink that [`fire`] reports failures to.
+/// Install the sink that frontend-side command failures report to.
 pub fn set_error_sink(sink: Callback<String>) {
     ERROR_SINK.with(|s| *s.borrow_mut() = Some(sink));
 }
@@ -171,9 +187,6 @@ pub fn report_error(msg: String) {
         }
     });
 }
-
-#[cfg(not(test))]
-use wasm_bindgen_futures::spawn_local as spawn;
 
 /// Unwrap one event payload and hand it to `cb`, logging a payload the event's
 /// type cannot read.

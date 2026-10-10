@@ -1,5 +1,5 @@
-//! Shared drag-to-reorder state for vertical lists (queue panel + sidebar
-//! playlists). See [`Reorder`] for the wiring contract.
+//! Shared drag- and keyboard-reorder state for vertical lists (queue panel +
+//! sidebar playlists). See [`Reorder`] for the wiring contract.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -131,6 +131,67 @@ pub(crate) fn drag_shift_style(
     ))
 }
 
+/// Where a keyboard reorder (Alt+Up/Down) moves the row at `from`, if anywhere.
+///
+/// Split out of the handler for the same reason [`slot_at_offset`] is: the
+/// boundary is the whole correctness question. An index one past the end is how
+/// a reorder silently moves the wrong row, and a move off the top has nothing to
+/// swap with. `None` is "no move", which the caller must treat as "nothing
+/// happened" rather than as a slot that merely equals `from`.
+pub(crate) fn keyboard_move_target(key: &str, from: usize, len: usize) -> Option<usize> {
+    match key {
+        "ArrowUp" => from.checked_sub(1),
+        "ArrowDown" => (from + 1 < len).then_some(from + 1),
+        _ => None,
+    }
+}
+
+/// The `data-index` of the row the user's focus is inside, if any.
+///
+/// Read from the DOM at key time rather than captured when the row was
+/// rendered: an unkeyed list is patched in place, so a row's index changes under
+/// it after a move and a stale capture would move whichever row took its place.
+/// `closest` so the shortcut still works while one of the row's own buttons has
+/// focus; the open menu is excluded explicitly, because it renders *inside* the
+/// row's subtree and Alt+Up/Down there would move the row out from under the
+/// menu the user is reading.
+fn focused_row_index() -> Option<usize> {
+    let active = web_sys::window()?.document()?.active_element()?;
+    if active.closest(".menu").ok().flatten().is_some() {
+        return None;
+    }
+    let row = if active.has_attribute("data-index") {
+        active
+    } else {
+        active.closest("[data-index]").ok().flatten()?
+    };
+    row.get_attribute("data-index")?.parse().ok()
+}
+
+/// Put focus back on the row at `index` in this list, if it is still there.
+fn focus_row(list: &NodeRef, index: usize) {
+    let Some(root) = list.cast::<web_sys::HtmlElement>() else {
+        return;
+    };
+    let Ok(Some(row)) = root.query_selector(&format!("[data-index=\"{index}\"]")) else {
+        return;
+    };
+    if let Ok(row) = row.dyn_into::<web_sys::HtmlElement>() {
+        let _ = row.focus();
+    }
+}
+
+/// The live-region text for a keyboard reorder: the row's label and its new
+/// position, one-based and counted against the whole list.
+///
+/// Split out like [`keyboard_move_target`] so the wording and the arithmetic are
+/// decidable without a DOM: a screen reader hears this sentence, so an
+/// off-by-one here is the difference between "position 2" and the row actually
+/// being second.
+pub(crate) fn move_announcement(label: &str, to: usize, len: usize) -> String {
+    format!("{label} moved to position {} of {len}", to + 1)
+}
+
 /// Shared drag-to-reorder state for a vertical list. Both the queue panel and
 /// the sidebar playlist list drive their reordering through this: the two were
 /// line-for-line identical — the drag source/over slots, the committed-order
@@ -151,6 +212,13 @@ pub(crate) struct Reorder {
     pub(crate) drop: Callback<DragEvent>,
     /// Container `onmousemove` handler (clears hover-calm).
     pub(crate) calm_clear: Callback<MouseEvent>,
+    /// Container `onkeydown` handler: Alt+Up/Down reorders the focused row.
+    pub(crate) keyboard: Callback<KeyboardEvent>,
+    /// The last keyboard move as live-region text, e.g. "Chill moved to position
+    /// 2 of 5"; `None` until one lands. Render it in a `role="status"` element
+    /// (the lists use `.sr-only`), which is what makes a keyboard reorder
+    /// audible rather than a silent reshuffle.
+    pub(crate) announcement: Option<String>,
     // Effective source/target slots and the per-row state used to build each
     // row's handlers and live-preview transform.
     eff_src: Option<usize>,
@@ -210,17 +278,19 @@ impl Reorder {
     }
 }
 
-/// Custom hook backing [`Reorder`]. `ids` is the list's current order by stable
-/// id (used to detect when a committed reorder has landed); `margin` is the
-/// vertical gap between rows in px, used both to locate the hovered slot and to
-/// size the preview transforms. `on_move` is emitted with `(from, to)` on a
-/// committed drop.
+/// Custom hook backing [`Reorder`]. `rows` is the list's current order as
+/// `(stable id, label)`: the ids detect when a committed reorder has landed, and
+/// the labels are what a keyboard move names in its announcement. `margin` is
+/// the vertical gap between rows in px, used both to locate the hovered slot and
+/// to size the preview transforms. `on_move` is emitted with `(from, to)` on a
+/// committed drop and on a keyboard move.
 #[hook]
 pub(crate) fn use_reorder(
-    ids: Vec<String>,
+    rows: Vec<(String, String)>,
     margin: i64,
     on_move: Callback<(usize, usize)>,
 ) -> Reorder {
+    let ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
     let drag_src = use_state(|| None::<usize>);
     let drag_over = use_state(|| None::<usize>);
     let list_ref = use_node_ref();
@@ -234,6 +304,49 @@ pub(crate) fn use_reorder(
     let hover_calm = use_state(|| false);
     // Synchronous "our drag is live" flag; see the field doc on [`Reorder`].
     let active = use_mut_ref(|| false);
+    // Where focus has to go once a keyboard reorder lands, held with the order
+    // the move was computed against. `None` = no keyboard move in flight.
+    // Declared here with the other hooks rather than beside the handler that
+    // fills it: a hook belongs at the top of the body, and the handlers below
+    // return early on paths that must not skip it.
+    let focus_after_move = use_mut_ref(|| None::<(Vec<String>, usize)>);
+    // The last keyboard move, as text for a live region. Held in state rather
+    // than recomputed from `focus_after_move`, because the intent is consumed by
+    // the effect below: a region whose text vanished on the next render reads
+    // unreliably (some screen readers have not got to it yet).
+    let announcement = use_state(|| None::<String>);
+    {
+        // Hand focus to the slot the moved row landed in. An unkeyed list is
+        // patched in place, so the focused element stays on the *old* index
+        // holding a different row — pressing Alt+Down again would move that one,
+        // swapping the same two rows forever. Runs once the order the move was
+        // computed against has actually changed.
+        //
+        // The same moment is the only honest one for the announcement: it is
+        // when the move is known to have landed rather than merely been asked
+        // for, and the one-move-in-flight guard means there cannot be two
+        // announcements racing.
+        let focus_after_move = focus_after_move.clone();
+        let list_ref = list_ref.clone();
+        let announcement = announcement.clone();
+        let rows = rows.clone();
+        let ids = ids.clone();
+        use_effect_with(ids.clone(), move |ids| {
+            let landed = focus_after_move
+                .borrow()
+                .as_ref()
+                .is_some_and(|(before, _)| before != ids);
+            if landed {
+                if let Some((_, to)) = focus_after_move.borrow_mut().take() {
+                    focus_row(&list_ref, to);
+                    if let Some((_, label)) = rows.get(to) {
+                        announcement.set(Some(move_announcement(label, to, rows.len())));
+                    }
+                }
+            }
+            || ()
+        });
+    }
 
     // The committed reorder has landed: resolve the preview in the same render
     // that first shows the new order (visually identical to the preview, so the
@@ -276,6 +389,9 @@ pub(crate) fn use_reorder(
         let committed = committed.clone();
         let active = active.clone();
         let ids = ids.clone();
+        // Cloned rather than moved: the keyboard handler below emits through the
+        // same callback and has to own one too.
+        let on_move = on_move.clone();
         Callback::from(move |e: DragEvent| {
             e.prevent_default();
             *active.borrow_mut() = false;
@@ -316,6 +432,54 @@ pub(crate) fn use_reorder(
             }
         })
     };
+    // Keyboard reorder: Alt+Up/Down moves the focused row one slot, through the
+    // same `on_move` a drop emits — so the backend command, the committed-order
+    // hold and the sidebar's id lookup are all the existing path, and the only
+    // thing the keyboard adds is where the keystroke came from and where focus
+    // has to end up.
+    let keyboard = {
+        let ids = ids.clone();
+        let on_move = on_move.clone();
+        let focus_after_move = focus_after_move.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if !e.alt_key() {
+                return;
+            }
+            // One keyboard move at a time. The index comes from the DOM, which
+            // only reflects the new order once the move has landed, so a second
+            // keystroke before the echo would compute the same `(from, to)`
+            // again — and two identical moves cancel out. This is also what
+            // makes a held Alt+Down walk the row down the list instead of
+            // fighting itself: each repeat waits for the previous echo.
+            if focus_after_move.borrow().is_some() {
+                return;
+            }
+            let Some(from) = focused_row_index() else {
+                return;
+            };
+            let Some(to) = keyboard_move_target(&e.key(), from, ids.len()) else {
+                return;
+            };
+            e.prevent_default();
+            *focus_after_move.borrow_mut() = Some((ids.clone(), to));
+            // The drop path's safety net, for the same reason: a rejected move
+            // never echoes the new order, and a stale intent would otherwise
+            // grab focus on some later, unrelated list change.
+            let settled = ids.clone();
+            let focus_after_move = focus_after_move.clone();
+            gloo_timers::callback::Timeout::new(700, move || {
+                let mut pending = focus_after_move.borrow_mut();
+                if pending
+                    .as_ref()
+                    .is_some_and(|(before, _)| *before == settled)
+                {
+                    *pending = None;
+                }
+            })
+            .forget();
+            on_move.emit((from, to));
+        })
+    };
 
     Reorder {
         list_ref,
@@ -324,6 +488,7 @@ pub(crate) fn use_reorder(
         dragover,
         drop,
         calm_clear,
+        keyboard,
         eff_src,
         eff_over,
         margin,
@@ -332,5 +497,6 @@ pub(crate) fn use_reorder(
         committed,
         hover_calm_state: hover_calm,
         active,
+        announcement: (*announcement).clone(),
     }
 }

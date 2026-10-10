@@ -2,7 +2,6 @@
 
 use rift_types::{UpdateStatus, YtDlpStatus};
 use serde_json::json;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 
@@ -67,13 +66,16 @@ pub fn settings_view(props: &SettingsProps) -> Html {
 
     // yt-dlp detection: probe once on mount, and again when the user clicks
     // "Check again". `None` renders as a "Checking…" state.
+    //
+    // The probes run through `api::spawn` (not `spawn_local`) so their commands
+    // reach the test harness — see the executor seam in `api.rs`.
     let ytdlp = use_state(|| None as YtDlpProbe);
     let check = {
         let ytdlp = ytdlp.clone();
         Callback::from(move |_: ()| {
             let ytdlp = ytdlp.clone();
             ytdlp.set(None);
-            spawn_local(async move {
+            api::spawn(async move {
                 // `invoke_or_default`, not a bare `unwrap_or_default`: a
                 // rejected probe used to render as "✗ Not found", telling the
                 // user yt-dlp is missing when the command itself had failed.
@@ -118,7 +120,7 @@ pub fn settings_view(props: &SettingsProps) -> Html {
             let ytdlp = ytdlp.clone();
             let value = (*path_draft).clone();
             ytdlp.set(None);
-            spawn_local(async move {
+            api::spawn(async move {
                 // The rejection here is the *interesting* half: the backend
                 // validates the override (absolute, canonicalized, a regular
                 // file), and its message said why. It reaches the toast now
@@ -144,7 +146,7 @@ pub fn settings_view(props: &SettingsProps) -> Html {
             let downloading = downloading.clone();
             let path_draft = path_draft.clone();
             downloading.set(true);
-            spawn_local(async move {
+            api::spawn(async move {
                 let status =
                     api::invoke_or_default::<YtDlpStatus>("download_ytdlp", &json!({})).await;
                 if let Some(p) = &status.path {

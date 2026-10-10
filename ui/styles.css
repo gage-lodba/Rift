@@ -236,8 +236,8 @@ input[type="range"] { accent-color: var(--accent); }
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  /* Reserve room for the (taller) hover-revealed ⋮ button so swapping the
-     track count for it doesn't grow the row. 22px button + 16px padding. */
+  /* Reserve room for the (taller) hover- or focus-revealed ⋮ button so swapping
+     the track count for it doesn't grow the row. 22px button + 16px padding. */
   min-height: 38px;
   margin-bottom: 3px;
   border-radius: 6px;
@@ -258,7 +258,8 @@ input[type="range"] { accent-color: var(--accent); }
 .side-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .side-count { font-size: 11px; color: var(--text-dim); }
 
-/* On hover (or while its menu is open) the count gives way to the ⋮ button. */
+/* On hover, on focus (see the keyboard-focus block), or while its menu is open,
+   the count gives way to the ⋮ button. */
 .side-item:hover .side-count,
 .side-item.menu-open .side-count { display: none; }
 
@@ -489,8 +490,8 @@ input[type="range"] { accent-color: var(--accent); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* per-row offline slot: check when downloaded, spinner while fetching, or a
-   hover-revealed download button. Fixed width so the album column stays
-   aligned across rows regardless of state. */
+   hover- or focus-revealed download button. Fixed width so the album column
+   stays aligned across rows regardless of state. */
 .trow-dl {
   display: flex;
   align-items: center;
@@ -501,8 +502,9 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .trow-dl > span { display: flex; align-items: center; }
 .trow-dl svg, .trow-dl .ibtn svg { width: 15px; height: 15px; }
-/* Like the kebab, the download button only shows while the row is hovered;
-   the downloaded check doubles as the offline indicator, so it stays visible. */
+/* Like the kebab, the download button only shows while the row is hovered or the
+   button itself has focus; the downloaded check doubles as the offline
+   indicator, so it stays visible. */
 .trow-dl .ibtn { opacity: 0; }
 .trow:hover .trow-dl .ibtn,
 .trow-dl .ibtn.accent,
@@ -525,9 +527,13 @@ input[type="range"] { accent-color: var(--accent); }
   border-radius: 8px;
   padding: 10px;
   background: transparent;
-  /* `.card` is a `<button>` (so it is keyboard-reachable); reset the UA's
-     button chrome. `color: inherit` matters — a button does not inherit the
-     page colour, so without it every card's text would fall back to black. */
+  /* A `.card` is a `<button>` when it has no secondary controls (the plain
+     library/album/artist cards) and a plain `div` when it holds a kebab — a
+     button inside a button is undefined, so that card carries its action in a
+     `.card-action` overlay instead. These are the button resets it needs as a
+     button; as a div they are no-ops. `color: inherit` matters — a button does
+     not inherit the page colour, so without it every card's text would fall
+     back to black. */
   border: none;
   color: inherit;
   font: inherit;
@@ -536,6 +542,21 @@ input[type="range"] { accent-color: var(--accent); }
   transition: background 0.15s;
 }
 .card:hover { background: var(--bg-raised); }
+
+/* Primary action of a card that also holds a kebab: transparent, covering the
+   whole card so it is the pointer target the card itself used to be, and under
+   the kebab so the kebab stays clickable (see `.card-menu`). A real `<button>`,
+   so Enter/Space and the tab order come for free. */
+.card-action {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: none;
+  border: none;
+  padding: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
 
 /* Card footer: title/song-count on the left, kebab menu on the right. */
 .card-foot {
@@ -546,8 +567,9 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .card-text { flex: 1; min-width: 0; }
 .card-foot .card-name { margin-top: 0; }
-/* Kebab revealed on hover (or while its menu is open). */
-.card-menu { flex-shrink: 0; opacity: 0; }
+/* Kebab revealed on hover, on focus, or while its menu is open, and stacked
+   above the card's own action overlay so it stays clickable. */
+.card-menu { position: relative; z-index: 2; flex-shrink: 0; opacity: 0; }
 .card:hover .card-menu,
 .card-menu:has(.menu-anchor .menu) { opacity: 1; }
 .card-menu .ibtn { width: 24px; height: 24px; }
@@ -653,7 +675,7 @@ input[type="range"] { accent-color: var(--accent); }
   gap: 2px;
 }
 /* The like button stays visible (so songs can be liked from any list, including
-   search results); only the kebab menu is revealed on hover. */
+   search results); only the kebab menu is revealed on hover or focus. */
 .trow-actions .menu-anchor { opacity: 0; }
 .trow:hover .trow-actions .menu-anchor,
 .trow.menu-open .trow-actions .menu-anchor { opacity: 1; }
@@ -1090,12 +1112,47 @@ input[type="range"] { accent-color: var(--accent); }
 .side-item:focus-within .side-kebab { display: inline-flex; }
 .side-item:focus-within .side-count { display: none; }
 
+/* The drag-calm rules mute `:hover` for a beat after a drop, because the browser
+   leaves :hover stuck on the grab position. They must not mute *focus* along
+   with it — and these need the same specificity as the rules they override
+   (`.hover-calm .qrow:hover .ibtn`), which is why they repeat the prefix. */
+.hover-calm .side-item .side-kebab:focus-within { display: inline-flex; }
+.hover-calm .qrow .ibtn:focus-visible { opacity: 1; }
+
 /* Rows and cards are focusable containers; an inset ring reads better than one
-   that bleeds into the neighbouring row. */
+   that bleeds into the neighbouring row. `.card-action` is included because the
+   keyboard stops on that overlay, not on the card: it covers the card exactly,
+   so the ring lands where the card's own would. */
 .trow:focus-visible,
 .qrow:focus-visible,
 .side-item:focus-visible,
-.card:focus-visible {
+.card:focus-visible,
+.card-action:focus-visible {
   outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/* Available to assistive tech, invisible on screen — a 1px clip, not
+   `display: none`, which would drop it out of the accessibility tree as well.
+   Carries the live region that announces a keyboard reorder (see
+   `Reorder::announcement`). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The submenu list is a scroll container (`overflow-y: auto` computes
+   `overflow-x` to `auto` as well), so an outset ring on an option is clipped at
+   the sides and at the first/last entry. An inset ring is fully inside the
+   item's own box, which the container cannot clip. */
+.menu-sub-list .menu-item:focus-visible {
   outline-offset: -2px;
 }

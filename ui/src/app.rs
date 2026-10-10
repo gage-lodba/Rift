@@ -12,7 +12,6 @@ use rift_types::{
 use serde_json::json;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, KeyboardEvent};
 use yew::prelude::*;
 
@@ -75,13 +74,14 @@ pub(crate) fn fire_play_tracks(tracks: &[Track], source: &Option<String>, start:
 
 /// Fire `play_track` for a single track, replacing the queue.
 ///
-/// Split out of the two closures that call it for the same reason
+/// Split out of the click handler that calls it for the same reason
 /// [`shuffled_start`] is: the payload this builds is the exact thing that
 /// regressed — the command's `radio` parameter was removed from the backend
-/// while this call site kept sending it — and a `json!` literal inside a
-/// `Callback::from` closure cannot be reached by any test. Both the row handler
-/// and the Home view call it, so it is shared code rather than a test-only
-/// detour.
+/// while this call site kept sending it — and a named function lets that payload
+/// be driven against the real serialization instead of restated. The Home view's
+/// recently-played list is the caller; a row inside a collection goes through
+/// [`fire_play_tracks`], which starts the collection at that row rather than
+/// replacing the queue with one song.
 pub(crate) fn fire_play_track(track: &Track) {
     api::fire("play_track", json!({ "track": track }));
 }
@@ -126,7 +126,10 @@ pub(crate) fn show_toast(
         *g
     };
     toast.set(Some(msg));
-    spawn_local(async move {
+    // The real executor on purpose, not `api::spawn`: this is a UI timer, not a
+    // command. A test never drives it, which is what keeps the toast on screen
+    // for the assertion.
+    wasm_bindgen_futures::spawn_local(async move {
         gloo_timers::future::TimeoutFuture::new(ms).await;
         if *gen.borrow() == token {
             toast.set(None);
@@ -145,7 +148,8 @@ fn sticky_toast(toast: &UseStateHandle<Option<String>>, gen: &Rc<RefCell<u64>>, 
 pub fn app() -> Html {
     // Rc so the whole library can be shared with child views without a deep
     // clone per render (the library can be large, and App re-renders on every
-    // ~4 Hz progress tick).
+    // library, queue and playback-state event). The ~4 Hz PROGRESS tick is not
+    // one of them — only PlayerBar subscribes to it, on purpose.
     let library = use_state(|| std::rc::Rc::new(Library::default()));
     let queue = use_state(QueueSnapshot::default);
     let pstate = use_state(PlaybackState::default);
@@ -297,7 +301,7 @@ pub fn app() -> Html {
                     Callback::from(move |id: String| view.set(View::Playlist(id))),
                 );
             }
-            spawn_local(async move {
+            api::spawn(async move {
                 match api::invoke::<Bootstrap>("bootstrap", &json!({})).await {
                     Ok(b) => {
                         library.set(std::rc::Rc::new(b.library));
@@ -319,7 +323,7 @@ pub fn app() -> Html {
                         if b.update_notifications {
                             let update_banner = update_banner.clone();
                             let update_status = update_status.clone();
-                            spawn_local(async move {
+                            api::spawn(async move {
                                 if let Ok(status) =
                                     api::invoke::<UpdateStatus>("check_update", &json!({})).await
                                 {
@@ -345,24 +349,25 @@ pub fn app() -> Html {
     }
 
     // Global keyboard shortcuts: Space = play/pause, Ctrl/Cmd+Arrows = prev/next.
-    // Ignored while typing in a text field so search/rename keep working.
+    // Ignored while any focused control is in use so search/rename keep working.
     use_effect_with((), move |_| {
         let document = web_sys::window().unwrap().document().unwrap();
         let handler = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
-            // Ignore the shortcut while a text field or another focused control
-            // is being used, so Space doesn't also re-activate a just-clicked
-            // button (e.g. a focused Delete) while toggling playback.
-            let typing = web_sys::window()
+            // Skip while focus is on *any* control, so the global shortcut does
+            // not run on top of that control's own handling. `tabIndex >= 0` is
+            // the platform's "focusable" rule: it covers the native controls a
+            // tag-name list names *and* the app's own focusable `div`s — rows,
+            // sidebar items, menu items, the resize handle — which is what the
+            // tag list missed. Measured consequence: Space on a focused track
+            // row played that track *and* toggled playback, because the row's
+            // handler and this one both ran.
+            let focused_control = web_sys::window()
                 .and_then(|w| w.document())
                 .and_then(|d| d.active_element())
-                .map(|el| {
-                    matches!(
-                        el.tag_name().as_str(),
-                        "INPUT" | "TEXTAREA" | "BUTTON" | "SELECT"
-                    )
-                })
+                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+                .map(|el| el.tab_index() >= 0)
                 .unwrap_or(false);
-            if typing {
+            if focused_control {
                 return;
             }
             let cmd = e.ctrl_key() || e.meta_key();
@@ -431,7 +436,7 @@ pub fn app() -> Html {
                     artist_page.set(None);
                     let id = id.clone();
                     let page_gen = page_gen.clone();
-                    spawn_local(async move {
+                    api::spawn(async move {
                         let result =
                             api::invoke::<ArtistPage>("get_artist", &json!({ "id": id })).await;
                         if *page_gen.borrow() != token {
@@ -453,7 +458,7 @@ pub fn app() -> Html {
                         let toast = toast.clone();
                         let toast_gen = toast_gen.clone();
                         let page_gen = page_gen.clone();
-                        spawn_local(async move {
+                        api::spawn(async move {
                             let result = api::invoke::<Vec<Track>>(
                                 "get_artist_songs",
                                 &json!({ "id": id.clone() }),
@@ -473,7 +478,7 @@ pub fn app() -> Html {
                     album_page.set(None);
                     let id = id.clone();
                     let page_gen = page_gen.clone();
-                    spawn_local(async move {
+                    api::spawn(async move {
                         let result =
                             api::invoke::<AlbumPage>("get_album", &json!({ "id": id })).await;
                         if *page_gen.borrow() != token {
@@ -521,7 +526,7 @@ pub fn app() -> Html {
             let search_gen = search_gen.clone();
             let toast = toast.clone();
             let toast_gen = toast_gen.clone();
-            spawn_local(async move {
+            api::spawn(async move {
                 let result =
                     api::invoke::<Vec<Track>>("search", &json!({ "query": query.clone() })).await;
                 if *search_gen.borrow() != token {
@@ -618,7 +623,7 @@ pub fn app() -> Html {
                     let toast = toast.clone();
                     let toast_gen = toast_gen.clone();
                     let search_gen = search_gen.clone();
-                    spawn_local(async move {
+                    api::spawn(async move {
                         let result = api::invoke::<Vec<ArtistSummary>>(
                             "search_artists",
                             &json!({ "query": query }),
@@ -642,7 +647,7 @@ pub fn app() -> Html {
                     let toast = toast.clone();
                     let toast_gen = toast_gen.clone();
                     let search_gen = search_gen.clone();
-                    spawn_local(async move {
+                    api::spawn(async move {
                         let result = api::invoke::<Vec<AlbumSummary>>(
                             "search_albums",
                             &json!({ "query": query }),
@@ -688,7 +693,7 @@ pub fn app() -> Html {
         Callback::from(move |_: ()| {
             let update_status = update_status.clone();
             update_status.set(None);
-            spawn_local(async move {
+            api::spawn(async move {
                 // A rejection still resolves the status line (its `default`
                 // renders as "could not reach GitHub") but the reason itself
                 // reaches the user through the toast.
@@ -756,7 +761,7 @@ pub fn app() -> Html {
             let toast = toast.clone();
             let toast_gen = toast_gen.clone();
             let view = view.clone();
-            spawn_local(async move {
+            api::spawn(async move {
                 // Persist "Importing…" until the request resolves.
                 sticky_toast(&toast, &toast_gen, "Importing playlist…".to_string());
                 let msg =
@@ -808,8 +813,10 @@ pub fn app() -> Html {
     let on_queue_move = Callback::from(|(from, to): (usize, usize)| {
         api::fire("queue_move", json!({ "from": from, "to": to }));
     });
-    // Sidebar reorder: resolve the dragged index to a playlist id at emit time
-    // (the backend moves by id, so a stale index can't move the wrong list).
+    // Sidebar reorder: resolve whichever index the move came from — a drop slot
+    // or the `data-index` of the row a keyboard move was fired on — to a playlist
+    // id at emit time (the backend moves by id, so a stale index can't move the
+    // wrong list).
     let on_move_playlist = {
         let library = library.clone();
         Callback::from(move |(from, to): (usize, usize)| {
@@ -834,8 +841,9 @@ pub fn app() -> Html {
     // state handles, so the app keeps running underneath. Release builds
     // compile the placeholder path out entirely.
     //
-    // The library is shared via Rc so App can re-render on every progress tick
-    // (~4x/s while playing) without deep-cloning it for each view.
+    // The library is shared via Rc so App can re-render — on library, queue and
+    // playback-state events, not on the ~4 Hz progress tick, which only
+    // PlayerBar sees — without deep-cloning it for each view.
     #[cfg(debug_assertions)]
     let library: std::rc::Rc<Library> = if *preview {
         std::rc::Rc::new(preview_library())
