@@ -111,9 +111,24 @@ async fn scrape(http: &reqwest::Client, user_agent: &str) -> Option<String> {
     extract_client_version(&body)
 }
 
+/// The `"INNERTUBE_CONTEXT_CLIENT_VERSION":"…"` literal in the home page.
+///
+/// Compiled once per process rather than once per call: this is read on every
+/// client-version bootstrap, which happens on the request path. The pattern is
+/// a literal, so compilation cannot fail — `expect` states that rather than
+/// threading an `Option` through a helper whose only real failure mode is
+/// "not present".
+fn client_version_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r#""INNERTUBE_CONTEXT_CLIENT_VERSION":"([\w.\-]+?)""#)
+            .expect("the client-version pattern is a literal and cannot fail to compile")
+    })
+}
+
 fn extract_client_version(html: &str) -> Option<String> {
-    let re = regex::Regex::new(r#""INNERTUBE_CONTEXT_CLIENT_VERSION":"([\w.\-]+?)""#).ok()?;
-    re.captures(html)
+    client_version_regex()
+        .captures(html)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_owned())
 }
@@ -128,6 +143,20 @@ mod tests {
         assert_eq!(
             extract_client_version(html).as_deref(),
             Some("1.20250101.00.00")
+        );
+    }
+
+    /// L7's regression guard: the regex is compiled once, not once per scrape.
+    ///
+    /// `ptr::eq` is the observable consequence of caching — two calls through the
+    /// accessor must hand back the *same* compiled object. The tests above pass
+    /// either way, which is precisely why this one exists: without it, dropping
+    /// the `OnceLock` again would be invisible to the suite.
+    #[test]
+    fn the_client_version_regex_is_compiled_once() {
+        assert!(
+            std::ptr::eq(client_version_regex(), client_version_regex()),
+            "the client-version regex must be cached, not rebuilt on every call"
         );
     }
 

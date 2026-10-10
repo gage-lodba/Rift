@@ -649,7 +649,7 @@ mod tests {
     /// Seeding the pool rather than overriding the lookup: the retry path is
     /// exactly what these tests are about, and an override would bypass it.
     fn seed_visitor(id: &str) {
-        identity::seed_pool_for_test(id);
+        identity::seed_pool_for_test(&[id]);
     }
 
     /// Serialises the tests in this module. Held by **every** test here.
@@ -670,12 +670,11 @@ mod tests {
     /// they are independent, they just each need the shared state to themselves.
     ///
     /// Cargo runs test functions on parallel threads by default, so this is not
-    /// hypothetical.
+    /// hypothetical. The gate itself lives in `identity` because `identity`'s
+    /// tests touch the same pool with a different lock; a gate that only covered
+    /// this module left the pair green by scheduling luck.
     async fn visitor_gate() -> tokio::sync::MutexGuard<'static, ()> {
-        static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        GATE.get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await
+        identity::pool_gate().lock().await
     }
 
     fn client() -> Client {
