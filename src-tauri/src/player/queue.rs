@@ -43,7 +43,14 @@ fn remap_history(core: &mut PlayerCore, map: impl Fn(usize) -> Option<usize>) {
     }
     // `pick_prev` reads `history[cursor]` without a bounds check, so an empty
     // history must leave the cursor at zero and a non-empty one must keep it in
-    // range (the entry that slid into the removed one's slot is the fallback).
+    // range. The clamp is reachable, not decoration: a crossfade prefetch leaves
+    // the cursor naming the track it *reserved* while another one is still
+    // playing, so removing that reserved track is an ordinary edit that drops
+    // the cursor's entry and never re-seeds it (`play_index` re-anchors only the
+    // path that replaces the playing track, and only under shuffle). Without the
+    // clamp the cursor would sit one past the end — `pick_prev` happens to
+    // decrement before indexing, so it does not panic today, but the invariant
+    // the rest of the cycle code assumes would be false.
     core.shuffle_cursor = if remapped.is_empty() {
         0
     } else {

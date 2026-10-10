@@ -137,11 +137,7 @@ pub fn set_crossfade(secs: f32, state: State<'_, AppState>) {
 pub fn toggle_shuffle(app: AppHandle, state: State<'_, AppState>) {
     {
         let mut core = state.player.core.lock_safe();
-        core.shuffle = !core.shuffle;
-        // Anchor the shuffle history on the current track so it isn't
-        // immediately repeated and Previous has a sane starting point.
-        core.shuffle_history = core.current.into_iter().collect();
-        core.shuffle_cursor = 0;
+        crate::player::toggle_shuffle(&mut core);
     }
     player::emit_queue(&app, &state.player);
 }

@@ -2,7 +2,9 @@
 
 use rift_types::{PlaybackState, QueueSnapshot, RepeatMode, Track};
 
-use super::nav::{anchor_playing, cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor};
+use super::nav::{
+    anchor_playing, cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor, toggle_shuffle,
+};
 use super::playback::{commit_crossfade, preseed_duration};
 use super::queue::{
     append_tracks, insert_next, move_in_queue, remove_from_queue, AddOutcome, RemoveOutcome,
@@ -949,14 +951,10 @@ fn apply_random_step(core: &mut PlayerCore, rng: &mut Rng, next_id: &mut usize) 
             Step::new(format!("move({from},{to})"), true, false)
         }
         7 => {
-            // `toggle_shuffle`: flips the mode and re-anchors the history on the
-            // current track, so the cursor names it again afterwards. Like the
-            // command, it does *not* drop a prefetched crossfade pick — the
-            // asymmetry with `cycle_repeat` is real, and the assertions below
-            // hold the bookkeeping to it.
-            core.shuffle = !core.shuffle;
-            core.shuffle_history = core.current.into_iter().collect();
-            core.shuffle_cursor = 0;
+            // `toggle_shuffle`: the command now delegates straight to the pure
+            // transition, so this is the real behaviour — mode flip, history
+            // re-anchor, and the stale-pick invalidation included.
+            toggle_shuffle(core);
             Step::new("toggle_shuffle".to_owned(), false, core.current.is_some())
         }
         8 => {
@@ -1108,6 +1106,20 @@ fn assert_bookkeeping(core: &PlayerCore, seed: u64, step: usize, what: &str) {
                 "{at}: nothing is playing but the history still holds {:?}",
                 core.shuffle_history
             ),
+        }
+        // A live pin is always the entry the cursor names: `pick_next` leaves the
+        // cursor on the track it reserves, and every command that rewrites the
+        // history drops the pin (`toggle_shuffle` included, since the fix). This
+        // is the assertion that catches a reset reintroducing the old
+        // keep-the-pick behaviour at the step that resets it.
+        if let Some(pending) = core.pending_next {
+            assert_eq!(
+                core.shuffle_history.get(core.shuffle_cursor),
+                Some(&pending),
+                "{at}: the pinned pick {pending} is not the entry the cursor names (history {:?}, cursor {})",
+                core.shuffle_history,
+                core.shuffle_cursor
+            );
         }
     }
 }
@@ -1358,56 +1370,155 @@ fn a_cycle_rollover_keeps_the_playing_track_in_the_played_set() {
     assert_ne!(next, 4, "auto-advance must not restart the playing track");
 }
 
-/// The counterpart to the state above, found by the property test at seed
-/// 0x9e3779b97f4a7c15 step 241: `toggle_shuffle` re-anchors the shuffle history
-/// on the playing track but deliberately keeps a prefetched pick. When the track
-/// ends and that pick plays, it has to be anchored as the cycle's current point
-/// too — otherwise the track that just started is missing from the played set,
-/// stays in the draw pool, and Next can redraw it immediately (the property
-/// test's cycle check saw exactly that repeat).
+/// The consumers' anchors are defence-in-depth, and this is the state they
+/// protect: a pin the history does not name. No command leaves one any more —
+/// every history reset drops the pin, `toggle_shuffle` included — so the
+/// property harness cannot reach it (it models the fixed command) and the state
+/// is built directly here. It is pinned because an invariant belongs with the
+/// consumer that relies on it, and because a guard only the removed path could
+/// reach would otherwise be a mutation survivor. This is the scenario the
+/// property test found at seed 0x9e3779b97f4a7c15 step 241, when `toggle_shuffle`
+/// still kept the pick: the track that then played was missing from the played
+/// set, so the cycle check replayed it.
 #[test]
-fn toggle_shuffle_mid_prefetch_anchors_the_pick_when_the_track_ends() {
-    let mut core = queue_core(4, Some(1)); // ids "0".."3", playing "1"
-    core.shuffle_history = vec![1]; // "1" has played this cycle
-    core.shuffle_cursor = 0;
-    core.pending_next = Some(2); // a crossfade drew "2" while shuffle was off
-                                 // The user turns shuffle on mid-prefetch: `toggle_shuffle` flips the mode,
-                                 // re-anchors the history on the playing track, and leaves the pin alone.
-    core.shuffle = !core.shuffle;
-    core.shuffle_history = core.current.into_iter().collect();
-    core.shuffle_cursor = 0;
-
-    let played = pick_next(&mut core, false).expect("the pinned pick");
-    advance(&mut core, played);
-    assert_eq!(played, 2, "the prefetched pick still plays");
-    assert_eq!(
-        cursor_id(&core),
-        "2",
-        "playing the pick anchors the cursor on it"
-    );
-    // The rest of the cycle is exactly the two tracks that have never played.
-    assert_eq!(play_rest(&mut core), vec!["0", "3"]);
-}
-
-/// The same sequence through the other consumer: the crossfade's fetch wins the
-/// race and `commit_crossfade` makes the pinned pick current. It needs the same
-/// anchor, which is why the commit's pure half is a function of its own.
-#[test]
-fn toggle_shuffle_mid_prefetch_anchors_the_pick_when_the_crossfade_commits() {
+fn a_pin_the_history_does_not_name_is_anchored_when_it_plays() {
+    // "1" is playing and has played this cycle; the pin names "2", which has no
+    // entry of its own.
     let mut core = queue_core(4, Some(1));
+    core.shuffle = true;
     core.shuffle_history = vec![1];
     core.shuffle_cursor = 0;
     core.pending_next = Some(2);
-    core.shuffle = !core.shuffle; // the toggle above
-    core.shuffle_history = core.current.into_iter().collect();
+
+    let played = pick_next(&mut core, false).expect("the pinned pick");
+    advance(&mut core, played);
+    assert_eq!(played, 2);
+    assert_eq!(
+        cursor_id(&core),
+        "2",
+        "the pin becomes the cycle's current point"
+    );
+    // …so the track that just started is out of the draw pool: the rest of the
+    // cycle is exactly the tracks that have never played.
+    assert_eq!(play_rest(&mut core), vec!["0", "3"]);
+}
+
+/// The same guarantee through the commit consumer, which is why the crossfade
+/// commit's pure half is a function of its own: it makes a pin current, and a
+/// current track missing from the played set is a track Next can redraw. (Found
+/// at seed 0xdeadbeefcafebabe step 1459, while the command still kept the pin.)
+#[test]
+fn a_pin_the_history_does_not_name_is_anchored_when_the_crossfade_commits() {
+    let mut core = queue_core(4, Some(1));
+    core.shuffle = true;
+    core.shuffle_history = vec![1];
     core.shuffle_cursor = 0;
+    core.pending_next = Some(2);
 
     commit_crossfade(&mut core, 2);
     assert_eq!(core.current, Some(2));
     assert_eq!(
         cursor_id(&core),
         "2",
-        "committing the pick anchors the cursor on it"
+        "committing the pin anchors the cursor on it"
     );
     assert_eq!(play_rest(&mut core), vec!["0", "3"]);
+}
+
+/// The clamp in `remap_history` is reachable, and this is the path: a prefetch
+/// has reserved "0" and left the cursor naming it while "1" is still playing, so
+/// the user removing that reserved track is an ordinary edit (`EmitOnly` — not
+/// the playing track), and nothing re-seeds the cursor afterwards. Without the
+/// clamp it would point one past the end of the remapped history. (Property test
+/// seed 0x9e3779b97f4a7c15 step 709, which reports `cursor 1 is out of range for
+/// history [0]` when the clamp is removed.)
+#[test]
+fn removing_the_track_a_prefetch_reserved_keeps_the_cursor_in_range() {
+    // Played "2", then a prefetch reserved "0"; "1" is still playing.
+    let mut core = queue_core(4, Some(1));
+    core.shuffle = true;
+    core.shuffle_history = vec![2, 0];
+    core.shuffle_cursor = 1;
+    core.pending_next = Some(0);
+
+    assert!(matches!(
+        remove_from_queue(&mut core, 0),
+        RemoveOutcome::EmitOnly
+    ));
+    assert_eq!(ids(&core), vec!["1", "2", "3"]);
+    assert_eq!(core.shuffle_history, vec![1]);
+    assert!(
+        core.shuffle_cursor < core.shuffle_history.len(),
+        "the cursor stays in range for pick_prev's unchecked history[cursor]"
+    );
+
+    // The consequence: Previous restarts the playing track rather than stepping
+    // back from a position the cursor no longer has an entry for.
+    core.position = 0.0;
+    let prev = pick_prev(&mut core).expect("a previous track");
+    assert_eq!(core.queue[prev].id, "1", "the playing track is restarted");
+}
+
+/// `toggle_shuffle`'s transition, and the reason it is a function of its own:
+/// the command used to re-anchor the history while leaving a prefetched pick
+/// alive, so a pick drawn under the old mode could still play after the user
+/// changed modes — and, with the history rewritten under it, without being
+/// anchored when it did. The pin is now dropped and the crossfade un-armed,
+/// exactly as `cycle_repeat` documents for the same reason.
+#[test]
+fn toggle_shuffle_flips_the_mode_and_invalidates_a_prefetched_pick() {
+    let mut core = queue_core(3, Some(1));
+    core.shuffle_history = vec![0, 2, 1];
+    core.shuffle_cursor = 2;
+    core.pending_next = Some(0);
+    core.crossfade_armed_for = Some(core.generation);
+
+    toggle_shuffle(&mut core);
+    assert!(core.shuffle, "off → on");
+    assert_eq!(
+        core.shuffle_history,
+        vec![1],
+        "the cycle re-anchors on the playing track"
+    );
+    assert_eq!(core.shuffle_cursor, 0);
+    assert_eq!(core.pending_next, None, "the stale prefetch is dropped");
+    assert_eq!(
+        core.crossfade_armed_for, None,
+        "and un-armed so a fresh target is drawn under the new mode"
+    );
+
+    // …and back the other way, with another prefetch in flight.
+    core.pending_next = Some(2);
+    core.crossfade_armed_for = Some(core.generation);
+    toggle_shuffle(&mut core);
+    assert!(!core.shuffle, "on → off");
+    assert_eq!(core.shuffle_history, vec![1]);
+    assert_eq!(core.shuffle_cursor, 0);
+    assert_eq!(core.pending_next, None);
+    assert_eq!(core.crossfade_armed_for, None);
+}
+
+/// The observable consequence of dropping the pick: a track drawn under the old
+/// mode must not play once the user has changed modes. Shuffle is on and a
+/// crossfade has drawn shuffled pick "3"; the user turns shuffle off
+/// mid-prefetch, so the end-of-track advance follows queue order (0 → 1) instead
+/// of the stale shuffled pick.
+#[test]
+fn a_toggle_off_mid_prefetch_draws_under_the_new_mode_not_the_stale_pick() {
+    let mut core = queue_core(5, Some(0));
+    core.shuffle = true;
+    core.shuffle_history = vec![0];
+    core.shuffle_cursor = 0;
+    core.pending_next = Some(3); // drawn under shuffle
+    core.crossfade_armed_for = Some(core.generation);
+
+    toggle_shuffle(&mut core);
+
+    assert!(!core.shuffle);
+    assert_eq!(core.pending_next, None, "the shuffled pick is not reused");
+    assert_eq!(
+        pick_next(&mut core, false),
+        Some(1),
+        "the next track follows the queue order of the mode now in force"
+    );
 }

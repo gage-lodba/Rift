@@ -36,6 +36,28 @@ pub(crate) fn cycle_repeat(core: &mut PlayerCore) -> RepeatMode {
     next
 }
 
+/// Toggle shuffle, re-anchoring the cycle on the current track. Pure so the
+/// transition and the crossfade bookkeeping it invalidates are testable; the
+/// `toggle_shuffle` command is a lock, this call and a broadcast.
+pub(crate) fn toggle_shuffle(core: &mut PlayerCore) {
+    core.shuffle = !core.shuffle;
+    // Anchor on the playing track either way: it has just played, so it must not
+    // be drawn again straight away, and Previous needs a starting point.
+    core.shuffle_history = core.current.into_iter().collect();
+    core.shuffle_cursor = 0;
+    // The same invalidation `cycle_repeat` documents above: a pick drawn under
+    // the old mode is pinned in `pending_next`, and the end-of-track path reuses
+    // it without consulting the mode — so a shuffled pick would still play after
+    // shuffle was switched off, and a queue-order pick after it was switched on.
+    // Dropping it costs a hard cut instead of a crossfade (the trade every
+    // stale-pick path makes) and un-arms so a fresh target is drawn under the
+    // new mode. It also stops the pin outliving the history rewrite above,
+    // because a pin the cursor no longer names would put the track that then
+    // plays back in the draw pool.
+    core.pending_next = None;
+    core.crossfade_armed_for = None;
+}
+
 /// Re-anchor the shuffle bookkeeping on a direct jump to `index` (a click, a
 /// collection start, a resume). The jumped-to track becomes the cursor, but the
 /// tracks already played this cycle stay in the history: dropping them would let
@@ -60,9 +82,11 @@ pub(crate) fn seed_shuffle_anchor(core: &mut PlayerCore, index: usize) {
 /// cursor left naming the *previous* track would put the one that just started
 /// back in the draw pool (so Next can redraw it) and make Previous walk back
 /// from the wrong place. Normally the entry already exists — the pick was drawn
-/// through [`pick_next`] — and this only moves the cursor onto it; the history
-/// can also have been rewritten under a pinned pick (`toggle_shuffle`), which is
-/// when the anchor does real work. With shuffle off there is no cycle to anchor.
+/// through [`pick_next`], and every command that resets the history also drops
+/// any pinned pick — and this only moves the cursor onto it. It is kept as the
+/// consumers' own guarantee: whatever rewrites the history underneath a track
+/// that is becoming current, that track ends up in the played set. With shuffle
+/// off there is no cycle to anchor.
 pub(crate) fn anchor_playing(core: &mut PlayerCore, index: usize) {
     if core.shuffle {
         seed_shuffle_anchor(core, index);
@@ -87,12 +111,14 @@ pub(crate) fn pick_next(core: &mut PlayerCore, manual: bool) -> Option<usize> {
     // bookkeeping as it did). Honour that pick so it isn't drawn twice.
     if let Some(i) = core.pending_next.take() {
         if i < len {
-            // The pick was drawn when it was the cycle's next track, but the
-            // history can be rewritten under it while it waits — `toggle_shuffle`
-            // re-anchors the history on the playing track and deliberately keeps
-            // the pick. Anchor it to the track that is about to play, or the
-            // just-started track is missing from the played set and therefore
-            // still in the draw pool, so the next Next can redraw it.
+            // Normally the cursor already names the pick — `pick_next` left it on
+            // the entry it reserved when it drew it — and this only moves the
+            // cursor onto that entry again. It still has to hold if a history
+            // rewrite ever leaves a pin behind (every command that rewrites the
+            // history drops the pin today), because the consumer owns the
+            // invariant: the track handed to playback must be the cycle's current
+            // point, or it is missing from the played set and still in the draw
+            // pool, so the next Next can redraw it.
             anchor_playing(core, i);
             return Some(i);
         }

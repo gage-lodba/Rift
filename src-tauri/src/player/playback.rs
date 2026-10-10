@@ -292,10 +292,10 @@ pub(crate) fn commit_crossfade(core: &mut PlayerCore, index: usize) {
     core.pending_next = None;
     // Anchor the shuffle cycle on the pick before it becomes current. Normally
     // it is already the cursor's entry — the prefetch drew it through
-    // `pick_next` — but the pair can be rewritten between the draw and the
-    // commit (`toggle_shuffle` re-anchors the history and deliberately keeps the
-    // pick), and a pick the cursor does not name stays in the draw pool, so Next
-    // could redraw the track that just started.
+    // `pick_next` — and this only moves the cursor onto it; it is kept as this
+    // consumer's own guarantee that a track becoming current ends up in the
+    // played set (and so out of the draw pool), however the history was rewritten
+    // in between.
     super::nav::anchor_playing(core, index);
     core.current = Some(index);
     core.state = PlaybackState::Playing;
