@@ -16,19 +16,22 @@
 //! video marker. The type cannot catch that one, and the marker is the only
 //! evidence left.
 //!
-//! Where no type exists at all, the two paths must differ, and they do —
-//! deliberately, not silently:
+//! Wherever no type reaches a `Track`, nothing filters it, and that is
+//! deliberate rather than an omission:
 //!
-//! - Rift's own playlist JSON is a lossless round trip by design (see
-//!   `commands::library::import_playlist`, which must not drop rows the file
-//!   contained). `Track` has no field for a type, so re-importing a playlist
-//!   whose UGC rows were dropped upstream cannot bring the type back with it,
-//!   and this filter — the only one that could look — would be guessing from the
-//!   title. It is not applied there for that reason.
-//! - Where the fallback *is* applied to signal-less data, it keeps a clean-title
-//!   track: without `musicVideoType` there is nothing to distinguish a
-//!   clean-titled UGC cover from a catalog track, and dropping it on a hunch
-//!   would delete real songs. Rift does not own YouTube uploaders' naming.
+//! - `commands::library::import_playlist` parses Rift's own playlist JSON and is
+//!   a lossless round trip by design (see its own doc comment). A filter there
+//!   would drop rows the file contained, and nothing could put them back:
+//!   `Track` has no field to carry a type through the round trip, so the export
+//!   cannot preserve the evidence such a filter would need. That path does not
+//!   call this module, and it must not start.
+//! - The stored library is Rift's own data as well, already filtered when it was
+//!   collected; nothing re-filters it.
+//!
+//! Where the fallback does run, it keeps a clean-title track: the title is the
+//! only evidence left, and without `musicVideoType` there is nothing to
+//! distinguish a clean-titled UGC cover from a catalog track. Dropping one on a
+//! hunch would delete real songs — Rift does not own YouTube uploaders' naming.
 //!
 //! Both halves are asserted, so the split is a decision rather than an accident:
 //! the parser test above covers the typed branch, and
@@ -63,15 +66,23 @@ fn looks_like_video_title(title: &str) -> bool {
     MARKERS.iter().any(|m| t.contains(m))
 }
 
-/// Keep only audio tracks: the **title fallback** for paths that carry no
-/// `musicVideoType` — Rift's JSON import/export and the stored library.
+/// Keep only audio tracks: the title-marker net for the **innertube** call
+/// sites, where a `Track` no longer carries the type its own row had.
 ///
-/// This is not the whole rule; see the module docs. On the innertube paths the
-/// typed UGC signal is already enforced inside `rift_ytmusic::parse`, before a
-/// `Track` exists, which is why this function never has to reason about a UGC
-/// row there. It is still applied to those tracks as a second, weaker net for
-/// "Official Video" uploads that arrive typed as plain tracks — which is what it
-/// was written for.
+/// Called by `commands::search` (search, artist, artist songs, album) and
+/// `commands::library::import_yt_playlist` — every path that builds tracks from
+/// an innertube response. The typed UGC signal is enforced upstream inside
+/// `rift_ytmusic::parse` (see the module docs), so what this adds is the one
+/// case the type cannot catch: an upload that arrives typed as a plain track
+/// while a video marker is still in its title.
+///
+/// Deliberately *not* a blanket filter. In particular
+/// `commands::library::import_playlist` — Rift's own playlist JSON, a lossless
+/// round trip — must not gain a call to this function: it would drop rows the
+/// file contained, and the type that could justify the drop does not survive the
+/// round trip. Changing that is a decision about the round trip rather than a
+/// bug fix, and it needs its own test, because the tests below call this
+/// function directly and none of them can see where it is wired in.
 pub(crate) fn is_audio_track(t: &Track) -> bool {
     !looks_like_video_title(&t.title)
 }
