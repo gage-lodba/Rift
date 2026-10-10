@@ -240,6 +240,32 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_library_keeps_a_video_titled_track() {
+        // The stored library is the other half of the "no audio filter off the
+        // innertube paths" contract: whatever was saved must come back, whether
+        // or not its title looks like a music video. A load-time filter would
+        // drop the user's row silently, on the next launch, with the file still
+        // on disk holding it.
+        let dir = crate::util::testing::TempDir::new("library-video-title");
+        let mut lib = temp_store(&dir);
+        lib.toggle_like(Track {
+            title: "Some Song (Official Video)".into(),
+            ..track("v")
+        });
+
+        let reloaded = LibraryStore::load(dir.path());
+        assert_eq!(
+            reloaded.data.liked.len(),
+            1,
+            "the like must survive the save"
+        );
+        assert_eq!(
+            reloaded.data.liked[0].title, "Some Song (Official Video)",
+            "the title must come back exactly as stored"
+        );
+    }
+
+    #[test]
     fn backfill_copies_credits_onto_creditless_copies() {
         let dir = crate::util::testing::TempDir::new("library");
         let mut lib = temp_store(&dir);

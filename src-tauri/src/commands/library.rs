@@ -165,6 +165,20 @@ pub fn export_playlist(id: String, app: AppHandle, state: State<'_, AppState>) {
         });
 }
 
+/// Parse a Rift playlist document the user picked.
+///
+/// Split out of the dialog callback so the contract is behavioural rather than a
+/// comment: this path is a **lossless** round trip of whatever
+/// [`export_playlist`] wrote, and deliberately applies no audio/UGC filter. The
+/// innertube import applies one because it is building a playlist from search
+/// results, which mix in music videos and episodes; a filter here would silently
+/// drop rows the file contained, and the file is the only thing the user has to
+/// go on. The store's dedup-by-id is the sole transformation after this, and it
+/// keys on identity rather than on anything about the title.
+pub(crate) fn import_playlist_from(body: &[u8]) -> Result<Playlist, String> {
+    serde_json::from_slice(body).map_err(|_| "That isn't a valid Rift playlist file.".to_owned())
+}
+
 /// Import a playlist from a Rift JSON file the user picks via a native Open
 /// dialog. Always created as a new playlist (fresh id), never overwriting.
 #[tauri::command(rename_all = "snake_case")]
@@ -177,13 +191,13 @@ pub fn import_playlist(app: AppHandle) {
             let Some(path) = path.and_then(|p| p.into_path().ok()) else {
                 return; // cancelled
             };
-            let parsed: Playlist = match std::fs::read(&path)
-                .ok()
-                .and_then(|d| serde_json::from_slice(&d).ok())
+            let parsed = match std::fs::read(&path)
+                .map_err(|_| "That isn't a valid Rift playlist file.".to_owned())
+                .and_then(|body| import_playlist_from(&body))
             {
-                Some(p) => p,
-                None => {
-                    let _ = app2.emit(events::ERROR, "That isn't a valid Rift playlist file.");
+                Ok(p) => p,
+                Err(msg) => {
+                    let _ = app2.emit(events::ERROR, msg);
                     return;
                 }
             };
@@ -279,7 +293,61 @@ pub fn remove_from_playlist(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_playlist_id;
+    use super::{import_playlist_from, parse_playlist_id};
+    use rift_types::{Playlist, Track};
+
+    fn track(id: &str, title: &str) -> Track {
+        Track {
+            id: id.into(),
+            title: title.into(),
+            artist: String::new(),
+            album: None,
+            duration: None,
+            cover: String::new(),
+            artists: Vec::new(),
+            album_id: None,
+        }
+    }
+
+    /// The JSON import is a lossless round trip, and that is a behavioural
+    /// contract rather than a comment asking the next maintainer to be careful.
+    /// A filter added here (the tempting "copy what the innertube import does")
+    /// would silently drop rows the file contained: the export wrote them, the
+    /// file is the user's only copy, and nothing would report the loss.
+    #[test]
+    fn importing_a_playlist_keeps_every_row_including_a_video_titled_one() {
+        let exported = Playlist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+            tracks: vec![
+                track("a", "Ordinary Song"),
+                track("b", "Some Song (Official Video)"),
+            ],
+        };
+        // Exactly what `export_playlist` writes.
+        let body = serde_json::to_vec(&exported).expect("serialize the export");
+
+        let imported = import_playlist_from(&body).expect("a well-formed Rift playlist imports");
+
+        assert_eq!(
+            imported, exported,
+            "the imported playlist must equal the exported one"
+        );
+        assert!(
+            imported
+                .tracks
+                .iter()
+                .any(|t| t.title.contains("Official Video")),
+            "the video-titled row has to survive: {imported:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_playlist_reports_why() {
+        assert!(import_playlist_from(b"{ not json").is_err());
+        // Valid JSON, wrong shape — still refused rather than half-imported.
+        assert!(import_playlist_from(b"{\"name\": \"Mix\"}").is_err());
+    }
 
     #[test]
     fn parses_playlist_ids_from_urls_and_bare_ids() {
