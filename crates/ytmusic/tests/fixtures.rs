@@ -346,10 +346,17 @@ fn artist_page_extracts_the_show_all_songs_playlist_id() {
 
 #[test]
 fn playlist_page_parses_name_tracks_and_continuation() {
-    let (name, tracks, continuation) = raw::playlist_page(&fixture("playlist.json"));
+    let page = raw::playlist_page(&fixture("playlist.json"));
+    let (name, tracks, continuation) = (page.name, page.tracks, page.continuation);
 
     assert_eq!(name.as_deref(), Some("Homelab"));
     assert_eq!(tracks.len(), 100);
+    // Every row on the recorded page parsed into a track, which is why the
+    // fixture's row count and its track count are the same number. `items_seen`
+    // is the pagination signal — a page that carried rows but yielded no tracks
+    // is *filtered*, not empty, and the walk has to keep going — so the two
+    // counts agreeing here is worth asserting rather than assuming.
+    assert_eq!(page.items_seen, 100);
     assert!(
         continuation.is_some(),
         "first page must offer a continuation for pagination"

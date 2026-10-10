@@ -81,27 +81,44 @@ impl Client {
     }
 
     /// Fetch a playlist's name and tracks, following continuations up to `limit`.
+    ///
+    /// A page that yields no *tracks* is not the end of the playlist: the parser
+    /// drops UGC/video/episode rows on purpose, so a page of nothing but videos
+    /// still moved the walk along and the next page may hold audio. Stopping
+    /// there truncated the import at the first video-only page — the rest of the
+    /// playlist silently missing, with no error to show for it.
+    ///
+    /// What does end the walk, in order: the caller's `limit`, the absence of a
+    /// continuation token, a page that carried no items at all, and a token that
+    /// comes back unchanged (which is the spin the old track-based guard was
+    /// actually protecting against — a page with no rows and a token that never
+    /// advances).
     pub async fn playlist(&self, playlist_id: &str, limit: usize) -> Result<Playlist> {
-        let mut tracks = Vec::new();
-
         let first = self.browse_raw(&format!("VL{playlist_id}")).await?;
-        let (name_opt, mut t, mut continuation) = parse::playlist_page(&first);
-        let name = name_opt.unwrap_or_default();
-        tracks.append(&mut t);
+        let page = parse::playlist_page(&first);
+        let name = page.name.unwrap_or_default();
+        let mut tracks = page.tracks;
+        let mut continuation = page.continuation;
 
         while tracks.len() < limit {
             let Some(token) = continuation else { break };
             let next = self
                 .post("browse", json!({ "continuation": token }))
                 .await?;
-            let (_, mut t, c) = parse::playlist_page(&next);
-            // Guard against a page that yields no tracks but still carries a
-            // continuation (would otherwise spin without progress).
-            if t.is_empty() {
+            let page = parse::playlist_page(&next);
+            // A page whose rows were all filtered out is explained, not empty:
+            // keep following its token.
+            if page.items_seen == 0 {
                 break;
             }
-            tracks.append(&mut t);
-            continuation = c;
+            // ... but only while the token actually advances. Following a token
+            // that comes back unchanged would spin forever, and with the
+            // track-based guard gone that is otherwise unguarded.
+            if page.continuation.as_deref() == Some(token.as_str()) {
+                break;
+            }
+            tracks.extend(page.tracks);
+            continuation = page.continuation;
         }
         tracks.truncate(limit);
 
@@ -486,6 +503,43 @@ mod tests {
         })
     }
 
+    /// The same row typed `MUSIC_VIDEO_TYPE_UGC`: a user upload the parser drops
+    /// on the strength of the type alone, however clean its title is.
+    fn ugc_row(id: &str) -> Value {
+        let mut row = track_row(id, "A User Upload", "Some Channel");
+        row["musicResponsiveListItemRenderer"]["overlay"] = json!({
+            "musicItemThumbnailOverlayRenderer": { "content": { "musicPlayButtonRenderer": {
+                "playNavigationEndpoint": { "watchEndpoint": {
+                    "videoId": id,
+                    "watchEndpointMusicSupportedConfigs": { "watchEndpointMusicConfig": {
+                        "musicVideoType": "MUSIC_VIDEO_TYPE_UGC"
+                    } }
+                } }
+            } } }
+        });
+        row
+    }
+
+    /// A row badged "Video": dropped by the badge, which is the other reason a
+    /// page can carry rows and yield no tracks.
+    fn video_row(id: &str) -> Value {
+        let mut row = track_row(id, "A Music Video", "Some Artist");
+        row["musicResponsiveListItemRenderer"]["flexColumns"][1]
+            ["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"] =
+            json!("Video");
+        row
+    }
+
+    /// Requests the "stuck" route has served for its own token.
+    static STUCK_SERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Identical tokens the "stuck" route serves before it stops cooperating and
+    /// hands out a real track. A walk that keeps following a token which never
+    /// advances therefore ends holding a track, and the test that says it must
+    /// hold nothing fails — rather than hanging the suite until the harness
+    /// gives up.
+    const STUCK_TOKEN_LIMIT: usize = 5;
+
     /// A playlist page: a named header, some rows, and optionally a continuation
     /// token. Rows and a token coexist on a real page — the shape the guard in
     /// `playlist` exists for is a page with a token but *no* rows, expressed by
@@ -587,11 +641,86 @@ mod tests {
                     let id = req.browse_id();
                     let token = req.continuation();
 
-                    // A page that offers a continuation but yields no rows. The
-                    // same route serves the continuation, so a regression in the
-                    // guard would loop rather than quietly pass.
-                    if id.contains("degenerate") || token == "loop" {
-                        return Response::json(playlist_page("Degenerate", Vec::new(), Some("loop")));
+                    // One audio row, then a continuation whose page carries no
+                    // rows at all, then a page that does carry one. An itemless
+                    // page is a dead end, so the last page must never be reached —
+                    // and because it holds a real track, a walk that wrongly keeps
+                    // going fails an assertion in
+                    // `playlist_pagination_stops_when_a_page_carries_no_items`
+                    // instead of looping.
+                    if id.contains("degenerate") {
+                        return Response::json(playlist_page(
+                            "Degenerate",
+                            vec![track_row("degenerate-first", "First", "A")],
+                            Some("loop"),
+                        ));
+                    }
+                    if token == "loop" {
+                        return Response::json(playlist_page(
+                            "Degenerate",
+                            Vec::new(),
+                            Some("loop-2"),
+                        ));
+                    }
+                    if token == "loop-2" {
+                        return Response::json(playlist_page(
+                            "Degenerate",
+                            vec![track_row("degenerate-late", "Late Track", "A")],
+                            None,
+                        ));
+                    }
+                    // A page whose rows are all filtered out, sitting between two
+                    // pages of audio: the walk must not stop at it.
+                    if let Some(tx) = id
+                        .strip_prefix("VL")
+                        .unwrap_or(id)
+                        .strip_prefix("PLtest_filtered_")
+                    {
+                        return Response::json(playlist_page(
+                            "Filtered",
+                            vec![
+                                track_row(&format!("f{tx}-1"), "Kept", "A"),
+                                ugc_row(&format!("f{tx}-ugc-1")),
+                            ],
+                            Some(&format!("{tx}:filtered-1")),
+                        ));
+                    }
+                    if let Some(tx) = token.strip_suffix(":filtered-1") {
+                        return Response::json(playlist_page(
+                            "Filtered",
+                            vec![
+                                ugc_row(&format!("f{tx}-ugc-2")),
+                                video_row(&format!("f{tx}-vid-3")),
+                            ],
+                            Some(&format!("{tx}:filtered-2")),
+                        ));
+                    }
+                    if let Some(tx) = token.strip_suffix(":filtered-2") {
+                        return Response::json(playlist_page(
+                            "Filtered",
+                            vec![track_row(&format!("f{tx}-2"), "Kept Too", "A")],
+                            None,
+                        ));
+                    }
+                    // A page whose rows are all filtered *and* whose token does
+                    // not advance. After `STUCK_TOKEN_LIMIT` identical tokens the
+                    // route hands out a real track, so a missing no-advance guard
+                    // fails `playlist_pagination_stops_when_a_filtered_page_does_not_advance`
+                    // rather than spinning.
+                    if id.contains("PLtest_stuck") {
+                        return Response::json(playlist_page(
+                            "Stuck",
+                            vec![ugc_row("stuck-ugc")],
+                            Some("stuck"),
+                        ));
+                    }
+                    if token == "stuck" {
+                        let served = STUCK_SERVED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return Response::json(if served < STUCK_TOKEN_LIMIT {
+                            playlist_page("Stuck", vec![ugc_row("stuck-ugc")], Some("stuck"))
+                        } else {
+                            playlist_page("Stuck", vec![track_row("stuck-late", "Late", "A")], None)
+                        });
                     }
                     // `playlist()` requests `VL<id>`, so the prefix is stripped
                     // before matching.
@@ -880,14 +1009,103 @@ mod tests {
         );
     }
 
+    /// The walk also ends when a page offers no continuation, even though the
+    /// limit is far from reached — the other bound the pagination loop owes its
+    /// caller.
     #[tokio::test]
-    async fn playlist_pagination_stops_when_a_page_yields_no_tracks() {
+    async fn playlist_pagination_stops_at_the_page_without_a_continuation() {
+        let _gate = visitor_gate().await;
+        let c = client();
+        let tx = tx();
+        let playlist = c
+            .playlist(&format!("PLtest_pagination_{tx}"), 50)
+            .await
+            .expect("playlist");
+
+        let expected: Vec<String> = (1..=7).map(|n| format!("p{tx}-{n}")).collect();
+        assert_eq!(
+            playlist
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "all three pages; the third hands out no token, so the walk ends there"
+        );
+    }
+
+    /// The exact regression: a continuation page whose rows were **all filtered
+    /// out** is not the end of the playlist.
+    ///
+    /// The parser drops UGC/video/episode rows on purpose, so "this page yielded
+    /// no tracks" and "this page was empty" are different facts. The old loop
+    /// broke on the first, which truncated the import at the first video-only
+    /// page: the tracks after it were missing, and an empty playlist and a
+    /// truncated one look identical to the caller. The route here serves audio,
+    /// then a page of nothing but a UGC upload and a "Video"-badged row, then
+    /// more audio.
+    #[tokio::test]
+    async fn playlist_pagination_follows_a_page_whose_rows_were_all_filtered() {
+        let _gate = visitor_gate().await;
+        let c = client();
+        let tx = tx();
+        let playlist = c
+            .playlist(&format!("PLtest_filtered_{tx}"), 50)
+            .await
+            .expect("playlist");
+
+        let expected: Vec<String> = [format!("f{tx}-1"), format!("f{tx}-2")].into();
+        assert_eq!(
+            playlist
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the audio on either side of the all-video page, and none of the videos"
+        );
+    }
+
+    /// A page that carries no items at all is a dead end: the walk stops rather
+    /// than following its token.
+    ///
+    /// This replaces `playlist_pagination_stops_when_a_page_yields_no_tracks`,
+    /// which asserted the same outcome with a *track-less* page. That is the
+    /// property worth keeping — but it pinned "stop on any page with no tracks",
+    /// which is the bug next door: a page whose rows were merely filtered must be
+    /// followed. Here the first page has audio, the second has a token but no
+    /// rows, and the third has a real track, so a walk that wrongly keeps going
+    /// ends holding `degenerate-late` and fails this assertion.
+    #[tokio::test]
+    async fn playlist_pagination_stops_when_a_page_carries_no_items() {
         let _gate = visitor_gate().await;
         let c = client();
         let playlist = c.playlist("PLtest_degenerate", 50).await.expect("playlist");
+        assert_eq!(
+            playlist
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            ["degenerate-first"],
+            "the first page's track, and nothing from beyond the itemless page"
+        );
+    }
+
+    /// Once track-less pages are followed, the token is the only progress signal
+    /// left — so a token that comes back unchanged has to end the walk, or the
+    /// loop spins forever on a server that stops advancing. The route serves a
+    /// real track after a few identical tokens, so a missing guard fails here
+    /// rather than hanging the suite.
+    #[tokio::test]
+    async fn playlist_pagination_stops_when_a_filtered_page_does_not_advance() {
+        let _gate = visitor_gate().await;
+        STUCK_SERVED.store(0, std::sync::atomic::Ordering::SeqCst);
+        let c = client();
+        let playlist = c.playlist("PLtest_stuck", 50).await.expect("playlist");
         assert!(
             playlist.tracks.is_empty(),
-            "a token with no rows must stop the walk, not spin: {:?}",
+            "a token that does not advance must end the walk: {:?}",
             playlist.tracks
         );
     }

@@ -21,6 +21,7 @@ pub use params::SearchFilter;
 pub mod raw {
     pub use crate::parse::{
         album_page, albums, artist_page, artists, playlist_page, track_credits, tracks,
+        PlaylistPage,
     };
     // The pure helpers behind the row parsers, so their rules can be pinned
     // without building a whole innertube response around each one.

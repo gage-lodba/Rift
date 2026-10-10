@@ -84,10 +84,12 @@ fn main() {
         );
     }
 
-    let (name, pl, cont) = raw::playlist_page(&load("playlist.json"));
+    let page = raw::playlist_page(&load("playlist.json"));
+    let (name, pl, cont) = (page.name, page.tracks, page.continuation);
     println!(
-        "== playlist: {name:?} tracks={} next_page={} ==",
+        "== playlist: {name:?} tracks={} items={} next_page={} ==",
         pl.len(),
+        page.items_seen,
         cont.is_some()
     );
     for t in pl.iter().take(5) {

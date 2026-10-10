@@ -154,8 +154,13 @@ impl Kind {
                 .map(|p| format!("{p:?}"))
                 .unwrap_or_else(|| "<none>".to_owned()),
             Kind::Playlist => {
-                let (name, tracks, cont) = raw::playlist_page(v);
-                format!("name={name:?} cont={} {tracks:?}", cont.is_some())
+                let page = raw::playlist_page(v);
+                format!(
+                    "name={:?} cont={} {:?}",
+                    page.name,
+                    page.continuation.is_some(),
+                    page.tracks
+                )
             }
             Kind::Next => format!("{:?}", raw::track_credits(v, video_id)),
         }

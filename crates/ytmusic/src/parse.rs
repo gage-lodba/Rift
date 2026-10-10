@@ -326,10 +326,20 @@ fn items_in_shelves(sections: &[Value]) -> Vec<&Value> {
 
 /// Extract audio tracks from a music search response.
 pub fn tracks(resp: &Value) -> Vec<Track> {
-    let parsed: Vec<Track> = shelf_items(resp)
-        .iter()
-        .filter_map(|n| track_from_mrlir(n))
-        .collect();
+    tracks_and_items(resp).0
+}
+
+/// The audio tracks a page carries, and how many item rows it carried in total.
+///
+/// The second half matters to [`playlist_page`]'s caller: an empty track list
+/// means either "this page had no items" or "every item on it was filtered
+/// out", and a paginating caller needs opposite responses to those. Split out so
+/// [`tracks`] and [`playlist_page`] walk the document the same way and cannot
+/// disagree about what the page contained.
+fn tracks_and_items(resp: &Value) -> (Vec<Track>, usize) {
+    let items = shelf_items(resp);
+    let items_seen = items.len();
+    let parsed: Vec<Track> = items.iter().filter_map(|n| track_from_mrlir(n)).collect();
     if parsed.is_empty() {
         // A renderer rename looks identical to "no results" from here, so the
         // two are worth distinguishing in a log: one is a YouTube change, the
@@ -353,7 +363,7 @@ pub fn tracks(resp: &Value) -> Vec<Track> {
             .count();
         warn_on_silent_degradation("track", rows.len() - explained);
     }
-    parsed
+    (parsed, items_seen)
 }
 
 /// Warn when the response carried rows that nothing could be extracted from.
@@ -887,11 +897,27 @@ fn album_from_card(node: &Value, album_type: &str) -> Option<AlbumSummary> {
 // Playlist
 // ---------------------------------------------------------------------------
 
-/// Parse one playlist page: `(name, tracks, continuation_token)`.
+/// One parsed playlist page.
 ///
-/// The name is `None` on continuation pages (which carry only tracks plus a
-/// further continuation, no header).
-pub fn playlist_page(resp: &Value) -> (Option<String>, Vec<Track>, Option<String>) {
+/// Returned as named fields rather than a tuple because two of them have to be
+/// read together: `tracks.is_empty()` alone cannot distinguish "this page
+/// carried nothing" from "every row on this page was filtered out", and a
+/// paginating caller must keep walking in the second case and stop in the
+/// first. `items_seen` is what makes that distinction available.
+pub struct PlaylistPage {
+    /// The page title. `None` on continuation pages, which carry no header.
+    pub name: Option<String>,
+    /// The page's audio tracks, with non-audio rows already dropped.
+    pub tracks: Vec<Track>,
+    /// How many item rows the page carried, *including* rows the audio filter
+    /// dropped. Zero means the page was genuinely empty.
+    pub items_seen: usize,
+    /// The token for the next page, when the page offered one.
+    pub continuation: Option<String>,
+}
+
+/// Parse one playlist page.
+pub fn playlist_page(resp: &Value) -> PlaylistPage {
     let name = header_of(resp, "musicResponsiveHeaderRenderer")
         .and_then(|h| h.pointer("/title"))
         .map(runs_all);
@@ -928,7 +954,13 @@ pub fn playlist_page(resp: &Value) -> (Option<String>, Vec<Track>, Option<String
             .map(str::to_owned)
     });
 
-    (name, tracks(resp), continuation)
+    let (tracks, items_seen) = tracks_and_items(resp);
+    PlaylistPage {
+        name,
+        tracks,
+        items_seen,
+        continuation,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1504,10 +1536,10 @@ mod tests {
                 super::artist_page(&body, "UCx").is_none(),
                 "artist_page: {name} produced a page"
             );
-            let (name_opt, pl, cont) = super::playlist_page(&body);
-            assert!(name_opt.is_none(), "playlist name: {name}");
-            assert!(pl.is_empty(), "playlist tracks: {name}");
-            assert!(cont.is_none(), "playlist continuation: {name}");
+            let page = super::playlist_page(&body);
+            assert!(page.name.is_none(), "playlist name: {name}");
+            assert!(page.tracks.is_empty(), "playlist tracks: {name}");
+            assert!(page.continuation.is_none(), "playlist continuation: {name}");
             assert!(
                 track_credits(&body, "abc").is_none(),
                 "credits: {name} produced a byline"
