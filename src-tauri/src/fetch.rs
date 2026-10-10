@@ -250,24 +250,39 @@ fn ytdlp_release_asset() -> &'static str {
     }
 }
 
-/// Download the latest yt-dlp standalone binary for this platform into
-/// `dest_dir`, mark it executable, and return its path. Used by Settings when
-/// yt-dlp isn't already installed.
 /// The release the installer downloads from, and the checksum manifest that
 /// comes with it.
 const YTDLP_RELEASE_BASE: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
 /// yt-dlp publishes SHA-256 digests for every release asset here.
 const YTDLP_SUMS_ASSET: &str = "SHA2-256SUMS";
 
+/// Download the latest yt-dlp standalone binary for this platform into
+/// `dest_dir`, mark it executable, and return its path. Used by Settings when
+/// yt-dlp isn't already installed.
 pub async fn download_ytdlp(dest_dir: &Path, http: &reqwest::Client) -> anyhow::Result<PathBuf> {
+    download_ytdlp_from(YTDLP_RELEASE_BASE, dest_dir, http).await
+}
+
+/// [`download_ytdlp`] against an arbitrary release base.
+///
+/// Split out so a test can point the installer at a loopback server and drive
+/// the real ordering — nothing may be created or written before the digest has
+/// been checked. A parameter rather than an environment variable on purpose: the
+/// shipped binary has exactly one base, compiled in, with no override a release
+/// build would honour.
+async fn download_ytdlp_from(
+    base: &str,
+    dest_dir: &Path,
+    http: &reqwest::Client,
+) -> anyhow::Result<PathBuf> {
     let asset = ytdlp_release_asset();
-    let url = format!("{YTDLP_RELEASE_BASE}/{asset}");
+    let url = format!("{base}/{asset}");
     info!("downloading yt-dlp from {url}");
 
     // Fetch the checksum manifest *first*, so a manifest that cannot be
     // retrieved fails before anything is written to disk. Both requests use the
     // same `latest/download` base, so they resolve to the same release.
-    let sums = fetch(http, &format!("{YTDLP_RELEASE_BASE}/{YTDLP_SUMS_ASSET}"))
+    let sums = fetch(http, &format!("{base}/{YTDLP_SUMS_ASSET}"))
         .await
         .context("could not download SHA2-256SUMS to verify the yt-dlp download")?;
     let sums_text = String::from_utf8_lossy(&sums);
@@ -463,7 +478,10 @@ fn probe_ytdlp_locations() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_version_probe, safe_stem, validate_ytdlp_override, ProbeError};
+    use super::{
+        download_ytdlp_from, run_version_probe, safe_stem, validate_ytdlp_override,
+        ytdlp_release_asset, ProbeError, YTDLP_BIN, YTDLP_SUMS_ASSET,
+    };
 
     /// A command that keeps running far longer than any ceiling this test
     /// applies, so only the ceiling can end the wait.
@@ -581,6 +599,163 @@ mod tests {
         assert!(
             !resolved.to_string_lossy().contains(".."),
             "the persisted path must not carry parent segments"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fake `latest/download` release on loopback: `(path, body)` pairs served
+    /// in the order the installer asks for them, plus the base URL to hand it.
+    ///
+    /// A FIFO rather than a path router, because scenario 2 of the test below
+    /// never fetches the asset at all — a manifest with no entry for it is
+    /// refused first — so the server has to know which requests *should* arrive.
+    /// Anything off-plan gets a 404 and is recorded, so a reordering surfaces as
+    /// a readable assertion instead of a hang on an accept that never comes.
+    fn serve_release(
+        plan: Vec<(String, Vec<u8>)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("bound address").port()
+        );
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = log.clone();
+        let mut plan = std::collections::VecDeque::from(plan);
+
+        std::thread::spawn(move || loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Drain the whole request head before answering: closing while the
+            // peer is still sending resets the connection on Windows, and the
+            // client would report a transport error instead of reading the reply.
+            let mut head = Vec::new();
+            let mut buf = [0u8; 2048];
+            while head.len() < 16 * 1024 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let request = String::from_utf8_lossy(&head).into_owned();
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_owned();
+
+            let planned = plan.front().is_some_and(|(expected, _)| *expected == path);
+            let body = if planned {
+                plan.pop_front().map(|(_, body)| body).unwrap_or_default()
+            } else {
+                recorder
+                    .lock()
+                    .expect("plan log")
+                    .push(format!("unexpected request for {path}"));
+                Vec::new()
+            };
+            let status = if planned { "200 OK" } else { "404 Not Found" };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        });
+
+        (base, log)
+    }
+
+    /// The installer's security property is an *ordering*: the published digest
+    /// is checked before anything is created or written. Nothing else in the
+    /// repo drives `download_ytdlp` at all, so moving the verification after
+    /// `create_dir_all` and the write leaves every other test green — this is the
+    /// guard that fails.
+    ///
+    /// The `chmod 0o755` half is `#[cfg(unix)]` and therefore not exercised here
+    /// on Windows; the unit tests cover what is platform-independent.
+    #[tokio::test]
+    async fn an_unverified_yt_dlp_is_never_created_or_written() {
+        let asset = b"this is not really yt-dlp".to_vec();
+        let digest = crate::sha256::hex(&crate::sha256::sha256(&asset));
+        let name = ytdlp_release_asset();
+
+        // 1: a digest that cannot match. 2: a real digest for a *different*
+        // asset, so there is no entry for this one. 3: the correct manifest.
+        // Only 1 and 3 go on to fetch the asset.
+        let sums = |digest: &str, entry: &str| format!("{digest}  {entry}\n");
+        let (base, log) = serve_release(vec![
+            (
+                format!("/{YTDLP_SUMS_ASSET}"),
+                sums(&"0".repeat(64), name).into_bytes(),
+            ),
+            (format!("/{name}"), asset.clone()),
+            (
+                format!("/{YTDLP_SUMS_ASSET}"),
+                sums(&digest, "some-other-asset").into_bytes(),
+            ),
+            (
+                format!("/{YTDLP_SUMS_ASSET}"),
+                sums(&digest, name).into_bytes(),
+            ),
+            (format!("/{name}"), asset.clone()),
+        ]);
+
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let dir = scratch("ytdlp-verify");
+        // Deliberately not created: the installer may only make it *after* the
+        // digest has checked out.
+        let dest = dir.join("bin");
+
+        let err = download_ytdlp_from(&base, &dest, &http)
+            .await
+            .expect_err("a digest mismatch must not install");
+        assert!(
+            format!("{err:#}").contains("failed verification"),
+            "the error must name the verification failure: {err:#}"
+        );
+        assert!(
+            !dest.exists(),
+            "the destination must not be created before the digest is checked"
+        );
+
+        let err = download_ytdlp_from(&base, &dest, &http)
+            .await
+            .expect_err("a manifest without this asset must not install");
+        assert!(
+            format!("{err:#}").contains("no entry"),
+            "the error must name the missing manifest entry: {err:#}"
+        );
+        assert!(
+            !dest.exists(),
+            "nothing may be created for an asset the manifest does not list"
+        );
+
+        // The control: the same path with the right digest installs exactly the
+        // served bytes, so the two refusals above are not passing vacuously.
+        let installed = download_ytdlp_from(&base, &dest, &http)
+            .await
+            .expect("a correct digest installs");
+        assert_eq!(installed, dest.join(YTDLP_BIN));
+        assert_eq!(
+            std::fs::read(&installed).expect("read the installed binary"),
+            asset,
+            "the installed bytes are the served bytes"
+        );
+
+        let unexpected = log.lock().expect("plan log").clone();
+        assert!(
+            unexpected.is_empty(),
+            "the installer made requests the release plan did not expect: {unexpected:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
