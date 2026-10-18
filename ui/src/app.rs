@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use rift_types::{
     events, AlbumPage, AlbumSummary, ArtistPage, ArtistSummary, Bootstrap, DownloadState, Library,
-    PlaybackState, Playlist, Progress, QueueSnapshot, Track, UpdateStatus,
+    PlaybackState, Playlist, Progress, QueueSnapshot, SongIndex, Track, UpdateStatus,
 };
 use serde_json::json;
 use wasm_bindgen::closure::Closure;
@@ -870,7 +870,11 @@ pub fn app() -> Html {
     #[cfg(not(debug_assertions))]
     let (track, queue, progress, pstate) = ((*track).clone(), (*queue).clone(), *progress, *pstate);
 
-    let liked_ids: HashSet<String> = library.liked.iter().map(|t| t.id.clone()).collect();
+    // Indexed by song rather than by video id: the page a row is rendered on
+    // and the surface it was liked from can name the same song with two ids
+    // (`Track::same_song`), and the heart has to agree with the library either
+    // way.
+    let liked = SongIndex::new(&library.liked);
     let playlist_opts: Vec<(String, String)> = library
         .playlists
         .iter()
@@ -893,7 +897,7 @@ pub fn app() -> Html {
 
     // Everything a TrackList needs that doesn't vary per list.
     let ctx = TrackListCtx {
-        liked_ids: liked_ids.clone(),
+        liked: liked.clone(),
         playing_id: track.as_ref().map(|t| t.id.clone()),
         downloads: (*downloads).clone(),
         pinned_ids,
@@ -1391,10 +1395,7 @@ pub fn app() -> Html {
         },
     };
 
-    let liked_current = track
-        .as_ref()
-        .map(|t| liked_ids.contains(&t.id))
-        .unwrap_or(false);
+    let liked_current = track.as_ref().map(|t| liked.contains(t)).unwrap_or(false);
 
     // Show the equalizer only while a track is actually loaded.
     let playing_source = match pstate {

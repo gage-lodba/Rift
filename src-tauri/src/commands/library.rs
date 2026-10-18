@@ -173,8 +173,9 @@ pub fn export_playlist(id: String, app: AppHandle, state: State<'_, AppState>) {
 /// innertube import applies one because it is building a playlist from search
 /// results, which mix in music videos and episodes; a filter here would silently
 /// drop rows the file contained, and the file is the only thing the user has to
-/// go on. The store's dedup-by-id is the sole transformation after this, and it
-/// keys on identity rather than on anything about the title.
+/// go on. The store's dedup is the sole transformation after this: it folds rows
+/// `Track::same_song` calls one song — a title match plus agreement on whichever
+/// of duration, album and credit both rows carry — never a title on its own.
 pub(crate) fn import_playlist_from(body: &[u8]) -> Result<Playlist, String> {
     serde_json::from_slice(body).map_err(|_| "That isn't a valid Rift playlist file.".to_owned())
 }
@@ -249,6 +250,11 @@ pub fn add_to_playlist(id: String, track: Track, app: AppHandle, state: State<'_
     // offline": adding a new track should pull it down too, so the playlist
     // stays fully available offline. Evaluated before the add, and only for a
     // non-empty playlist that doesn't already contain this track.
+    //
+    // "Contains this track" is asked by song, exactly as `add_to_playlist` asks
+    // it: a playlist that already holds this recording under the other
+    // surface's video id will refuse the add, and downloading a row that was
+    // never added would leave the offline copy dangling outside the playlist.
     let keep_offline = {
         let lib = state.library.lock_safe();
         lib.data
@@ -256,7 +262,7 @@ pub fn add_to_playlist(id: String, track: Track, app: AppHandle, state: State<'_
             .iter()
             .find(|p| p.id == id)
             .is_some_and(|p| {
-                !p.tracks.iter().any(|t| t.id == track.id)
+                !p.tracks.iter().any(|t| t.same_song(&track))
                     && super::downloads::playlist_fully_downloaded(p, |tid| {
                         state.downloads.is_downloaded(tid)
                     })

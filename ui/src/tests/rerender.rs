@@ -24,7 +24,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rift_types::{DownloadState, Track};
+use rift_types::{DownloadState, SongIndex, Track};
 use wasm_bindgen_test::wasm_bindgen_test;
 use yew::prelude::*;
 
@@ -209,7 +209,7 @@ fn ListRoot(props: &ListRootProps) -> Html {
         downloaded.insert(decor.downloaded.clone());
     }
     let ctx = TrackListCtx {
-        liked_ids: [decor.liked.clone()].into_iter().collect(),
+        liked: SongIndex::new(&[track(&decor.liked)]),
         playing_id: Some(decor.playing.clone()),
         downloads: DownloadState {
             downloaded,

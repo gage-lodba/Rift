@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use rift_types::{DownloadState, Track};
+use rift_types::{DownloadState, SongIndex, Track};
 use yew::prelude::*;
 
 use super::icons::{artist_links, cover, fmt_secs, icon};
@@ -15,8 +15,11 @@ use super::menu::{Menu, MenuAction};
 /// dozen identical props.
 #[derive(Clone, PartialEq)]
 pub struct TrackListCtx {
-    /// IDs of liked tracks.
-    pub liked_ids: HashSet<String>,
+    /// The user's liked songs. Indexed by *song*, not by video id: YouTube
+    /// Music hands one song out under more than one video id, so the heart has
+    /// to light up for the album page's row when the artist page's row is the
+    /// one that was liked (`Track::same_song`).
+    pub liked: SongIndex,
     /// ID of the track currently playing, highlighted in the list.
     pub playing_id: Option<String>,
     /// Offline download status (downloaded / in flight / given up).
@@ -62,7 +65,7 @@ pub fn track_list(props: &TrackListProps) -> Html {
                 <TrackRow
                     track={t.clone()}
                     index={i}
-                    liked={c.liked_ids.contains(&t.id)}
+                    liked={c.liked.contains(t)}
                     downloaded={c.downloads.downloaded.contains(&t.id)}
                     downloading={c.downloads.downloading.contains(&t.id)}
                     pinned={c.pinned_ids.contains(&t.id)}

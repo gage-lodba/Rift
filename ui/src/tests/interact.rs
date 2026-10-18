@@ -49,7 +49,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rift_types::{ArtistRef, QueueSnapshot, Track};
+use rift_types::{ArtistRef, QueueSnapshot, SongIndex, Track};
 use wasm_bindgen_test::wasm_bindgen_test;
 use yew::prelude::*;
 
@@ -630,7 +630,7 @@ fn rows(tracks: Vec<Track>, online: bool) -> Rows {
     let on_play_next = Callback::from(move |_: Track| sink.borrow_mut().push("PLAY_NEXT"));
 
     let ctx = TrackListCtx {
-        liked_ids: Default::default(),
+        liked: Default::default(),
         playing_id: None,
         downloads: Default::default(),
         pinned_ids: Default::default(),
@@ -775,6 +775,81 @@ async fn clicking_like_likes_the_track_and_does_not_play_it() {
         seen(&r.played).is_empty(),
         "clicking Like also played the track, so the row's click handler saw it: {:?}",
         seen(&r.played)
+    );
+}
+
+/// **The album page's row shows the heart for a song liked from the artist
+/// page.**
+///
+/// YouTube Music names one song with two video ids: the artist page's Top songs
+/// row is the art track, the album page's row is the official music video, and
+/// neither carries the other's id (recorded live — "Around the World" is
+/// `Jb6gcoR266U` on Daft Punk's page and `K0HSD_i2DvA` on *Homework*). So a like
+/// stored from one surface has an id the other surface's row never renders, and
+/// the heart has to follow the *song*. Against the id-only set this replaced,
+/// the row below rendered unliked — which is the bug this test exists for.
+#[wasm_bindgen_test]
+async fn a_row_liked_from_another_surface_shows_the_heart() {
+    // Liked from the artist page: the art track, with the credit and no
+    // duration, which is how that surface renders the row.
+    let artist_page_row = Track {
+        title: "Around the World".to_string(),
+        artist: "Daft Punk".to_string(),
+        album: Some("Homework".to_string()),
+        duration: None,
+        artists: vec![ArtistRef {
+            id: Some("UCRr1xG_2WIDs18a6cIiCxeA".to_string()),
+            name: "Daft Punk".to_string(),
+        }],
+        album_id: Some("MPREb_dMHztPsrDgN".to_string()),
+        ..track("Jb6gcoR266U")
+    };
+    // ...and the album page renders the same song as the music video, with the
+    // duration and no credit (album rows leave the byline to the page header).
+    let album_page_row = Track {
+        title: "Around the World".to_string(),
+        artist: String::new(),
+        album: Some("Homework".to_string()),
+        duration: Some(430),
+        artists: Vec::new(),
+        album_id: Some("MPREb_dMHztPsrDgN".to_string()),
+        ..track("K0HSD_i2DvA")
+    };
+
+    let ctx = TrackListCtx {
+        liked: SongIndex::new(&[artist_page_row]),
+        playing_id: None,
+        downloads: Default::default(),
+        pinned_ids: Default::default(),
+        online: true,
+        playlists: Vec::new(),
+        on_like: Callback::noop(),
+        on_queue: Callback::noop(),
+        on_add_to_playlist: Callback::noop(),
+        on_open_artist: Callback::noop(),
+        on_open_album: Callback::noop(),
+        on_download: Callback::noop(),
+        on_remove_download: Callback::noop(),
+        on_play_next: Callback::noop(),
+    };
+    let case = mount::<ListHarness>(ListHarnessProps {
+        ctx,
+        tracks: vec![album_page_row],
+        on_play: Callback::noop(),
+    });
+    flush().await;
+
+    assert_eq!(
+        case.classes(".trow-actions button.ibtn"),
+        vec!["ibtn liked".to_string(), "ibtn".to_string()],
+        "the album page's row must show the heart the artist page's like set:\n{}",
+        case.inner_html()
+    );
+    assert_eq!(
+        case.attr(".trow-actions button.ibtn", "title"),
+        "Unlike",
+        "and the heart has to be the *un-like* affordance, not decoration:\n{}",
+        case.inner_html()
     );
 }
 
