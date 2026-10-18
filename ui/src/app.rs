@@ -63,6 +63,15 @@ pub(crate) fn playlist_fully_downloaded(p: &Playlist, downloaded: &HashSet<Strin
     !p.tracks.is_empty() && p.tracks.iter().all(|t| downloaded.contains(&t.id))
 }
 
+/// The liked-songs lookup every list decorates its rows from.
+///
+/// One place, so the wiring from the library to the hearts is testable without
+/// mounting [`App`]: the renderer tests hand-build the context, and an App that
+/// fed it the wrong list (or an empty index) would leave them all green.
+pub(crate) fn liked_index(library: &Library) -> Rc<SongIndex> {
+    Rc::new(SongIndex::new(&library.liked))
+}
+
 /// Fire the `play_tracks` command for a collection, tagged with where it came
 /// from so the UI can mark the playing collection.
 pub(crate) fn fire_play_tracks(tracks: &[Track], source: &Option<String>, start: usize) {
@@ -873,8 +882,8 @@ pub fn app() -> Html {
     // Indexed by song rather than by video id: the page a row is rendered on
     // and the surface it was liked from can name the same song with two ids
     // (`Track::same_song`), and the heart has to agree with the library either
-    // way.
-    let liked = SongIndex::new(&library.liked);
+    // way. Built once per render and shared by every list through `Rc`.
+    let liked = liked_index(&library);
     let playlist_opts: Vec<(String, String)> = library
         .playlists
         .iter()

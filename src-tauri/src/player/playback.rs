@@ -3,7 +3,7 @@
 
 use std::sync::Mutex;
 
-use rift_types::{events, PlaybackState, Progress, Track};
+use rift_types::{events, ArtistRef, PlaybackState, Progress, Track};
 use tauri::{AppHandle, Emitter, Manager};
 use tracing::{debug, error, info};
 
@@ -223,6 +223,18 @@ pub(crate) fn start_playback(app: &AppHandle, index: usize) {
     });
 }
 
+/// The plain-text byline for a set of resolved credits: what
+/// [`Track::artist`] holds and every non-linkable surface shows.
+///
+/// Pure, so the join rule is testable without a network round trip.
+pub(crate) fn byline(artists: &[ArtistRef]) -> String {
+    artists
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Backfill per-artist credits (with channel IDs) for a track saved before
 /// they were stored. Returns `true` if anything changed. Tracks that already
 /// have credits, or whose lookup fails, are left untouched.
@@ -241,6 +253,13 @@ async fn enrich_track(yt: &rift_ytmusic::Client, track: &mut Track) -> bool {
         return false;
     }
     track.artists = artists;
+    // Fill the byline too. Storing the structured credits alone left the row
+    // with `artists` populated and `artist` empty — the shape that used to
+    // defeat the song matcher's credit check (it read only the byline), and one
+    // the app's own library has eight of.
+    if track.artist.is_empty() {
+        track.artist = byline(&track.artists);
+    }
     if track.album_id.is_none() {
         if track.album.is_none() {
             track.album = album;

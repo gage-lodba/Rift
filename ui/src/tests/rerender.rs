@@ -209,7 +209,7 @@ fn ListRoot(props: &ListRootProps) -> Html {
         downloaded.insert(decor.downloaded.clone());
     }
     let ctx = TrackListCtx {
-        liked: SongIndex::new(&[track(&decor.liked)]),
+        liked: Rc::new(SongIndex::new(&[track(&decor.liked)])),
         playing_id: Some(decor.playing.clone()),
         downloads: DownloadState {
             downloaded,

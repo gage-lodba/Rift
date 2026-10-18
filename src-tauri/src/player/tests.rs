@@ -5,7 +5,7 @@ use rift_types::{PlaybackState, QueueSnapshot, RepeatMode, Track};
 use super::nav::{
     anchor_playing, cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor, toggle_shuffle,
 };
-use super::playback::{commit_crossfade, preseed_duration};
+use super::playback::{byline, commit_crossfade, preseed_duration};
 use super::queue::{
     append_tracks, insert_next, move_in_queue, remove_from_queue, AddOutcome, RemoveOutcome,
 };
@@ -694,6 +694,29 @@ fn preseed_duration_prefers_metadata_and_never_zeroes_a_known_length() {
     // A metadata length of zero is treated as "known to be zero-length" only
     // because it is `Some`; it must not fall through to the stale previous.
     assert_eq!(preseed_duration(Some(0), 180.0), 0.0);
+}
+
+/// A row that learns its credits from playback gets the plain-text byline too.
+///
+/// Storing `artists` and leaving `artist` empty is the shape that used to
+/// defeat the song matcher's credit check — the app's own library has eight rows
+/// like it — so the enrichment that resolves the credits must fill both.
+#[test]
+fn a_resolved_credit_gets_a_plain_byline() {
+    use rift_types::ArtistRef;
+    let credits = vec![
+        ArtistRef {
+            id: Some("uc-daft-punk".into()),
+            name: "Daft Punk".into(),
+        },
+        ArtistRef {
+            id: None,
+            name: "Pharrell Williams".into(),
+        },
+    ];
+    assert_eq!(byline(&credits), "Daft Punk, Pharrell Williams");
+    // No credits at all stays empty rather than a stray separator.
+    assert_eq!(byline(&[]), "");
 }
 
 /// The redundant-write guard. A track's first play emits the queue twice (once

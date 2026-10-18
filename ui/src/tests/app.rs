@@ -13,9 +13,10 @@
 
 use std::collections::HashSet;
 
+use rift_types::Library;
 use wasm_bindgen_test::wasm_bindgen_test;
 
-use crate::app::{fmt_total_duration, playlist_fully_downloaded, shuffled_start};
+use crate::app::{fmt_total_duration, liked_index, playlist_fully_downloaded, shuffled_start};
 use crate::tests::harness::{ids, playlist, track};
 
 // ---------------------------------------------------------------------------
@@ -218,4 +219,56 @@ fn playlists_are_evaluated_independently() {
         both.len() == 3,
         "the two playlists should share exactly one track: {both:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// liked_index — the library → hearts wiring
+// ---------------------------------------------------------------------------
+
+/// **The one line that connects the library to the hearts.**
+///
+/// The renderer tests hand-build their `TrackListCtx`, so an `App` that fed the
+/// index the wrong list — or never built it — would leave them all green. This
+/// drives the real helper: the reported cross-surface pair resolves, a song that
+/// is only in Recently played does not, and an empty library indexes nothing.
+#[wasm_bindgen_test]
+fn the_liked_index_is_built_from_the_liked_songs_by_song() {
+    // Liked from the artist page: the art track, credit and no duration.
+    let mut liked_row = track("Jb6gcoR266U");
+    liked_row.title = "Around the World".to_string();
+    liked_row.artist = "Daft Punk".to_string();
+    liked_row.album_id = Some("MPREb_dMHztPsrDgN".to_string());
+    liked_row.duration = None;
+    // The album page's row for the same song: the music video, duration and no
+    // credit. It is in Recently played, not in liked.
+    let mut album_row = track("K0HSD_i2DvA");
+    album_row.title = "Around the World".to_string();
+    album_row.artist = String::new();
+    album_row.album_id = Some("MPREb_dMHztPsrDgN".to_string());
+    album_row.duration = Some(430);
+
+    let library = Library {
+        liked: vec![liked_row.clone()],
+        recently_played: vec![album_row.clone()],
+        ..Library::default()
+    };
+    let liked = liked_index(&library);
+    assert!(
+        liked.contains(&album_row),
+        "the album page's row must be liked through the artist page's row"
+    );
+    assert!(liked.contains(&liked_row));
+
+    // Built from `liked`, not from every stored list: a song only in Recently
+    // played must not light a heart.
+    let recent_only = track("recent-only");
+    let library = Library {
+        liked: vec![liked_row],
+        recently_played: vec![recent_only.clone()],
+        ..Library::default()
+    };
+    assert!(!liked_index(&library).contains(&recent_only));
+
+    // And nothing liked indexes nothing, rather than matching by accident.
+    assert!(!liked_index(&Library::default()).contains(&album_row));
 }

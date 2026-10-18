@@ -817,7 +817,7 @@ async fn a_row_liked_from_another_surface_shows_the_heart() {
     };
 
     let ctx = TrackListCtx {
-        liked: SongIndex::new(&[artist_page_row]),
+        liked: Rc::new(SongIndex::new(&[artist_page_row])),
         playing_id: None,
         downloads: Default::default(),
         pinned_ids: Default::default(),

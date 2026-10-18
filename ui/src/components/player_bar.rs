@@ -167,7 +167,8 @@ pub fn player_bar(props: &PlayerBarProps) -> Html {
                             </div>
                         </div>
                         <button class={classes!("ibtn", "np-like", props.liked.then_some("liked"))}
-                                title="Like" onclick={toggle_like}>
+                                title={ if props.liked { "Unlike" } else { "Like" } }
+                                onclick={toggle_like}>
                             { icon(if props.liked { "heart" } else { "heart-outline" }) }
                         </button>
                     }

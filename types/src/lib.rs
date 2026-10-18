@@ -41,6 +41,60 @@ fn normalized(text: &str) -> String {
         .to_lowercase()
 }
 
+/// How far apart two known durations can be and still describe one recording.
+///
+/// The same audio is rendered with lengths that differ by a second or two
+/// depending on the upload and the surface: album rows round, a re-upload pads
+/// the tail, and the art track and the music video of one recording are not cut
+/// to the same frame. Treating a one-second difference as proof of two
+/// recordings would leave the heart dark on the row the user is looking at —
+/// the reported bug in its most literal form.
+const DURATION_TOLERANCE_SECS: u32 = 2;
+
+/// The credited names a row actually knows, as a candidate set to intersect.
+///
+/// Every shape the two credit fields are stored in contributes a candidate:
+/// the joined byline as a whole (so a name that itself contains a comma, like
+/// "Earth, Wind & Fire", still meets its structured twin), each structured
+/// credit (the field album pages resolve, and the one that can be populated
+/// while the byline is empty — `enrich_track` used to store exactly that
+/// shape), and the byline split back into names (so a byline that lists a
+/// featured artist can meet a surface that lists only the primary one).
+fn credit_names(track: &Track) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |name: String| {
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    add(normalized(&track.artist));
+    for artist in &track.artists {
+        add(normalized(&artist.name));
+    }
+    for part in track.artist.split([',', '&']) {
+        add(normalized(part));
+    }
+    names
+}
+
+/// Whether two rows can be about the same recording as far as their credits go.
+///
+/// An absent credit is not evidence of a different song — album-page rows carry
+/// no byline (the header has it) — so one side knowing nothing passes. Two
+/// known sides must name at least one artist in common, which is what tolerates
+/// the surfaces' disagreement about featured artists: a playlist row links only
+/// the primary artist ("Lady Gaga") while the album page links the featured one
+/// too ("Lady Gaga, Colby O'Donis"), and an exact-string comparison would veto
+/// one recording as two.
+fn credits_compatible(a: &Track, b: &Track) -> bool {
+    let names_a = credit_names(a);
+    let names_b = credit_names(b);
+    if names_a.is_empty() || names_b.is_empty() {
+        return true;
+    }
+    names_a.iter().any(|name| names_b.contains(name))
+}
+
 impl Track {
     /// The title key [`Track::same_song`] compares on.
     ///
@@ -67,43 +121,55 @@ impl Track {
     ///
     /// The rule, in the order the evidence runs out:
     ///
-    /// 1. The same id is the same song.
+    /// 1. The same non-empty id is the same song. An empty id is "no id", not
+    ///    an id every empty-id row shares.
     /// 2. The titles must match (and not be empty).
-    /// 3. Two credits that are both known must agree — an absent one is not a
-    ///    disagreement, it is the album page's normal shape.
-    /// 4. Two durations that are both known decide it: equal is the same
-    ///    recording, different is not. This is what catches the same recording
-    ///    re-released on another album, which the two surfaces describe with
-    ///    different album ids (*Veridis Quo* is `HhZaHf8RP6g` on *Discovery*
-    ///    and `qe8Q7mjxjig` on the *Interstella* single, 346 s both).
-    /// 5. With a duration missing on one side, the album has to match — and if
-    ///    there is no album either, the credit has to be on both sides and
-    ///    agree.
+    /// 3. Credits, when known on both sides, must be compatible — share a name
+    ///    (see [`credits_compatible`]). An absent credit is not a disagreement.
+    /// 4. Both durations known: agreement within [`DURATION_TOLERANCE_SECS`]
+    ///    means one recording, a greater difference means two. This is what
+    ///    catches the same recording re-released on another album, which the two
+    ///    surfaces describe with different album ids (*Veridis Quo* is stored
+    ///    under *Discovery* as `HhZaHf8RP6g` and under *Something About Us (Love
+    ///    Theme from Interstella)* as `qe8Q7mjxjig`, 346 s both).
+    /// 5. With a duration missing on one side, the album decides: the same
+    ///    album is the same song entry; different albums are not guessed at
+    ///    (every album has an "Intro"), and with no album on at least one side
+    ///    the credit has to be known on both.
     ///
-    /// Step 5 is deliberately conservative. "Same title, different release" is
-    /// only *proof* of a different recording when the lengths differ, and every
-    /// album has an "Intro"; matching two of them on a shared name alone would
-    /// light a heart on a song the user never liked.
+    /// It is deliberately conservative: a shared title alone is never enough,
+    /// and the two rules that can still be wrong are priced in. Step 4 treats
+    /// "same title, same length, no conflicting credit" as one recording, and a
+    /// pair that shares only a title and a length with no credit on either side
+    /// can still be two creditless album-page rows; the repo's review notes both.
     pub fn same_song(&self, other: &Track) -> bool {
-        if self.id == other.id {
+        if !self.id.is_empty() && self.id == other.id {
             return true;
         }
         let title = self.title_key();
         if title.is_empty() || title != other.title_key() {
             return false;
         }
-        if conflicts(&self.artist, &other.artist) {
+        if !credits_compatible(self, other) {
             return false;
         }
-        if let (Some(a), Some(b)) = (self.duration, other.duration) {
-            return a == b;
-        }
+        let durations = match (self.duration, other.duration) {
+            (Some(a), Some(b)) => Some(a.abs_diff(b) <= DURATION_TOLERANCE_SECS),
+            _ => None,
+        };
         match (self.album_id.as_deref(), other.album_id.as_deref()) {
-            (Some(a), Some(b)) => a == b,
-            _ => {
-                let artist = normalized(&self.artist);
-                !artist.is_empty() && artist == normalized(&other.artist)
-            }
+            // One album entry under two uploads: same length, or one side simply
+            // did not know the length.
+            (Some(a), Some(b)) if a == b => durations.unwrap_or(true),
+            // Two releases describe one recording with different album ids only
+            // when their lengths agree.
+            (Some(_), Some(_)) => durations == Some(true),
+            // No album to compare: a matching length is evidence; without one,
+            // both sides have to name the song's artist.
+            _ => match durations {
+                Some(agree) => agree,
+                None => !credit_names(self).is_empty() && !credit_names(other).is_empty(),
+            },
         }
     }
 
@@ -130,6 +196,18 @@ impl Track {
             self.artists = other.artists.clone();
             changed = true;
         }
+        // A byline can be missing while the structured credits are known (the
+        // shape `enrich_track` used to store); derive it rather than leaving the
+        // row with no plain-text artist.
+        if self.artist.is_empty() && !self.artists.is_empty() {
+            self.artist = self
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            changed = true;
+        }
         if self.album.is_none() && other.album.is_some() {
             self.album = other.album.clone();
             changed = true;
@@ -144,15 +222,6 @@ impl Track {
         }
         changed
     }
-}
-
-/// Whether two credits are both known and disagree.
-///
-/// An absent credit is not evidence of a different song — it is the normal
-/// state of an album page's rows, which omit the byline the header already
-/// carries.
-fn conflicts(a: &str, b: &str) -> bool {
-    !a.trim().is_empty() && !b.trim().is_empty() && normalized(a) != normalized(b)
 }
 
 /// Membership by *song* rather than by video id: "is this row one of these?"
@@ -180,7 +249,9 @@ impl SongIndex {
     }
 
     fn insert(&mut self, track: &Track) {
-        self.ids.insert(track.id.clone());
+        if !track.id.is_empty() {
+            self.ids.insert(track.id.clone());
+        }
         self.by_title
             .entry(track.title_key())
             .or_default()
@@ -194,7 +265,7 @@ impl SongIndex {
             // never find, and a fresh install renders whole lists this way.
             return false;
         }
-        if self.ids.contains(&track.id) {
+        if !track.id.is_empty() && self.ids.contains(&track.id) {
             return true;
         }
         self.by_title
@@ -416,6 +487,15 @@ mod tests {
         }
     }
 
+    /// One structured credit, with no channel id — only the name matters to the
+    /// comparison under test.
+    fn credit(name: &str) -> ArtistRef {
+        ArtistRef {
+            id: None,
+            name: name.into(),
+        }
+    }
+
     /// Daft Punk's *Homework* → "Around the World": the album page's row.
     ///
     /// Recorded from the live album page (`MPREb_dMHztPsrDgN`): the id is the
@@ -482,6 +562,105 @@ mod tests {
         assert!(!liked.contains(&track("zzz", "Around the World")));
     }
 
+    /// A structured credit with no plain-text byline still vetoes a match.
+    ///
+    /// `enrich_track` used to store the credits it resolved on `artists` and
+    /// leave `artist` empty, so the app's own library has rows like this (eight
+    /// of them, measured). A credit check that reads only `artist` sees "no
+    /// credit" on that row, and a cover with the same title and the same length
+    /// would win on the duration rule — the false positive that motivated this
+    /// test.
+    #[test]
+    fn structured_credits_veto_a_match_the_byline_cannot() {
+        let mut liked = track("PwILkY9gRrc", "Da Funk");
+        liked.artists = vec![credit("Daft Punk")];
+        liked.album_id = Some("MPREb_dMHztPsrDgN".into());
+        liked.duration = Some(329);
+
+        let mut karaoke = track("karaoke", "Da Funk");
+        karaoke.artist = "Karaoke Band".into();
+        karaoke.album_id = Some("MPREb_karaoke".into());
+        karaoke.duration = Some(329);
+
+        assert!(
+            !liked.same_song(&karaoke),
+            "the structured credit must veto one recording as two"
+        );
+        assert!(!karaoke.same_song(&liked), "and symmetrically");
+    }
+
+    /// The surfaces disagree about *how many* artists a row links, not about
+    /// which recording it is: playlist rows link the primary artist only, album
+    /// pages link the featured ones too. An exact-string credit comparison —
+    /// what this replaced — called one recording two and kept the heart dark.
+    #[test]
+    fn featured_credits_that_only_one_surface_links_do_not_split_a_song() {
+        let mut from_playlist = track("pl", "Get Lucky (feat. Pharrell Williams)");
+        from_playlist.artist = "Daft Punk".into();
+        from_playlist.album_id = Some("MPREb_ram".into());
+        from_playlist.duration = Some(248);
+
+        let mut from_album_page = track("al", "Get Lucky (feat. Pharrell Williams)");
+        from_album_page.artist = "Daft Punk, Pharrell Williams".into();
+        from_album_page.artists = vec![credit("Daft Punk"), credit("Pharrell Williams")];
+        from_album_page.album_id = Some("MPREb_ram".into());
+        from_album_page.duration = Some(248);
+
+        assert!(from_playlist.same_song(&from_album_page));
+        assert!(from_album_page.same_song(&from_playlist));
+    }
+
+    /// An artist name that itself contains a comma must still meet its
+    /// structured twin, which is why the byline as a whole is a candidate name
+    /// before it is split apart.
+    #[test]
+    fn a_comma_in_an_artist_name_does_not_split_it_against_itself() {
+        let mut byline = track("a", "September");
+        byline.artist = "Earth, Wind & Fire".into();
+        byline.duration = Some(215);
+        let mut structured = track("b", "September");
+        structured.artists = vec![credit("Earth, Wind & Fire")];
+        structured.duration = Some(215);
+        assert!(byline.same_song(&structured));
+    }
+
+    /// The credit check is what tells two recordings apart when everything else
+    /// agrees — same title, same album, same length. Deleting it as dead weight
+    /// has to fail this test.
+    #[test]
+    fn two_artists_on_the_same_album_entry_are_two_songs() {
+        let mut original = track("a", "Yesterday");
+        original.artist = "The Beatles".into();
+        original.album_id = Some("MPREb_beatles".into());
+        original.duration = Some(125);
+
+        let mut cover = track("b", "Yesterday");
+        cover.artist = "Someone Else".into();
+        cover.album_id = Some("MPREb_beatles".into());
+        cover.duration = Some(125);
+
+        assert!(!original.same_song(&cover));
+    }
+
+    /// A second or two of difference is the same recording; more than the
+    /// tolerance is two recordings.
+    #[test]
+    fn a_second_or_two_of_length_is_still_the_same_recording() {
+        let mut a = track("a", "Song");
+        a.album_id = Some("MPREb_x".into());
+        a.duration = Some(430);
+        let mut b = track("b", "Song");
+        b.album_id = Some("MPREb_x".into());
+        b.duration = Some(431);
+        assert!(
+            a.same_song(&b),
+            "one second apart is one recording, not two"
+        );
+
+        b.duration = Some(440);
+        assert!(!a.same_song(&b), "ten seconds apart is two recordings");
+    }
+
     /// The id is decisive on its own: a re-resolved copy whose metadata has
     /// been replaced still matches, which is what keeps this from regressing
     /// the plain case.
@@ -529,8 +708,9 @@ mod tests {
     /// the album id, and the length is the evidence that they are the same song.
     ///
     /// Both rows are from the library this was reported against — "Veridis Quo"
-    /// is `HhZaHf8RP6g` on *Discovery* and `qe8Q7mjxjig` on the *Interstella*
-    /// single, 346 s on both, and only the album page's copy has no credit.
+    /// is stored under *Discovery* as `HhZaHf8RP6g` and under *Something About
+    /// Us (Love Theme from Interstella)* as `qe8Q7mjxjig`, 346 s on both, and
+    /// only the album page's copy has no credit.
     #[test]
     fn one_recording_on_a_second_release_matches_by_its_length() {
         let mut discovery = track("HhZaHf8RP6g", "Veridis Quo");
@@ -548,8 +728,12 @@ mod tests {
             "same title, same length, no conflicting credit"
         );
 
-        // Same two releases, one second apart: two recordings.
+        // Within the tolerance one upload's rounding is not a second recording.
         interstella.duration = Some(347);
+        assert!(discovery.same_song(&interstella));
+
+        // Beyond it, it is.
+        interstella.duration = Some(350);
         assert!(!discovery.same_song(&interstella));
     }
 
@@ -589,6 +773,27 @@ mod tests {
     #[test]
     fn rows_with_nothing_in_common_are_not_guessed_at() {
         assert!(!track("a", "").same_song(&track("b", "")));
+    }
+
+    /// An empty id is "no id", not an id every empty-id row shares: a corrupt
+    /// or hand-edited row must not become a wildcard that folds into — or
+    /// unlikes — every other one.
+    #[test]
+    fn an_empty_id_is_not_an_identity() {
+        let mut one = track("", "One");
+        one.artist = "Artist A".into();
+        let mut two = track("", "Two");
+        two.artist = "Artist B".into();
+        assert!(
+            !one.same_song(&two),
+            "two unrelated empty-id rows are not one song"
+        );
+
+        // With the same metadata the ordinary rule still applies, exactly as it
+        // would for two different ids.
+        let mut also_one = track("", "One");
+        also_one.artist = "Artist A".into();
+        assert!(one.same_song(&also_one));
     }
 
     #[test]

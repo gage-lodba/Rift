@@ -4,9 +4,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use rift_types::{Library, Playlist, Track};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const RECENT_CAP: usize = 30;
+
+/// Where the pre-repair library is snapshotted before the one-time collapse
+/// rewrites it. A sibling of `library.json`, so the repair is recoverable by
+/// hand even if the merge rule ever guesses wrong about a song.
+const PRE_COLLAPSE_BACKUP: &str = "library.json.pre-collapse";
 
 /// Fold rows that are the same song ([`Track::same_song`]) into their first
 /// occurrence, which keeps its position and its id and absorbs whatever a later
@@ -16,8 +21,10 @@ const RECENT_CAP: usize = 30;
 /// Two lookups rather than one, because `same_song` has two ways in: the same id
 /// is the same song whatever the titles say, and otherwise equal titles are
 /// required — so an id hit is checked first and the title bucket after it.
-/// Bucketing by title is what keeps this linear for the long lists (a
-/// 1000-track import) that a pairwise scan would make quadratic.
+/// Bucketing by title is what keeps this linear on average for the long lists (a
+/// 1000-track import) that a pairwise scan would make quadratic; the pathological
+/// case is one title bucket holding every row (at worst quadratic, only when the
+/// rows share a title).
 fn fold_song_duplicates(tracks: Vec<Track>) -> (Vec<Track>, usize) {
     let before = tracks.len();
     if before < 2 {
@@ -28,17 +35,30 @@ fn fold_song_duplicates(tracks: Vec<Track>) -> (Vec<Track>, usize) {
     let mut out: Vec<Track> = Vec::with_capacity(before);
     for t in tracks {
         let key = t.title_key();
-        let existing = by_id.get(&t.id).copied().or_else(|| {
+        // An empty id is "no id", not an id every empty-id row shares, so it
+        // only ever takes part in the title comparison.
+        let by_id_hit = if t.id.is_empty() {
+            None
+        } else {
+            by_id.get(&t.id).copied()
+        };
+        let existing = by_id_hit.or_else(|| {
             by_title
                 .get(&key)
                 .and_then(|positions| positions.iter().copied().find(|&i| out[i].same_song(&t)))
         });
         match existing {
             Some(i) => {
+                debug!(
+                    "folding {} ({:?}) into {} ({:?})",
+                    t.id, t.title, out[i].id, out[i].title
+                );
                 out[i].fill_missing_from(&t);
             }
             None => {
-                by_id.insert(t.id.clone(), out.len());
+                if !t.id.is_empty() {
+                    by_id.insert(t.id.clone(), out.len());
+                }
                 by_title.entry(key).or_default().push(out.len());
                 out.push(t);
             }
@@ -57,8 +77,13 @@ fn fold_song_duplicates(tracks: Vec<Track>) -> (Vec<Track>, usize) {
 /// [`Track::same_song`]). Merging is lossless — the surviving row keeps its
 /// position and id and takes the fields it was missing from the row it absorbs,
 /// so the artist-less album-page copy ends up with the credit and the
-/// duration — and [`Track::same_song`] is deliberately conservative about which
-/// rows count as the same song, so nothing else can be removed by this.
+/// duration.
+///
+/// The rule cannot be certain about every pair (the two cases it accepts are
+/// priced in on [`Track::same_song`]), and this runs on playlists the user
+/// curated, so the *first* repair snapshots the file to
+/// [`PRE_COLLAPSE_BACKUP`] before writing: a wrong merge is recoverable by hand
+/// rather than silent.
 fn collapse_duplicates(data: &mut Library) -> usize {
     let mut folded = 0;
     for list in [&mut data.liked, &mut data.recently_played] {
@@ -107,9 +132,23 @@ impl LibraryStore {
             // duplicate rows are on disk, and a launch that merely reads them
             // again would keep showing the user two rows for one song.
             warn!("collapsed {collapsed} duplicate song row(s) in the library");
+            store.back_up_before_repair();
             store.save();
         }
         store
+    }
+
+    /// Copy the library aside before the one-time repair rewrites it.
+    ///
+    /// Best effort on purpose: a backup that cannot be written must not stop the
+    /// repair the user needs, and the write itself stays atomic, so the worst
+    /// case is the pre-repair file being lost on a disk already refusing writes.
+    fn back_up_before_repair(&self) {
+        let backup = self.path.with_file_name(PRE_COLLAPSE_BACKUP);
+        match std::fs::copy(&self.path, &backup) {
+            Ok(_) => info!("pre-repair library saved to {}", backup.display()),
+            Err(e) => warn!("could not back up the library before repairing it: {e}"),
+        }
     }
 
     pub fn save(&self) {
@@ -134,8 +173,22 @@ impl LibraryStore {
         self.save();
     }
 
+    /// Record a play, newest first.
+    ///
+    /// A song already in the list moves to the front instead of appearing twice,
+    /// and the row it replaces keeps the fields the stored copy knew that this
+    /// surface's copy does not: playing the album page's row of a song the
+    /// artist page's row recorded must not drop the byline from Recently played.
     pub fn push_recent(&mut self, track: Track) {
-        self.data.recently_played.retain(|t| !t.same_song(&track));
+        let mut track = track;
+        self.data.recently_played.retain(|stored| {
+            if stored.same_song(&track) {
+                track.fill_missing_from(stored);
+                false
+            } else {
+                true
+            }
+        });
         self.data.recently_played.insert(0, track);
         self.data.recently_played.truncate(RECENT_CAP);
         self.save();
@@ -179,12 +232,22 @@ impl LibraryStore {
     }
 
     /// Create a playlist pre-populated with `tracks` (used by import). Rows for
-    /// the same song within the input are dropped, preserving first-seen order.
+    /// the same song within the input are folded into their first occurrence,
+    /// preserving first-seen order.
     pub fn create_playlist_with(&mut self, name: String, tracks: Vec<Track>) -> Playlist {
+        let (tracks, folded) = fold_song_duplicates(tracks);
+        if folded > 0 {
+            // The importing surfaces can list one song under two uploads (a
+            // playlist that holds both the art track and the music video), and a
+            // pre-fix Rift export can hold two ids for one song. Folding them is
+            // right, but say so: the file the user imported had more rows than
+            // the playlist they get back.
+            info!("import: folded {folded} duplicate song row(s)");
+        }
         let playlist = Playlist {
             id: format!("pl-{:016x}", rand::random::<u64>()),
             name,
-            tracks: fold_song_duplicates(tracks).0,
+            tracks,
         };
         self.data.playlists.push(playlist.clone());
         self.save();
@@ -519,6 +582,101 @@ mod tests {
         );
     }
 
+    /// A credit that exists only in the structured field still tells two songs
+    /// apart.
+    ///
+    /// Rows `enrich_track` produced carry `artists` and an empty `artist`, and
+    /// that is the shape that would let a cover with the same title and length
+    /// collapse into a real like. Pinned at the store because this is the
+    /// destructive path: a wrong answer here deletes a row on next launch.
+    #[test]
+    fn loading_does_not_fold_a_cover_whose_credit_is_structural() {
+        let dir = crate::util::testing::TempDir::new("library-structural-credit");
+        let mut liked = track("PwILkY9gRrc");
+        liked.title = "Da Funk".into();
+        liked.artists = vec![ArtistRef {
+            id: Some("UCRr1xG_2WIDs18a6cIiCxeA".into()),
+            name: "Daft Punk".into(),
+        }];
+        liked.album_id = Some("MPREb_dMHztPsrDgN".into());
+        liked.duration = Some(329);
+
+        let mut karaoke = track("karaoke");
+        karaoke.title = "Da Funk".into();
+        karaoke.artist = "Karaoke Band".into();
+        karaoke.album_id = Some("MPREb_karaoke".into());
+        karaoke.duration = Some(329);
+
+        let stored = Library {
+            liked: vec![liked, karaoke],
+            ..Library::default()
+        };
+        crate::util::save_json(&dir.join("library.json"), &stored, "library");
+
+        let lib = LibraryStore::load(dir.path());
+
+        assert_eq!(
+            lib.data.liked.len(),
+            2,
+            "the structured credit has to keep these apart: {:?}",
+            lib.data.liked
+        );
+    }
+
+    /// Empty ids are "no id", not one id every corrupt row shares. Two rows
+    /// carrying one must be compared on their metadata, exactly like any other
+    /// pair — and metadata that disagrees leaves them alone.
+    #[test]
+    fn loading_does_not_fold_rows_that_only_share_an_empty_id() {
+        let dir = crate::util::testing::TempDir::new("library-empty-id");
+        let mut first = track("");
+        first.title = "First".into();
+        first.artist = "Artist A".into();
+        let mut second = track("");
+        second.title = "Second".into();
+        second.artist = "Artist B".into();
+
+        let stored = Library {
+            liked: vec![first, second],
+            ..Library::default()
+        };
+        crate::util::save_json(&dir.join("library.json"), &stored, "library");
+
+        let lib = LibraryStore::load(dir.path());
+
+        assert_eq!(lib.data.liked.len(), 2, "empty ids are not an identity");
+    }
+
+    /// The repair rewrites the user's file, so the file it replaced has to be
+    /// recoverable: the pre-repair snapshot is written before the rewrite and
+    /// holds the duplicate rows exactly as an older build stored them.
+    #[test]
+    fn the_repair_snapshots_the_library_before_rewriting_it() {
+        let dir = crate::util::testing::TempDir::new("library-repair-backup");
+        let stored = Library {
+            liked: vec![album_row(), artist_row()],
+            ..Library::default()
+        };
+        crate::util::save_json(&dir.join("library.json"), &stored, "library");
+
+        let lib = LibraryStore::load(dir.path());
+
+        assert_eq!(lib.data.liked.len(), 1);
+        let backup = dir.join(super::PRE_COLLAPSE_BACKUP);
+        assert!(
+            backup.is_file(),
+            "the pre-repair library must be kept at {}",
+            backup.display()
+        );
+        let before: Library = crate::util::load_json(&backup);
+        assert_eq!(
+            before.liked.len(),
+            2,
+            "the snapshot must hold the rows the repair replaced: {:?}",
+            before.liked
+        );
+    }
+
     /// Playing the album's copy of a song already in Recently played moves that
     /// song to the front instead of listing it twice.
     #[test]
@@ -535,6 +693,24 @@ mod tests {
             lib.data.recently_played
         );
         assert_eq!(lib.data.recently_played[0].id, "K0HSD_i2DvA");
+    }
+
+    /// Moving a song to the front of Recently played must not make the row
+    /// poorer: the surface it was just played from may be the half-empty one
+    /// (album-page rows have no byline), and the stored copy's fields are what
+    /// the row keeps.
+    #[test]
+    fn replaying_a_song_from_the_other_surface_keeps_its_fields() {
+        let dir = crate::util::testing::TempDir::new("library-recent-fields");
+        let mut lib = temp_store(&dir);
+        lib.push_recent(artist_row()); // credit, no duration
+        lib.push_recent(album_row()); // duration, no credit
+
+        let row = &lib.data.recently_played[0];
+        assert_eq!(row.id, "K0HSD_i2DvA", "the row that was just played wins");
+        assert_eq!(row.artist, "Daft Punk", "the byline it did not carry");
+        assert_eq!(row.artists.len(), 1);
+        assert_eq!(row.duration, Some(430), "the duration the surface knew");
     }
 
     #[test]

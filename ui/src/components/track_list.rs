@@ -1,6 +1,7 @@
 //! Track list and its per-row rendering (cover, actions, offline state).
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use rift_types::{DownloadState, SongIndex, Track};
 use yew::prelude::*;
@@ -9,17 +10,21 @@ use super::icons::{artist_links, cover, fmt_secs, icon};
 use super::key_on_nested_control;
 use super::menu::{Menu, MenuAction};
 
-/// Per-render context shared by every track list on screen: the id sets that
-/// decorate rows and the track-level callbacks that are the same for all
-/// lists. Bundled so each call site passes one value instead of re-plumbing a
-/// dozen identical props.
+/// Per-render context shared by every track list on screen: the per-row
+/// decoration state (liked songs by song identity, download status, pinned ids)
+/// and the track-level callbacks that are the same for all lists. Bundled so
+/// each call site passes one value instead of re-plumbing a dozen identical
+/// props.
+///
+/// `liked` is an [`Rc`] because this context is cloned once per list per
+/// render; the index itself is built once per App render and shared.
 #[derive(Clone, PartialEq)]
 pub struct TrackListCtx {
     /// The user's liked songs. Indexed by *song*, not by video id: YouTube
     /// Music hands one song out under more than one video id, so the heart has
     /// to light up for the album page's row when the artist page's row is the
     /// one that was liked (`Track::same_song`).
-    pub liked: SongIndex,
+    pub liked: Rc<SongIndex>,
     /// ID of the track currently playing, highlighted in the list.
     pub playing_id: Option<String>,
     /// Offline download status (downloaded / in flight / given up).
