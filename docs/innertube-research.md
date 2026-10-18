@@ -187,6 +187,48 @@ don't hard-fail. A reimplementation should copy this *philosophy* (tolerant,
 partial-failure parsing) because innertube responses are large, nested, and
 frequently add/rename fields.
 
+### 1.9 One recording, two video ids
+
+A music item states its kind in
+`watchEndpoint.watchEndpointMusicSupportedConfigs.watchEndpointMusicConfig`
+`.musicVideoType` (`…_ATV` = art track, the topic channel's album audio; `…_OMV`
+= official music video; `…_UGC` = user upload). YouTube Music describes one
+*recording* with one video per upload, and different surfaces pick different
+uploads — measured 2026-10-10 and re-checked 2026-10-18 against Daft Punk's
+*Homework* (`MPREb_dMHztPsrDgN`) and artist page (`UCRr1xG_2WIDs18a6cIiCxeA`):
+
+| row | id | type | carries |
+|---|---|---|---|
+| album page, "Around the World" | `K0HSD_i2DvA` | `…_OMV` on 2026-10-18; **absent** on 2026-10-10 | duration 430 s, **no** artist credit |
+| artist page → Top songs, same song | `Jb6gcoR266U` | `…_ATV` | `artist` = Daft Punk, **no** duration |
+| artist page → Videos carousel | `K0HSD_i2DvA` | `…_OMV` | 135M views |
+
+The type is not reliably present on a row — the first measurement found none on
+the album row and the second found `…_OMV` — so nothing may depend on it being
+there. (Rift's duplicate-song rule does not.)
+
+Both ids resolve to different YouTube uploads ("…(Official Music Video
+Remastered)" and the topic channel's "Around the World"), and the album page's
+row names **only** `K0HSD_i2DvA` — on the inline play button's `watchEndpoint`,
+on `playlistItemData.videoId` *and* on the title run's `watchEndpoint`. Neither
+row names the other's id, so no choice of pointer in `parse::video_id` can
+reconcile them, and the two surfaces disagree about which fields they carry:
+album rows omit the byline (the page header has it; the row's own column is the
+play count), Top songs rows omit the duration.
+
+Two consequences for a client:
+
+- **Do not key a song on the video id alone.** Rift's likes, recently played,
+  playlist duplicate check and credit backfill compare songs through
+  `Track::same_song` (`types/src/lib.rs`), and the UI asks a `SongIndex` built
+  from the liked list, so the heart agrees with the library whichever surface
+  rendered the row. The rule uses the title plus whichever of compatible
+  credits, known durations (a couple of seconds apart is one recording) and
+  album id both rows carry.
+- **The two ids are still two streams.** Downloads and the playback queue stay
+  keyed on the video id: an offline copy is one upload's audio file, and the
+  other id is a different upload to play.
+
 ---
 
 ## Part 2 — yt-dlp internals
