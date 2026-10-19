@@ -206,7 +206,11 @@ jobs:
       # types, two TLS stacks, and a bigger install for no reason. The script
       # narrows `cargo tree -d` to genuinely distinct versions (it also reports
       # one version split across feature sets) and compares against the
-      # recorded baseline, because `cargo tree -d` exits 0 either way.
+      # recorded baseline, because `cargo tree -d` exits 0 either way. The
+      # baseline is per host: `cargo tree` filters by the host target, so the
+      # duplicated set genuinely differs across this matrix — the Windows
+      # `windows-*` generation, macOS's Cocoa/Swift crates, and the Linux-only
+      # zbus 3 tree — and each platform is checked against its own list.
       - name: Check for duplicate dependency versions
         shell: bash
         run: .github/scripts/check-duplicate-deps.sh
