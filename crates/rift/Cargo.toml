@@ -47,7 +47,7 @@ tracing = "0.1.44"
 # stack into every platform. On Linux, rfd needs exactly one backend, so it gets
 # `xdg-portal` there; Windows/macOS always use their native backends.
 [target.'cfg(target_os = "linux")'.dependencies]
-rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "wayland"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = { version = "0.16", default-features = false }
