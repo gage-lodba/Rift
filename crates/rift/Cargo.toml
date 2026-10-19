@@ -44,10 +44,12 @@ tracing = "0.1.44"
 #
 # The feature split matters: the portal/GTK backends are Linux-only in rfd, and
 # leaving the default `async-std` + `xdg-portal` features on would drag a portal
-# stack into every platform. On Linux, rfd needs exactly one backend, so it gets
-# `xdg-portal` there; Windows/macOS always use their native backends.
+# stack into every platform. On Linux, rfd needs exactly one async backend: the
+# app already runs Tokio, so enable `rfd/tokio` (ashpd/zbus then use their Tokio
+# backends instead of the unavailable async-io one). Windows/macOS use their
+# native backends.
 [target.'cfg(target_os = "linux")'.dependencies]
-rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland"] }
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland", "tokio"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = { version = "0.16", default-features = false }
