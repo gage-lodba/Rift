@@ -1,0 +1,73 @@
+# Dependabot configuration — dependency updates for the Rust workspace and the
+# GitHub Actions pinned in `.github/workflows/`.
+#
+# The workflow files pin every action by commit SHA with the version in a
+# comment (a tag is mutable and can be repointed at arbitrary code — see the
+# comment in `ci.yml`). That is only safe if something keeps the SHAs current:
+# this file is that something, for both the actions and the whole cargo graph.
+#
+# Routine updates are grouped so a week of bumps is one review instead of ten:
+#   * cargo: patch + minor versions in one PR. Major bumps stay separate on
+#     purpose — they need a real migration read, and grouping them would hide a
+#     major change inside a mechanical "patch/minor" PR.
+#   * github-actions: one PR for all action bumps. Dependabot rewrites both the
+#     pinned SHA and the `# vN` version comment next to it, so the comment can
+#     be trusted to describe the commit the workflow actually runs.
+# Security updates are never grouped (group `applies-to` is version-updates), so
+# an advisory-driven PR is always its own, immediately reviewable change.
+#
+# Labels only take effect if they exist in the repository (`dependencies` is a
+# GitHub default; `rust`/`github-actions` may need creating), and version
+# updates must be enabled for the repo in Settings → Code security. The config
+# alone does not turn the feature on for a fork.
+version: 2
+
+updates:
+  # Cargo workspace at the repository root (`Cargo.toml` with `members` under
+  # `crates/`). All four members are `publish = false`, so updates are for the
+  # application build, not for downstream consumers.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      # GitHub's default is UTC; state the maintainer's local time explicitly so
+      # the window doesn't silently move if the account default changes.
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-patch-minor:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+          - "minor"
+
+  # The SHA-pinned actions in `.github/workflows/*.yml`, so the pins stay
+  # current (Dependabot understands the `# vN` comment form and rewrites both
+  # the SHA and the comment).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        applies-to: "version-updates"
+        patterns:
+          - "*"

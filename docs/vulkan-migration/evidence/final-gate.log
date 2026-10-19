@@ -1,0 +1,1126 @@
+Rift local CI gate — 20261019-172442
+root: <repo>
+log : <repo>\artifacts\ci-local-20261019-172442.log
+rustc: rustc 1.88.0 (6b00bc388 2025-06-23)
+cargo: cargo 1.88.0 (873a06493 2025-05-10)
+locked: True; skip-tests: False; skip-release: False
+git bash: C:\Program Files\Git\bin\bash.exe
+python (image compare): <python>
+git HEAD: 9762dbc; changed files: 141 (informational — the gate checks the working tree, not a commit)
+
+=== toolchain consistency ===
+declared rust-version = 1.88
+rust-toolchain channel = 1.88.0
+toolchain version is consistent across Cargo.toml, rust-toolchain.toml, and the workflows
+PASS: toolchain consistency (0.8s)
+
+=== cargo fmt --all -- --check ===
+PASS: cargo fmt --all -- --check (0.4s)
+
+=== cargo clippy (-D warnings) ===
+    Checking rift-types v0.5.0 (<repo>\crates\rift-types)
+    Checking rift-ytmusic v0.5.0 (<repo>\crates\rift-ytmusic)
+    Checking rift v0.5.0 (<repo>\crates\rift)
+    Checking rift-desktop v0.5.0 (<repo>\crates\rift-desktop)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.53s
+PASS: cargo clippy (-D warnings) (2.7s)
+
+=== cargo doc -p rift -p rift-types -p rift-ytmusic ===
+    Checking rift-types v0.5.0 (<repo>\crates\rift-types)
+ Documenting rift-types v0.5.0 (<repo>\crates\rift-types)
+    Checking rift-ytmusic v0.5.0 (<repo>\crates\rift-ytmusic)
+ Documenting rift-ytmusic v0.5.0 (<repo>\crates\rift-ytmusic)
+ Documenting rift v0.5.0 (<repo>\crates\rift)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.43s
+   Generated <repo>\target\doc\rift\index.html and 2 other files
+PASS: cargo doc -p rift -p rift-types -p rift-ytmusic (1.5s)
+
+=== cargo test ===
+   Compiling rift-types v0.5.0 (<repo>\crates\rift-types)
+   Compiling rift-ytmusic v0.5.0 (<repo>\crates\rift-ytmusic)
+   Compiling rift v0.5.0 (<repo>\crates\rift)
+   Compiling rift-desktop v0.5.0 (<repo>\crates\rift-desktop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.44s
+     Running unittests src\lib.rs (target\debug\deps\rift-aa606cf9ec519fa3.exe)
+
+running 179 tests
+test backend::tests::choose_metadata_candidate_ignores_incomplete_results ... ok
+test backend::tests::an_explicit_data_dir_is_used_verbatim ... ok
+test backend::tests::choose_metadata_candidate_requires_a_non_empty_exact_id ... ok
+test backend::tests::choose_metadata_candidate_accepts_album_evidence_without_an_id ... ok
+test backend::tests::choose_metadata_candidate_prefers_the_exact_id ... ok
+test backend::tests::choose_metadata_candidate_rejects_ambiguous_no_album_no_duration ... ok
+test backend::tests::choose_metadata_candidate_reports_none_when_nothing_usable ... ok
+test backend::tests::choose_metadata_candidate_accepts_a_known_stored_duration ... ok
+test backend::tests::the_config_defaults_to_the_historical_layout_and_no_window_handle ... ok
+test backend::tests::the_public_handle_types_are_send_and_sync ... ok
+test commands::convert::tests::is_audio_track_drops_marker_titles ... ok
+test commands::convert::tests::flags_official_video_uploads ... ok
+test commands::convert::tests::is_audio_track_keeps_a_clean_title_the_type_would_have_caught ... ok
+test commands::convert::tests::keeps_audio_tracks_and_video_named_songs ... ok
+test commands::downloads::tests::a_track_dropped_from_the_retry_set_is_reported_rather_than_filtered_away ... ok
+test commands::downloads::tests::fresh_full_download_that_fully_fails_is_not_kept_offline ... ok
+test commands::downloads::tests::partially_downloaded_playlist_is_not_kept_offline ... ok
+test commands::downloads::tests::partition_retryable_keeps_everything_when_nothing_was_dropped ... ok
+test commands::downloads::tests::topping_up_a_fully_downloaded_playlist_is_kept_offline ... ok
+test commands::downloads::tests::track_in_no_kept_offline_playlist_is_not_kept_offline ... ok
+test commands::images::tests::the_default_cap_is_generous_but_bounded ... ok
+test commands::library::tests::export_filenames_are_stripped_to_a_single_safe_component ... ok
+test commands::images::tests::only_http_and_https_urls_are_fetchable ... ok
+test commands::library::tests::a_file_that_is_not_a_playlist_reports_why ... ok
+test commands::library::tests::importing_a_playlist_keeps_every_row_including_a_video_titled_one ... ok
+test backend::tests::metadata_repair_skips_rows_without_a_usable_result ... ok
+test backend::tests::metadata_repair_does_not_hold_the_lock_across_the_lookup ... ok
+test commands::library::tests::parses_playlist_ids_from_urls_and_bare_ids ... ok
+test backend::tests::metadata_repair_fills_rows_and_emits_exactly_one_event ... ok
+test backend::tests::metadata_repair_stops_after_three_consecutive_errors ... ok
+test backend::tests::metadata_repair_caps_the_lookups_per_launch ... ok
+test commands::downloads::tests::a_track_dropped_from_the_retry_set_is_recorded_and_announced ... ok
+test commands::updates::tests::only_http_and_https_urls_are_opened ... ok
+test commands::updates::tests::detects_newer_versions ... ok
+test commands::updates::tests::ignores_same_or_older_versions ... ok
+test discord::tests::the_activity_frame_carries_a_nonce_and_the_pid ... ok
+test discord::tests::the_nonce_is_a_fresh_v4_uuid ... ok
+test downloads::tests::fail_releases_the_claim_without_marking_downloaded ... ok
+test event::tests::events_round_trip_in_order ... ok
+test downloads::tests::begin_claims_once_so_concurrent_calls_dont_double_fetch ... ok
+test event::tests::every_variant_keeps_its_old_event_name ... ok
+test event::tests::sending_to_a_dropped_receiver_is_a_false_not_a_panic ... ok
+test event::tests::the_receiver_is_send_so_it_can_live_on_a_pump_thread ... ok
+test fetch::tests::safe_stem_preserves_real_ids_and_neutralizes_traversal ... ok
+test fetch::tests::the_installer_installs_from_the_yt_dlp_release ... ok
+test downloads::tests::finish_moves_from_in_flight_to_downloaded ... ok
+test backend::tests::a_backend_starts_and_stops_cleanly_without_a_window_or_network ... ok
+test downloads::tests::mark_failed_records_and_is_cleared_by_a_retry_or_success ... ok
+test fetch::tests::ytdlp_override_canonicalizes_parent_segments ... ok
+test downloads::tests::remove_deletes_the_file_and_clears_state ... ok
+test library::tests::an_empty_id_source_does_not_merge_by_id ... ok
+test fetch::tests::ytdlp_override_rejects_anything_that_is_not_a_resolved_regular_file ... ok
+test downloads::tests::load_discovers_existing_offline_files ... ok
+test library::tests::a_flushed_like_survives_dropping_the_store ... ok
+test library::tests::an_import_folds_a_repeated_id_whose_title_changed ... ok
+test library::tests::an_imported_playlist_folds_one_song_to_one_row ... ok
+test library::tests::apply_metadata_fills_missing_fields_across_lists_and_saves ... ok
+test library::tests::apply_metadata_never_overwrites_known_fields ... ok
+test library::tests::apply_metadata_crosses_to_the_other_surfaces_copy ... ok
+test library::tests::apply_metadata_matches_the_other_surface_id_via_same_song ... ok
+test library::tests::apply_metadata_copies_credits_onto_creditless_copies ... ok
+test library::tests::a_playlist_refuses_the_same_song_from_another_surface ... ok
+test library::tests::apply_metadata_with_no_useful_sources_reports_unchanged ... ok
+test library::tests::a_save_survives_dropping_the_store_before_the_flush ... ok
+test library::tests::incomplete_tracks_filters_dedupes_limits_and_ignores_playlists ... ok
+test library::tests::incomplete_tracks_does_not_let_a_complete_liked_row_mask_a_recent_one ... ok
+test library::tests::incomplete_tracks_dedupes_empty_id_rows_by_title ... ok
+test library::tests::apply_metadata_merges_by_id_and_by_song_and_persists ... ok
+test library::tests::loading_does_not_fold_rows_that_only_share_an_empty_id ... ok
+test library::tests::loading_keeps_different_songs_that_share_a_title ... ok
+test library::tests::like_toggles_and_persists_across_reload ... ok
+test library::tests::loading_does_not_fold_a_cover_whose_credit_is_structural ... ok
+test library::tests::liking_the_same_song_from_the_album_page_unlikes_it ... ok
+test library::tests::merge_visible_metadata_from_repairs_visible_rows_only ... ok
+test library::tests::loading_collapses_a_song_stored_from_both_surfaces ... ok
+test media::tests::an_empty_backend_slot_means_ignore_the_event ... ok
+test media::tests::an_unavailable_media_handle_swallows_updates ... ok
+test library::tests::loading_a_library_keeps_a_video_titled_track ... ok
+test paths::tests::a_configured_data_dir_wins_over_the_environment ... ok
+test paths::tests::an_empty_override_is_ignored_rather_than_meaning_the_empty_path ... ok
+test paths::tests::no_base_directory_is_an_error_that_names_the_override ... ok
+test library::tests::recently_played_dedups_by_song_not_by_video ... ok
+test paths::tests::the_default_directory_is_the_identifier_under_the_platform_data_dir ... ok
+test paths::tests::the_environment_override_wins_over_the_platform_default ... ok
+test player::playback::tests::adopt_fetched_duration_caps_at_a_day ... ok
+test library::tests::rapid_mutations_are_written_in_order_and_the_last_one_wins ... ok
+test library::tests::record_played_merges_and_records_a_play_in_one_save ... ok
+test library::tests::unliking_clears_every_copy_the_old_id_match_stored ... ok
+test player::playback::tests::adopt_fetched_duration_fills_a_missing_length ... ok
+test library::tests::replaying_a_song_from_the_other_surface_keeps_its_fields ... ok
+test player::playback::tests::adopt_fetched_duration_ignores_unknown_or_invalid_lengths ... ok
+test player::playback::tests::adopt_fetched_duration_never_overwrites_a_known_length ... ok
+test library::tests::playlist_add_is_idempotent_and_remove_works ... ok
+test player::tests::a_cycle_rollover_keeps_the_playing_track_in_the_played_set ... ok
+test player::tests::a_jump_keeps_already_played_tracks_out_of_the_running ... ok
+test player::tests::a_finished_queue_stops_unless_repeat_asks_for_more ... ok
+test player::tests::a_jump_to_a_new_track_enters_the_cycle_but_keeps_the_history ... ok
+test player::tests::a_pin_the_history_does_not_name_is_anchored_when_the_crossfade_commits ... ok
+test player::tests::a_prefetched_pick_leads_the_cursor_until_it_is_played ... ok
+test player::tests::a_move_keeps_previous_walking_the_real_play_order ... ok
+test player::tests::a_pin_the_history_does_not_name_is_anchored_when_it_plays ... ok
+test player::tests::a_resolved_credit_gets_a_plain_byline ... ok
+test player::tests::a_toggle_off_mid_prefetch_draws_under_the_new_mode_not_the_stale_pick ... ok
+test player::tests::an_unchanged_snapshot_is_not_persisted_again ... ok
+test player::tests::append_adds_at_end_and_skips_duplicates ... ok
+test player::tests::append_to_empty_queue_starts_playback ... ok
+test player::tests::changing_repeat_mode_drops_a_prefetched_crossfade_pick ... ok
+test player::tests::insert_next_places_after_current ... ok
+test player::tests::insert_next_shifts_played_entries_past_the_current_track ... ok
+test paths::tests::the_native_environment_resolves_to_the_identifier_directory ... ok
+test player::tests::insert_next_with_nothing_playing_starts_first ... ok
+test player::tests::move_follows_the_playing_track ... ok
+test player::tests::inserting_next_keeps_the_rest_of_the_cycle ... ok
+test player::tests::move_out_of_range_or_noop_is_rejected ... ok
+test player::tests::pending_next_is_honoured_once_then_falls_through ... ok
+test player::tests::moving_any_track_keeps_the_rest_of_the_cycle_intact ... ok
+test player::tests::preseed_duration_prefers_metadata_and_never_zeroes_a_known_length ... ok
+test player::tests::previous_near_start_of_track_restarts_it ... ok
+test player::tests::remove_after_current_keeps_current ... ok
+test player::tests::remove_before_current_shifts_current_down ... ok
+test player::tests::remove_current_at_end_clamps_to_new_last ... ok
+test player::tests::remove_clears_a_pending_crossfade_pick ... ok
+test player::tests::remove_current_plays_the_one_that_took_its_slot ... ok
+test player::tests::remove_out_of_range_is_a_noop ... ok
+test player::tests::remove_last_remaining_current_stops ... ok
+test player::tests::removing_a_played_track_leaves_the_rest_of_the_cycle_intact ... ok
+test player::tests::removing_after_the_current_track_keeps_the_played_set ... ok
+test player::tests::removing_the_last_playing_track_replays_from_its_place_in_the_order ... ok
+test library::tests::the_repair_snapshots_the_library_before_rewriting_it ... ok
+test player::tests::removing_the_playing_track_replaces_it_without_restarting_the_cycle ... ok
+test player::tests::removing_the_track_a_prefetch_reserved_keeps_the_cursor_in_range ... ok
+test player::tests::repeat_cycles_through_off_all_and_one ... ok
+test player::tests::shuffle_auto_advance_stops_at_the_end_of_the_cycle_when_repeat_is_off ... ok
+test player::tests::sequential_next_prev_walk_queue_order ... ok
+test player::tests::shuffle_covers_every_track_once_before_repeating ... ok
+test player::tests::shuffle_previous_retraces_then_next_replays_forward ... ok
+test player::tests::shuffle_manual_next_wraps_at_the_end_of_the_cycle_when_repeat_is_off ... ok
+test player::tests::shuffle_repeat_all_auto_advance_starts_a_fresh_cycle ... ok
+test player::tests::shuffle_repeat_one_auto_advance_replays_the_current_track ... ok
+test player::tests::stale_out_of_range_pending_next_is_ignored ... ok
+test player::tests::toggle_shuffle_flips_the_mode_and_invalidates_a_prefetched_pick ... ok
+test sha256::tests::a_partial_update_survives_until_the_next_call ... ok
+test sha256::tests::matches_a_manifest_entry_that_carries_a_directory ... ok
+test sha256::tests::ignores_malformed_lines_instead_of_matching_them ... ok
+test sha256::tests::reads_gnu_style_checksum_manifests ... ok
+test sha256::tests::reads_the_binary_marker_and_bsd_forms ... ok
+test sha256::tests::streaming_agrees_with_one_shot_at_block_boundaries ... ok
+test util::tests::a_fully_qualified_youtube_host_is_still_youtube ... ok
+test settings::tests::out_of_range_values_are_clamped_on_load ... ok
+test util::tests::a_path_with_no_file_name_is_rejected_rather_than_guessed_at ... ok
+test util::tests::an_answer_that_did_not_end_at_youtube_is_not_online ... ok
+test util::tests::any_status_from_youtube_is_online ... ok
+test util::tests::a_corrupt_file_is_backed_up_rather_than_lost ... ok
+test util::tests::a_durable_write_is_on_disk_after_flush ... ok
+test util::tests::a_failed_publish_does_not_leave_scratch_behind ... ok
+test util::tests::a_panicking_job_does_not_kill_the_writer_thread ... ok
+test settings::tests::rapid_settings_changes_are_written_in_order_and_the_last_one_wins ... ok
+test util::tests::no_response_at_all_is_offline ... ok
+test settings::tests::volume_survives_a_reload ... ok
+test util::tests::dropping_the_writer_drains_the_queue ... ok
+test util::tests::flush_waits_for_a_write_that_is_still_in_flight ... ok
+test util::tests::the_live_youtube_response_shape_counts_as_online ... ok
+test util::tests::atomic_write_replaces_the_target_and_leaves_no_temp_behind ... ok
+test util::tests::json_round_trips_through_disk ... ok
+test util::tests::the_temp_path_is_a_unique_sibling_of_the_target ... ok
+test util::tests::durable_writes_keep_their_queued_order_and_the_last_one_wins ... ok
+test util::tests::the_durable_writer_serializes_off_the_callers_thread ... ok
+test util::tests::the_inline_fallback_writes_synchronously_and_flushes_true ... ok
+test util::tests::the_persister_serializes_off_the_callers_thread ... ok
+test util::tests::the_persister_writes_and_drops_an_identical_payload ... ok
+test commands::images::tests::an_oversized_declared_body_is_refused ... ok
+test library::tests::recently_played_dedups_caps_and_orders_newest_first ... ok
+test player::tests::random_command_sequences_keep_the_shuffle_bookkeeping_sound ... ok
+test fetch::tests::an_unverified_yt_dlp_is_never_created_or_written ... ok
+test sha256::tests::matches_the_published_test_vectors ... ok
+test commands::images::tests::a_normal_image_round_trips ... ok
+test fetch::tests::a_version_probe_that_never_finishes_times_out_instead_of_waiting ... ok
+test backend::tests::shutdown_flushes_pending_library_and_settings_writes ... ok
+test backend::tests::startup_merge_fills_incomplete_liked_metadata_from_the_restored_queue ... ok
+
+test result: ok. 179 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running unittests src\lib.rs (target\debug\deps\rift_desktop-3e652f2968736175.exe)
+
+running 304 tests
+test controller::tests::a_decoded_cover_is_emitted_and_a_later_request_may_refetch ... ok
+test controller::tests::a_failed_async_playback_is_reported_as_an_error ... ok
+test controller::tests::cover_requests_are_deduplicated_while_in_flight ... ok
+test controller::tests::a_failed_page_reports_an_error_and_retry_works ... ok
+test controller::tests::a_rejected_playlist_name_is_toasted_instead_of_silently_dropped ... ok
+test controller::tests::a_duplicate_navigation_to_the_loading_page_does_not_refetch ... ok
+test controller::backend_event_tests::every_backend_event_maps_one_to_one ... ok
+test controller::tests::a_page_reply_for_an_abandoned_view_is_dropped ... ok
+test controller::tests::a_track_cache_insert_updates_metadata_in_place ... ok
+test controller::tests::a_yt_playlist_import_navigates_and_toasts_like_the_old_ui ... ok
+test controller::tests::an_unknown_toggle_like_id_reports_an_error_instead_of_guessing ... ok
+test controller::tests::clearing_the_search_box_cancels_the_in_flight_search ... ok
+test controller::tests::a_failed_cover_is_not_requested_again ... ok
+test controller::tests::bootstrap_seeds_the_mirrors_and_runs_the_launch_update_check ... ok
+test controller::tests::dispatch_keeps_ui_local_actions_off_the_backend ... ok
+test controller::tests::artist_and_album_tabs_are_lazily_fetched_once_per_search ... ok
+test controller::tests::dispatch_maps_downloads_and_resolves_ids_through_the_track_cache ... ok
+test controller::tests::dispatch_maps_library_and_playlist_commands ... ok
+test controller::tests::dispatch_maps_playback_and_queue_commands ... ok
+test controller::tests::dispatch_maps_settings_update_and_ytdlp_commands ... ok
+test controller::tests::dispatch_maps_transport_and_volume_to_the_backend ... ok
+test controller::tests::fallible_commands_surface_their_error_on_the_next_poll ... ok
+test controller::tests::navigating_to_a_page_requests_it_at_the_current_generation ... ok
+test controller::tests::open_current_artist_resolves_the_playing_tracks_first_linkable_artist ... ok
+test controller::tests::preview_mode_fails_cover_requests_immediately ... ok
+test controller::tests::reachability_changes_emit_online_only_on_transitions ... ok
+test controller::tests::retry_page_reissues_the_last_page_request ... ok
+test controller::tests::search_results_for_a_superseded_query_are_dropped ... ok
+test controller::tests::the_reachability_probe_runs_on_the_interval_and_reports_transitions ... ok
+test cover::tests::a_failed_url_is_not_retried ... ok
+test cover::tests::the_tracker_starts_and_ends_one_fetch_per_url ... ok
+test cover::tests::undecodable_bytes_are_an_error_not_a_panic ... ok
+test gfx::paint::tests::prims_go_into_the_last_layer ... ok
+test gfx::paint::tests::intersect_and_contains ... ok
+test gfx::paint::tests::rect_split_helpers_respect_bounds ... ok
+test cover::tests::a_small_cover_is_not_upscaled_and_keeps_its_alpha ... ok
+test cover::tests::remembered_failures_are_bounded ... ok
+test cover::tests::a_wide_panorama_keeps_at_least_one_pixel_per_edge ... ok
+test screens::cards::buttons::tests::mix_interpolates_colors ... ok
+test screens::cards::card::tests::card_height_matches_the_reference ... ok
+test screens::cards::card::tests::grid_metrics_matches_the_reference_library ... ok
+test screens::cards::tests::line_boxes_match_segoe_ui_metrics ... ok
+test screens::cards::textures::tests::generated_textures_have_the_right_shape ... ok
+test screens::cards::track_row::tests::artist_link_hover_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::chrome::overlays::tests::banner_text_matches_the_old_component ... ok
+test screens::chrome::player_bar::tests::controls_block_is_centred ... ok
+test cover::tests::a_portrait_cover_is_capped_on_its_height ... ok
+test screens::chrome::sidebar::tests::drag_visual_index_identity_and_edges ... ok
+test screens::chrome::sidebar::tests::drag_visual_index_previews_the_post_drop_order ... ok
+test cover::tests::the_longest_edge_is_capped_at_the_maximum ... ok
+test screens::chrome::sidebar::tests::inline_editor_buttons_do_not_overlap ... ok
+test screens::chrome::sidebar::tests::inline_editor_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::chrome::sidebar::tests::moved_order_matches_the_backend_remove_then_insert ... ok
+test screens::artist::tests::artist_songs_head_is_151_with_catalogue ... ok
+test screens::artist::tests::loading_artist_is_just_the_empty_state ... ok
+test screens::chrome::sidebar::tests::playing_playlist_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::album::tests::loading_album_is_just_the_empty_state ... ok
+test screens::chrome::player_bar::tests::player_bar_artist_name_links_to_the_profile ... ok
+test screens::chrome::sidebar::tests::sidebar_drag_preview_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::album::tests::album_height_is_page_head_plus_rows ... ok
+test screens::cards::track_row::tests::nested_row_controls_win_over_the_row ... ok
+test screens::cards::track_row::tests::artist_credit_click_reports_the_credit_not_play ... ok
+test screens::chrome::sidebar::tests::held_drag_paints_rows_in_the_post_drop_order ... ok
+test screens::chrome::sidebar::tests::playing_liked_songs_replaces_heart_with_equalizer ... ok
+test gfx::tests::offscreen_scene_renders_expected_pixels ... ok
+test gfx::tests::updated_texture_replaces_pixels ... ok
+test gfx::tests::empty_paint_list_renders_clear_colour_only ... ok
+test screens::chrome::sidebar::tests::playing_playlist_replaces_music_note_with_equalizer ... ok
+test gfx::tests::multi_frame_runtime_texture_lifecycle ... ok
+test gfx::tests::png_screenshot_helper_writes_readable_png ... ok
+test screens::chrome::sidebar::tests::post_drop_committed_order_prevents_snap_back ... ok
+test screens::artist::tests::artist_page_height_sections ... ok
+test screens::chrome::sidebar::tests::sidebar_alt_arrows_ignored_while_committed_hold_active ... ok
+test screens::chrome::sidebar::tests::sidebar_drift_click_releases_in_place_and_navigates ... ok
+test screens::chrome::sidebar::tests::spring_slot_is_stable_under_large_dt ... ok
+test screens::chrome::sidebar::tests::spring_slot_overshoots_slightly_and_settles_quickly ... ok
+test screens::chrome::sidebar::tests::spring_slot_zero_or_non_finite_dt_is_a_noop ... ok
+test screens::chrome::titlebar::tests::titlebar_geometry_matches_the_reference ... ok
+test screens::home::tests::recent_is_capped_at_twelve_rows ... ok
+test gfx::tests::stress_10k_prims_many_clips_and_atlas_growth ... ok
+test screens::chrome::sidebar::tests::sidebar_focus_loss_cancels_a_held_drag ... ok
+test screens::liked::tests::empty_liked_has_only_the_head_plus_empty_state ... ok
+test screens::liked::tests::liked_height_adds_one_row_per_track ... ok
+test screens::menu::tests::entry_helpers_keep_the_action ... ok
+test screens::menu::tests::backdrop_pin_does_nothing_when_no_menu_is_open ... ok
+test screens::menu::tests::item_builders_set_state ... ok
+test screens::chrome::sidebar::tests::sidebar_hover_cursors_are_pointer_and_resize ... ok
+test screens::menu::tests::disabled_menu_rows_keep_the_arrow ... ok
+test screens::chrome::sidebar::tests::sidebar_import_from_file_emits_the_native_picker_action ... ok
+test screens::menu::tests::escape_closes_the_menu_without_emitting ... ok
+test screens::menu::tests::submenu_visible_rows_cap_at_200px ... ok
+test screens::overlays::tests::banner_places_buttons_with_gaps_and_caps_at_480 ... ok
+test screens::overlays::tests::banner_sits_18_from_the_right_and_110_above_the_bottom ... ok
+test screens::overlays::tests::toast_is_padding_plus_text_and_caps_at_420 ... ok
+test screens::menu::tests::one_item_click_pushes_exactly_one_action ... ok
+test screens::overlays::tests::toast_sits_110_above_the_window_bottom ... ok
+test screens::overlays::tests::toast_paints_a_card_at_the_bottom_left ... ok
+test screens::pages::tests::album_subtitle_has_type_and_year ... ok
+test screens::chrome::sidebar::tests::sidebar_import_inline_buttons_are_separate ... ok
+test screens::pages::tests::collection_head_height_is_meta_plus_actions ... ok
+test screens::pages::tests::empty_state_is_113_tall ... ok
+test screens::menu::tests::open_menu_backdrop_keeps_the_arrow_while_rows_show_the_hand ... ok
+test screens::pages::tests::artist_page_paints_the_album_and_single_grids ... ok
+test screens::chrome::sidebar::tests::sidebar_import_playlist_escape_cancels ... ok
+test screens::pages::tests::subscribers_format_compacts ... ok
+test screens::menu::tests::opening_and_closing_tracks_state ... ok
+test screens::playlist::tests::header_menu_is_rename_then_delete ... ok
+test screens::pages::tests::grid_height_matches_the_reference_library ... ok
+test screens::overlays::tests::update_banner_paints_when_a_newer_release_exists ... ok
+test screens::chrome::sidebar::tests::sidebar_import_playlist_url_flow ... ok
+test screens::menu::tests::outside_press_closes_and_consumes_the_frame ... ok
+test screens::playlist::tests::playlist_height_adds_rows ... ok
+test screens::playlist::tests::missing_playlist_is_just_the_empty_state ... ok
+test screens::pages::tests::search_artist_and_album_tabs_paint_grid_covers ... ok
+test screens::queue::tests::clear_button_emits_queue_clear ... ok
+test screens::queue::tests::collapse_flag_toggles ... ok
+test screens::playlist::tests::rename_input_enter_submits_and_escape_cancels ... ok
+test screens::chrome::sidebar::tests::sidebar_new_playlist_inline_buttons_are_separate ... ok
+test screens::queue::tests::collapsed_panel_paints_the_header_only ... ok
+test screens::playlist::tests::header_kebab_opens_rename_and_delete_menu ... ok
+test screens::chrome::sidebar::tests::sidebar_new_playlist_inline_input_creates ... ok
+test screens::queue::tests::cursors_are_pointer_on_hover_and_grabbing_only_while_dragging ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_alt_arrows_reorder ... ok
+test screens::queue::tests::dragging_row_zero_over_row_two_emits_queue_move ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_drag_cursor_is_grabbing_only_while_held ... ok
+test screens::search::tests::busy_search_shows_an_empty_state_even_with_stale_songs ... ok
+test screens::queue::tests::expanded_panel_paints_one_cover_per_queue_row ... ok
+test screens::pages::tests::every_page_paints_a_non_empty_frame ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_drag_reorders ... ok
+test screens::settings::tests::control_sizes_match_the_css ... ok
+test screens::search::tests::empty_search_height_is_head_tabs_and_empty_state ... ok
+test screens::search::tests::tab_pills_emit_set_search_tab ... ok
+test screens::queue::tests::focus_loss_and_release_in_one_frame_cannot_drop ... ok
+test screens::search::tests::songs_tab_height_tracks_the_result_count ... ok
+test screens::settings::tests::check_again_and_check_now_emit_their_actions ... ok
+test screens::settings::tests::crossfade_row_grows_when_enabled ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_kebab_menu_exports ... ok
+test screens::settings::tests::crossfade_slider_emits_set_crossfade ... ok
+test screens::settings::tests::discord_switch_emits_set_discord_rpc ... ok
+test screens::settings::tests::long_ytdlp_path_moves_to_its_own_line ... ok
+test screens::settings::tests::ytdlp_status_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::settings::tests::long_not_found_detail_wraps_below_the_badge ... ok
+test screens::queue::tests::focus_loss_cancels_a_retained_drag ... ok
+test screens::tests::queue_is_hidden_on_settings_and_when_empty ... ok
+test screens::settings::tests::missing_ytdlp_offers_download ... ok
+test screens::settings::tests::overwide_ytdlp_path_wraps_inside_the_chip ... ok
+test screens::track_list::tests::blocked_by_other_playlist_ignores_the_collection_itself ... ok
+test screens::track_list::tests::collection_meta_counts_songs_and_total_duration ... ok
+test screens::track_list::tests::current_collection_needs_a_source_and_a_loaded_track ... ok
+test screens::track_list::tests::download_head_button_state_machine ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_plain_click_still_navigates ... ok
+test screens::track_list::tests::head_actions_total_height ... ok
+test screens::settings::tests::row_heights_are_padding_plus_content ... ok
+test screens::settings::tests::update_available_offers_a_download_link ... ok
+test screens::settings::tests::ytdlp_row_height_accounts_for_a_wrapped_path ... ok
+test screens::tests::home_preview_paints_the_reference_geometry ... ok
+test screens::track_list::tests::list_height_is_54_per_row ... ok
+test screens::track_list::tests::track_menu_matches_the_old_order ... ok
+test single_instance::tests::the_instance_name_names_the_app_and_is_stable ... ok
+test single_instance::tests::the_named_mutex_admits_one_holder_and_releases_on_drop ... ok
+test single_instance::tests::the_public_guard_is_exclusive_within_a_process ... ok
+test state::tests::fmt_time_formats ... ok
+test state::tests::play_collection_toggles_the_current_collection ... ok
+test state::tests::repeat_cycles ... ok
+test state::tests::shuffled_start_never_returns_len ... ok
+test state::tests::toast_expiry ... ok
+test text::atlas::tests::allocate_does_not_overlap ... ok
+test text::atlas::tests::dirty_region_is_a_union ... ok
+test text::atlas::tests::shelves_wrap_and_request_growth ... ok
+test text::atlas::tests::uv_is_normalized ... ok
+test screens::queue::tests::header_click_toggles_collapse ... ok
+test screens::tests::main_content_reserves_the_scrollbar_gutter ... ok
+test screens::tests::reference_layout_bands ... ok
+test screens::track_list::tests::artist_credit_click_navigates_to_the_profile ... ok
+test screens::chrome::sidebar::tests::sidebar_settling_rows_do_not_navigate_until_settled ... ok
+test text::tests::atlas_produces_upload_once_and_uvs_are_sane ... ok
+test text::tests::ellipsize_empty_when_no_room ... ok
+test text::tests::ellipsize_truncates_and_fits ... ok
+test text::tests::ellipsize_borrows_when_it_fits ... ok
+test screens::queue::tests::panel_heights_come_from_the_theme ... ok
+test text::tests::empty_text_has_line_height ... ok
+test text::tests::every_ui_icon_codepoint_exists_in_both_icon_fonts ... ok
+test screens::track_list::tests::head_download_pill_emits_download_and_remove ... ok
+test screens::track_list::tests::head_play_pill_emits_play_tracks_or_toggle ... ok
+test text::tests::explicit_line_height_uses_css_half_leading_baseline ... ok
+test text::tests::hidpi_rasterizes_glyph_bitmaps_at_physical_size_but_quads_stay_logical ... ok
+test text::tests::icon_quad_is_centered_ink_size ... ok
+test text::tests::hidpi_icons_keep_their_logical_box ... ok
+test text::tests::line_height_is_font_default_and_overridable ... ok
+test text::tests::measure_does_not_rasterize_and_layout_caches ... ok
+test screens::queue::tests::remove_x_emits_queue_remove ... ok
+test screens::queue::tests::row_and_cover_sizes_match_the_css ... ok
+test text::tests::measure_matches_layout_size ... ok
+test text::tests::measure_is_stable_across_scale_factors ... ok
+test text::tests::newlines_stack_lines ... ok
+test ui::clipboard::tests::memory_clipboard_roundtrips_and_shares_state ... ok
+test ui::clipboard::tests::native_clipboard_roundtrips_when_available ... ok
+test text::tests::prewarm_fills_atlas_once ... ok
+test text::tests::scale_changes_cache_but_not_logical_width ... ok
+test text::tests::weighted_faces_load_and_measure_differently ... ok
+test text::tests::wrap_breaks_a_word_longer_than_the_line ... ok
+test text::tests::wrap_gap_is_only_the_whitespace_between_words ... ok
+test text::tests::wrap_and_ellipsize_are_robust_for_random_unicode_and_widths ... ok
+test text::tests::wrap_honours_explicit_newlines_and_max_width ... ok
+test text::tests::wrap_does_not_double_count_the_line_prefix ... ok
+test screens::queue::tests::row_click_emits_queue_jump ... ok
+test text::tests::wrap_splits_at_words_within_width ... ok
+test text::tests::wrap_text_inserts_newlines ... ok
+test ui::clipboard::tests::ui_pastes_from_and_copies_to_the_real_os_clipboard ... ok
+test ui::clipboard::tests::ui_tolerates_an_unavailable_native_clipboard ... ok
+test ui::fuzz::deferred_content_paints_once_and_disappears ... ok
+test ui::gallery::render_image_texture_png ... ignored, requires a Vulkan device; run manually for visual QA
+test ui::gallery::render_widget_gallery_png ... ignored, requires a Vulkan device; run manually for visual QA
+test ui::icons::tests::all_codepoints_has_no_duplicates_within_font ... ok
+test ui::fuzz::injected_clipboard_takes_precedence_over_the_native_backend ... ok
+test ui::icons::tests::all_is_complete_for_required_names ... ok
+test ui::icons::tests::codepoints_are_in_private_use_area ... ok
+test ui::id::tests::children_do_not_collide_for_neighbours ... ok
+test ui::id::tests::string_ids_are_stable_and_distinct ... ok
+test ui::id::tests::with_is_sensitive_to_key_type_and_value ... ok
+test ui::input::tests::end_frame_consumes_focus_lost ... ok
+test ui::input::tests::focus_lost_defaults_to_false ... ok
+test ui::layout::tests::align_centers_size ... ok
+test ui::layout::tests::column_cursor_clamps_to_bounds ... ok
+test ui::layout::tests::inset_pad_uses_each_edge ... ok
+test ui::layout::tests::row_cursor_respects_gaps_and_remaining ... ok
+test ui::layout::tests::splitting_columns_accounts_for_gaps ... ok
+test ui::layout::tests::vec2_math ... ok
+test ui::fuzz::open_popup_cannot_leak_to_another_screen ... ok
+test ui::tests::button_styles_use_theme_tokens ... ok
+test ui::fuzz::text_input_caret_and_edit_bounds_are_safe ... ok
+test screens::queue::tests::shrinking_queue_clears_a_stale_drag_index ... ok
+test ui::fuzz::text_input_enter_submits_and_escape_cancels_and_blurs ... ok
+test ui::fuzz::random_resizes_and_scale_changes_keep_paint_valid ... ok
+test ui::fuzz::text_input_long_text_keeps_editing_inside_the_field ... ok
+test ui::fuzz::text_input_selection_shift_home_end_and_ctrl_a_replace ... ok
+test ui::fuzz::text_input_without_clipboard_copies_are_no_ops ... ok
+test ui::gallery::gallery_builds_a_non_empty_paint_list ... ok
+test ui::tests::button_click_requires_press_and_release_inside ... ok
+test ui::tests::button_release_outside_does_not_click ... ok
+test ui::tests::clickable_hover_requests_the_pointer_cursor ... ok
+test ui::tests::clicking_a_focusable_widget_focuses_it_without_visible_ring ... ok
+test ui::fuzz::text_input_clipboard_works_with_injected_clipboard ... ok
+test ui::tests::cover_widget_uses_fallback_glyph_without_texture ... ok
+test ui::tests::clips_become_layers_and_preserve_order ... ok
+test ui::tests::cursor_resets_to_default_on_every_frame ... ok
+test ui::tests::deferred_content_paints_after_base_content ... ok
+test ui::tests::dropped_textures_survive_into_the_next_frame ... ok
+test ui::tests::empty_rects_and_transparent_colors_are_skipped ... ok
+test ui::tests::end_frame_without_begin_frame_is_tolerated_and_flushes_uploads ... ok
+test ui::tests::escape_closes_an_open_popup ... ok
+test ui::tests::fill_emits_one_rect_prim_with_theme_clear ... ok
+test ui::tests::focused_text_input_accepts_typed_characters ... ok
+test ui::tests::focus_loss_clears_the_active_latch_so_the_next_click_works ... ok
+test ui::tests::glyph_uvs_point_at_the_font_atlas ... ok
+test ui::tests::icons_emit_image_prims ... ok
+test ui::tests::id_derivation_is_stable_across_frames ... ok
+test ui::tests::in_frame_texture_upload_appears_exactly_once ... ok
+test ui::fuzz::random_input_sequences_never_break_ui_invariants ... ok
+test ui::tests::explicit_cursor_requests_win_over_the_automatic_pointer ... ok
+test ui::tests::nested_clips_intersect ... ok
+test ui::tests::open_popup_blocks_interaction_underneath_next_frame ... ok
+test ui::tests::scroll_content_rect_is_offset_and_stable_gutter_reserves_width ... ok
+test ui::tests::tab_focus_cycles_through_widgets_in_paint_order ... ok
+test ui::tests::popup_draws_deferred_and_click_outside_closes_it ... ok
+test ui::tests::scroll_offsets_are_retained_and_resettable ... ok
+test ui::tests::hover_only_and_disabled_widgets_keep_the_default_cursor ... ok
+test ui::tests::text_emits_one_image_prim_per_nonspace_glyph ... ok
+test screens::track_list::tests::each_track_menu_entry_emits_its_action ... ok
+test ui::tests::text_input_backspace_and_enter ... ok
+test ui::tests::inter_frame_texture_upload_reaches_the_next_paint_list ... ok
+test ui::tests::text_input_escape_cancels_and_blurs ... ok
+test ui::tests::texture_lifecycle_is_forwarded_to_the_paint_list ... ok
+test ui::tests::toast_is_queued_drawn_and_expires ... ok
+test ui::tests::the_font_atlas_is_uploaded_once_as_texture_one ... ok
+test ui::tests::wheel_does_not_scroll_when_pointer_is_outside ... ok
+test ui::tests::widgets_outside_clip_do_not_hover ... ok
+test ui::tests_polish::slider_track_color_matches_the_browser_default ... ok
+test ui::tests::wheel_scrolls_the_hovered_container ... ok
+test ui::tests::tooltip_appears_after_hover_delay ... ok
+test window_state::tests::a_failed_save_is_swallowed ... ok
+test window_state::tests::clamps_unusable_geometry ... ok
+test window_state::tests::falls_back_to_the_first_window_object_for_another_label ... ok
+test window_state::tests::loads_the_existing_legacy_plugin_document ... ok
+test window_state::tests::missing_file_is_not_an_error ... ok
+test window_state::tests::save_creates_the_directory_and_leaves_no_scratch ... ok
+test window_state::tests::save_then_load_round_trips ... ok
+test window_state::tests::save_writes_the_plugin_schema ... ok
+test window_state::tests::the_default_geometry_matches_the_old_window ... ok
+test ui::tests_polish::a_new_toast_replaces_the_previous_one ... ok
+test ui::tests_polish::clicking_a_menu_item_activates_it ... ok
+test screens::track_list::tests::heart_click_emits_toggle_like_without_playing ... ok
+test ui::tests_polish::disabled_button_does_not_click ... ok
+test ui::tests_polish::disabled_switch_does_not_toggle ... ok
+test ui::tests_polish::dynamic_scroll_uses_previous_content_height ... ok
+test ui::tests_polish::escape_closes_menu_and_returns_focus_to_trigger ... ok
+test ui::tests::text_is_ellipsized_to_the_rect ... ok
+test ui::tests_polish::focus_ring_inset_draws_inside_the_rect ... ok
+test ui::tests_polish::menu_focuses_first_item_and_arrow_keys_move ... ok
+test ui::tests_polish::menu_item_submenu_draws_a_caret ... ok
+test ui::tests_polish::sticky_toast_does_not_expire ... ok
+test ui::tests_polish::style_helpers_still_match_theme_tokens ... ok
+test ui::tests_polish::slider_thumb_stays_inside_the_track ... ok
+test screens::track_list::tests::kebab_click_opens_the_track_menu ... ok
+
+test result: ok. 297 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 16.27s
+
+     Running unittests src\main.rs (target\debug\deps\rift_music-6542dbe247b3aab5.exe)
+
+running 1 test
+test tests::apply_focus_lost_releases_state_without_a_synthetic_release_edge ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\live_backend.rs (target\debug\deps\live_backend-4d2d0e3d5a175d2a.exe)
+
+running 5 tests
+test live_bootstrap_event_pump_and_clean_shutdown ... ignored, live backend smoke: needs temp data dir + audio device; run with --ignored
+test live_cover_fetch_decode_and_dedupe ... ignored, live backend smoke: fetches a real cover image over the network; run with --ignored
+test live_search_through_app_state ... ignored, live backend smoke: performs a real YouTube Music search; run with --ignored
+test live_stale_search_generation_is_filtered ... ignored, live backend smoke: performs two real YouTube Music searches; run with --ignored
+test live_update_check_and_ytdlp_probe ... ignored, live backend smoke: hits GitHub + runs yt-dlp; run with --ignored
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\ui_flow.rs (target\debug\deps\ui_flow-48e7e7d28fccd0e8.exe)
+
+running 10 tests
+test boot_frame_paints_the_window_bands ... ok
+test context_menu_opens_closes_and_dispatches_an_action ... ok
+test text_editing_handles_backspace_and_enter_submit ... ok
+test player_bar_clicks_reach_the_backend_bridge ... ok
+test queue_panel_collapses_clears_and_jumps ... ok
+test settings_toggles_sliders_and_probes_map_to_commands ... ok
+test sidebar_rows_navigate ... ok
+test keyboard_shortcuts_work_without_text_focus ... ok
+test titlebar_search_types_submits_and_clears ... ok
+test window_controls_emit_window_commands ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.39s
+
+     Running unittests src\lib.rs (target\debug\deps\rift_types-a788f19fb84f1ba1.exe)
+
+running 16 tests
+test tests::a_different_recording_on_the_same_album_is_a_different_song ... ok
+test tests::a_comma_in_an_artist_name_does_not_split_it_against_itself ... ok
+test tests::a_second_or_two_of_length_is_still_the_same_recording ... ok
+test tests::featured_credits_that_only_one_surface_links_do_not_split_a_song ... ok
+test tests::a_shared_title_alone_is_not_a_shared_song ... ok
+test tests::structured_credits_veto_a_match_the_byline_cannot ... ok
+test tests::the_same_title_on_another_release_is_not_guessed_at ... ok
+test tests::one_recording_on_a_second_release_matches_by_its_length ... ok
+test tests::rows_with_nothing_in_common_are_not_guessed_at ... ok
+test tests::an_index_built_from_one_surface_answers_the_other ... ok
+test tests::the_same_id_is_the_same_song_whatever_else_changed ... ok
+test tests::the_album_and_artist_pages_describe_one_song ... ok
+test tests::merging_takes_the_missing_fields_from_the_other_surface ... ok
+test tests::two_artists_on_the_same_album_entry_are_two_songs ... ok
+test tests::without_an_album_the_credit_decides ... ok
+test tests::an_empty_id_is_not_an_identity ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\rift_ytmusic-2ca4f9954d427bb0.exe)
+
+running 38 tests
+test context::tests::only_a_successful_scrape_is_cached ... ok
+test context::tests::the_client_version_regex_is_compiled_once ... ok
+test context::tests::extract_client_version_is_none_when_absent_or_blank ... ok
+test context::tests::extract_client_version_reads_the_embedded_constant ... ok
+test client::tests::a_403_on_every_attempt_reports_forbidden ... ok
+test client::tests::a_failed_client_version_scrape_is_not_remembered ... ok
+test identity::tests::the_visitor_data_regex_is_compiled_once ... ok
+test parse::tests::a_duration_that_would_overflow_is_rejected ... ok
+test parse::tests::a_duration_with_a_bad_component_is_rejected_not_salvaged ... ok
+test parse::tests::a_response_with_rows_that_yield_nothing_warns_once ... ok
+test parse::tests::a_ugc_typed_row_with_a_clean_title_is_dropped ... ok
+test parse::tests::album_type_matches_the_shelf_title_by_prefix ... ok
+test parse::tests::audience_skips_textless_runs_instead_of_abandoning_the_scan ... ok
+test client::tests::album_and_artist_pages_route_to_browse_and_parse ... ok
+test parse::tests::parses_counts ... ok
+test identity::tests::visitor_data_is_read_from_the_home_page_json ... ok
+test parse::tests::parses_durations ... ok
+test parse::tests::subtitle_noise_is_limited_to_separators_and_durations ... ok
+test parse::tests::track_credits_is_not_decided_by_key_spelling ... ok
+test parse::tests::track_credits_only_reads_the_byline_of_the_requested_video ... ok
+test parse::tests::tracks_playlist_id_comes_from_the_top_songs_shelf ... ok
+test parse::tests::trailing_year_skips_textless_runs_instead_of_abandoning_the_scan ... ok
+test parse::tests::type_badges_are_recognized ... ok
+test parse::tests::unlinked_artist_drops_the_badge_and_duration ... ok
+test parse::tests::malformed_input_parses_to_nothing_without_panicking ... ok
+test client::tests::only_a_403_is_retried ... ok
+test client::tests::playlist_pagination_bounds_a_run_of_fruitless_pages ... ok
+test client::tests::a_rejected_visitor_is_rotated_and_the_request_retried ... ok
+test client::tests::playlist_pagination_follows_a_page_whose_rows_were_all_filtered ... ok
+test client::tests::playlist_pagination_follows_continuations_up_to_the_limit ... ok
+test client::tests::playlist_pagination_stops_at_the_page_without_a_continuation ... ok
+test client::tests::playlist_pagination_stops_when_a_filtered_page_does_not_advance ... ok
+test client::tests::playlist_pagination_truncates_at_the_limit ... ok
+test client::tests::playlist_pagination_stops_when_a_page_carries_no_items ... ok
+test identity::tests::a_banned_id_does_not_hide_the_others ... ok
+test identity::tests::a_banned_id_is_never_handed_back ... ok
+test client::tests::the_request_carries_the_context_object_and_innertube_headers ... ok
+test identity::tests::a_poisoned_pool_is_recovered_rather_than_repainted_as_a_panic ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests\fixtures.rs (target\debug\deps\fixtures-2fe973160cc0b472.exe)
+
+running 15 tests
+test track_credits_splits_artists_from_the_album ... ok
+test track_credits_refuses_a_video_the_response_does_not_contain ... ok
+test search_artists_rejects_non_artist_rows ... ok
+test search_artists_parses_ids_names_avatars_and_subscribers ... ok
+test search_albums_parses_year_and_type ... ok
+test search_albums_rejects_non_album_rows ... ok
+test search_albums_keeps_an_unlinked_byline ... ok
+test search_tracks_falls_back_to_the_subtitle_for_unlinked_artists ... ok
+test search_tracks_parses_ids_titles_durations_and_covers ... ok
+test album_page_attributes_every_track_to_the_album ... ok
+test album_page_parses_header_and_full_track_list ... ok
+test search_tracks_drops_ugc_and_video_rows ... ok
+test playlist_page_parses_name_tracks_and_continuation ... ok
+test artist_page_extracts_the_show_all_songs_playlist_id ... ok
+test artist_page_parses_header_songs_and_albums ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+   Doc-tests rift
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rift_desktop
+
+running 10 tests
+test crates\rift-desktop\src\screens\menu\mod.rs - screens::menu (line 19) ... ignored
+test crates\rift-desktop\src\screens\menu\mod.rs - screens::menu (line 28) ... ignored
+test crates\rift-desktop\src\screens\menu\mod.rs - screens::menu (line 35) ... ignored
+test crates\rift-desktop\src\ui\id.rs - ui::id (line 8) ... ignored
+test crates\rift-desktop\src\ui\layout.rs - ui::layout::Row (line 287) ... ignored
+test crates\rift-desktop\src\ui\mod.rs - ui (line 6) ... ignored
+test crates\rift-desktop\src\ui\mod.rs - ui::CursorShape (line 87) ... ignored
+test crates\rift-desktop\src\ui\paint.rs - ui::paint (line 7) ... ignored
+test crates\rift-desktop\src\ui\popup.rs - ui::popup (line 9) ... ignored
+test crates\rift-desktop\src\ui\text_input.rs - ui::text_input (line 9) ... ignored
+
+test result: ok. 0 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rift_types
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests rift_ytmusic
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+PASS: cargo test (34.6s)
+
+=== cargo test -p rift-desktop --no-default-features ===
+   Compiling rift-types v0.5.0 (<repo>\crates\rift-types)
+   Compiling rift-desktop v0.5.0 (<repo>\crates\rift-desktop)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.18s
+     Running unittests src\lib.rs (target\debug\deps\rift_desktop-6bbc9ea6f04b7c9e.exe)
+
+running 303 tests
+test controller::tests::an_unknown_toggle_like_id_reports_an_error_instead_of_guessing ... ok
+test controller::tests::a_rejected_playlist_name_is_toasted_instead_of_silently_dropped ... ok
+test controller::tests::clearing_the_search_box_cancels_the_in_flight_search ... ok
+test controller::tests::a_failed_page_reports_an_error_and_retry_works ... ok
+test controller::tests::a_duplicate_navigation_to_the_loading_page_does_not_refetch ... ok
+test controller::tests::a_failed_cover_is_not_requested_again ... ok
+test controller::tests::artist_and_album_tabs_are_lazily_fetched_once_per_search ... ok
+test controller::tests::a_page_reply_for_an_abandoned_view_is_dropped ... ok
+test controller::tests::a_track_cache_insert_updates_metadata_in_place ... ok
+test controller::tests::a_decoded_cover_is_emitted_and_a_later_request_may_refetch ... ok
+test controller::tests::a_yt_playlist_import_navigates_and_toasts_like_the_old_ui ... ok
+test controller::tests::cover_requests_are_deduplicated_while_in_flight ... ok
+test controller::tests::bootstrap_seeds_the_mirrors_and_runs_the_launch_update_check ... ok
+test controller::tests::a_failed_async_playback_is_reported_as_an_error ... ok
+test controller::tests::dispatch_maps_downloads_and_resolves_ids_through_the_track_cache ... ok
+test controller::tests::dispatch_keeps_ui_local_actions_off_the_backend ... ok
+test controller::tests::dispatch_maps_library_and_playlist_commands ... ok
+test controller::tests::dispatch_maps_playback_and_queue_commands ... ok
+test controller::tests::dispatch_maps_settings_update_and_ytdlp_commands ... ok
+test controller::tests::dispatch_maps_transport_and_volume_to_the_backend ... ok
+test controller::tests::fallible_commands_surface_their_error_on_the_next_poll ... ok
+test controller::tests::navigating_to_a_page_requests_it_at_the_current_generation ... ok
+test controller::tests::open_current_artist_resolves_the_playing_tracks_first_linkable_artist ... ok
+test controller::tests::preview_mode_fails_cover_requests_immediately ... ok
+test controller::tests::reachability_changes_emit_online_only_on_transitions ... ok
+test controller::tests::retry_page_reissues_the_last_page_request ... ok
+test controller::tests::search_results_for_a_superseded_query_are_dropped ... ok
+test controller::tests::the_reachability_probe_runs_on_the_interval_and_reports_transitions ... ok
+test cover::tests::a_failed_url_is_not_retried ... ok
+test cover::tests::the_tracker_starts_and_ends_one_fetch_per_url ... ok
+test gfx::paint::tests::intersect_and_contains ... ok
+test gfx::paint::tests::rect_split_helpers_respect_bounds ... ok
+test cover::tests::undecodable_bytes_are_an_error_not_a_panic ... ok
+test gfx::paint::tests::prims_go_into_the_last_layer ... ok
+test cover::tests::a_small_cover_is_not_upscaled_and_keeps_its_alpha ... ok
+test cover::tests::remembered_failures_are_bounded ... ok
+test screens::cards::buttons::tests::mix_interpolates_colors ... ok
+test screens::cards::card::tests::card_height_matches_the_reference ... ok
+test cover::tests::a_wide_panorama_keeps_at_least_one_pixel_per_edge ... ok
+test screens::cards::tests::line_boxes_match_segoe_ui_metrics ... ok
+test screens::cards::card::tests::grid_metrics_matches_the_reference_library ... ok
+test screens::cards::track_row::tests::artist_link_hover_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::cards::textures::tests::generated_textures_have_the_right_shape ... ok
+test screens::chrome::overlays::tests::banner_text_matches_the_old_component ... ok
+test screens::chrome::player_bar::tests::controls_block_is_centred ... ok
+test cover::tests::a_portrait_cover_is_capped_on_its_height ... ok
+test screens::chrome::sidebar::tests::drag_visual_index_identity_and_edges ... ok
+test screens::chrome::sidebar::tests::drag_visual_index_previews_the_post_drop_order ... ok
+test cover::tests::the_longest_edge_is_capped_at_the_maximum ... ok
+test screens::chrome::sidebar::tests::inline_editor_buttons_do_not_overlap ... ok
+test screens::chrome::sidebar::tests::inline_editor_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::chrome::sidebar::tests::moved_order_matches_the_backend_remove_then_insert ... ok
+test screens::artist::tests::loading_artist_is_just_the_empty_state ... ok
+test screens::artist::tests::artist_songs_head_is_151_with_catalogue ... ok
+test screens::chrome::sidebar::tests::playing_playlist_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::album::tests::loading_album_is_just_the_empty_state ... ok
+test screens::album::tests::album_height_is_page_head_plus_rows ... ok
+test screens::chrome::sidebar::tests::sidebar_drag_preview_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::cards::track_row::tests::artist_credit_click_reports_the_credit_not_play ... ok
+test screens::chrome::player_bar::tests::player_bar_artist_name_links_to_the_profile ... ok
+test screens::cards::track_row::tests::nested_row_controls_win_over_the_row ... ok
+test screens::chrome::sidebar::tests::held_drag_paints_rows_in_the_post_drop_order ... ok
+test screens::chrome::sidebar::tests::playing_liked_songs_replaces_heart_with_equalizer ... ok
+test gfx::tests::offscreen_scene_renders_expected_pixels ... ok
+test gfx::tests::png_screenshot_helper_writes_readable_png ... ok
+test gfx::tests::updated_texture_replaces_pixels ... ok
+test gfx::tests::empty_paint_list_renders_clear_colour_only ... ok
+test gfx::tests::multi_frame_runtime_texture_lifecycle ... ok
+test screens::chrome::sidebar::tests::playing_playlist_replaces_music_note_with_equalizer ... ok
+test screens::chrome::sidebar::tests::post_drop_committed_order_prevents_snap_back ... ok
+test screens::artist::tests::artist_page_height_sections ... ok
+test screens::chrome::sidebar::tests::sidebar_alt_arrows_ignored_while_committed_hold_active ... ok
+test screens::chrome::sidebar::tests::sidebar_drift_click_releases_in_place_and_navigates ... ok
+test screens::chrome::sidebar::tests::spring_slot_is_stable_under_large_dt ... ok
+test screens::chrome::sidebar::tests::spring_slot_overshoots_slightly_and_settles_quickly ... ok
+test screens::chrome::sidebar::tests::spring_slot_zero_or_non_finite_dt_is_a_noop ... ok
+test screens::chrome::titlebar::tests::titlebar_geometry_matches_the_reference ... ok
+test screens::home::tests::recent_is_capped_at_twelve_rows ... ok
+test gfx::tests::stress_10k_prims_many_clips_and_atlas_growth ... ok
+test screens::liked::tests::empty_liked_has_only_the_head_plus_empty_state ... ok
+test screens::chrome::sidebar::tests::sidebar_focus_loss_cancels_a_held_drag ... ok
+test screens::liked::tests::liked_height_adds_one_row_per_track ... ok
+test screens::menu::tests::entry_helpers_keep_the_action ... ok
+test screens::menu::tests::backdrop_pin_does_nothing_when_no_menu_is_open ... ok
+test screens::menu::tests::item_builders_set_state ... ok
+test screens::chrome::sidebar::tests::sidebar_hover_cursors_are_pointer_and_resize ... ok
+test screens::menu::tests::disabled_menu_rows_keep_the_arrow ... ok
+test screens::chrome::sidebar::tests::sidebar_import_from_file_emits_the_native_picker_action ... ok
+test screens::menu::tests::escape_closes_the_menu_without_emitting ... ok
+test screens::menu::tests::submenu_visible_rows_cap_at_200px ... ok
+test screens::overlays::tests::banner_places_buttons_with_gaps_and_caps_at_480 ... ok
+test screens::overlays::tests::banner_sits_18_from_the_right_and_110_above_the_bottom ... ok
+test screens::overlays::tests::toast_is_padding_plus_text_and_caps_at_420 ... ok
+test screens::menu::tests::one_item_click_pushes_exactly_one_action ... ok
+test screens::overlays::tests::toast_sits_110_above_the_window_bottom ... ok
+test screens::overlays::tests::toast_paints_a_card_at_the_bottom_left ... ok
+test screens::pages::tests::album_subtitle_has_type_and_year ... ok
+test screens::chrome::sidebar::tests::sidebar_import_inline_buttons_are_separate ... ok
+test screens::pages::tests::collection_head_height_is_meta_plus_actions ... ok
+test screens::pages::tests::empty_state_is_113_tall ... ok
+test screens::pages::tests::artist_page_paints_the_album_and_single_grids ... ok
+test screens::menu::tests::open_menu_backdrop_keeps_the_arrow_while_rows_show_the_hand ... ok
+test screens::chrome::sidebar::tests::sidebar_import_playlist_escape_cancels ... ok
+test screens::pages::tests::subscribers_format_compacts ... ok
+test screens::overlays::tests::update_banner_paints_when_a_newer_release_exists ... ok
+test screens::playlist::tests::header_menu_is_rename_then_delete ... ok
+test screens::menu::tests::opening_and_closing_tracks_state ... ok
+test screens::pages::tests::grid_height_matches_the_reference_library ... ok
+test screens::chrome::sidebar::tests::sidebar_import_playlist_url_flow ... ok
+test screens::menu::tests::outside_press_closes_and_consumes_the_frame ... ok
+test screens::playlist::tests::playlist_height_adds_rows ... ok
+test screens::playlist::tests::missing_playlist_is_just_the_empty_state ... ok
+test screens::pages::tests::search_artist_and_album_tabs_paint_grid_covers ... ok
+test screens::queue::tests::clear_button_emits_queue_clear ... ok
+test screens::queue::tests::collapse_flag_toggles ... ok
+test screens::playlist::tests::rename_input_enter_submits_and_escape_cancels ... ok
+test screens::chrome::sidebar::tests::sidebar_new_playlist_inline_buttons_are_separate ... ok
+test screens::queue::tests::collapsed_panel_paints_the_header_only ... ok
+test screens::playlist::tests::header_kebab_opens_rename_and_delete_menu ... ok
+test screens::chrome::sidebar::tests::sidebar_new_playlist_inline_input_creates ... ok
+test screens::queue::tests::cursors_are_pointer_on_hover_and_grabbing_only_while_dragging ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_alt_arrows_reorder ... ok
+test screens::queue::tests::dragging_row_zero_over_row_two_emits_queue_move ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_drag_cursor_is_grabbing_only_while_held ... ok
+test screens::search::tests::busy_search_shows_an_empty_state_even_with_stale_songs ... ok
+test screens::queue::tests::expanded_panel_paints_one_cover_per_queue_row ... ok
+test screens::pages::tests::every_page_paints_a_non_empty_frame ... ok
+test screens::search::tests::empty_search_height_is_head_tabs_and_empty_state ... ok
+test screens::settings::tests::control_sizes_match_the_css ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_drag_reorders ... ok
+test screens::queue::tests::focus_loss_and_release_in_one_frame_cannot_drop ... ok
+test screens::search::tests::tab_pills_emit_set_search_tab ... ok
+test screens::search::tests::songs_tab_height_tracks_the_result_count ... ok
+test screens::settings::tests::check_again_and_check_now_emit_their_actions ... ok
+test screens::settings::tests::crossfade_row_grows_when_enabled ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_kebab_menu_exports ... ok
+test screens::settings::tests::discord_switch_emits_set_discord_rpc ... ok
+test screens::queue::tests::focus_loss_cancels_a_retained_drag ... ok
+test screens::settings::tests::crossfade_slider_emits_set_crossfade ... ok
+test screens::settings::tests::ytdlp_status_visual_png ... ignored, renders a PNG with the real GPU; run with --ignored for visual inspection
+test screens::settings::tests::long_ytdlp_path_moves_to_its_own_line ... ok
+test screens::settings::tests::long_not_found_detail_wraps_below_the_badge ... ok
+test screens::tests::queue_is_hidden_on_settings_and_when_empty ... ok
+test screens::settings::tests::missing_ytdlp_offers_download ... ok
+test screens::settings::tests::overwide_ytdlp_path_wraps_inside_the_chip ... ok
+test screens::track_list::tests::blocked_by_other_playlist_ignores_the_collection_itself ... ok
+test screens::track_list::tests::collection_meta_counts_songs_and_total_duration ... ok
+test screens::track_list::tests::current_collection_needs_a_source_and_a_loaded_track ... ok
+test screens::track_list::tests::download_head_button_state_machine ... ok
+test screens::chrome::sidebar::tests::sidebar_playlist_plain_click_still_navigates ... ok
+test screens::track_list::tests::head_actions_total_height ... ok
+test screens::settings::tests::row_heights_are_padding_plus_content ... ok
+test screens::settings::tests::update_available_offers_a_download_link ... ok
+test screens::settings::tests::ytdlp_row_height_accounts_for_a_wrapped_path ... ok
+test screens::queue::tests::header_click_toggles_collapse ... ok
+test screens::track_list::tests::list_height_is_54_per_row ... ok
+test screens::track_list::tests::track_menu_matches_the_old_order ... ok
+test single_instance::tests::the_instance_name_names_the_app_and_is_stable ... ok
+test single_instance::tests::the_named_mutex_admits_one_holder_and_releases_on_drop ... ok
+test single_instance::tests::the_public_guard_is_exclusive_within_a_process ... ok
+test state::tests::fmt_time_formats ... ok
+test state::tests::play_collection_toggles_the_current_collection ... ok
+test state::tests::repeat_cycles ... ok
+test state::tests::shuffled_start_never_returns_len ... ok
+test state::tests::toast_expiry ... ok
+test text::atlas::tests::allocate_does_not_overlap ... ok
+test text::atlas::tests::dirty_region_is_a_union ... ok
+test text::atlas::tests::shelves_wrap_and_request_growth ... ok
+test text::atlas::tests::uv_is_normalized ... ok
+test screens::tests::home_preview_paints_the_reference_geometry ... ok
+test screens::tests::main_content_reserves_the_scrollbar_gutter ... ok
+test screens::tests::reference_layout_bands ... ok
+test screens::track_list::tests::artist_credit_click_navigates_to_the_profile ... ok
+test screens::chrome::sidebar::tests::sidebar_settling_rows_do_not_navigate_until_settled ... ok
+test screens::queue::tests::panel_heights_come_from_the_theme ... ok
+test text::tests::atlas_produces_upload_once_and_uvs_are_sane ... ok
+test text::tests::ellipsize_empty_when_no_room ... ok
+test text::tests::ellipsize_borrows_when_it_fits ... ok
+test text::tests::ellipsize_truncates_and_fits ... ok
+test text::tests::empty_text_has_line_height ... ok
+test text::tests::every_ui_icon_codepoint_exists_in_both_icon_fonts ... ok
+test text::tests::explicit_line_height_uses_css_half_leading_baseline ... ok
+test screens::track_list::tests::head_download_pill_emits_download_and_remove ... ok
+test text::tests::hidpi_icons_keep_their_logical_box ... ok
+test screens::track_list::tests::head_play_pill_emits_play_tracks_or_toggle ... ok
+test screens::queue::tests::remove_x_emits_queue_remove ... ok
+test screens::queue::tests::row_and_cover_sizes_match_the_css ... ok
+test text::tests::hidpi_rasterizes_glyph_bitmaps_at_physical_size_but_quads_stay_logical ... ok
+test text::tests::icon_quad_is_centered_ink_size ... ok
+test text::tests::line_height_is_font_default_and_overridable ... ok
+test text::tests::measure_does_not_rasterize_and_layout_caches ... ok
+test text::tests::measure_is_stable_across_scale_factors ... ok
+test text::tests::measure_matches_layout_size ... ok
+test text::tests::newlines_stack_lines ... ok
+test ui::clipboard::tests::memory_clipboard_roundtrips_and_shares_state ... ok
+test ui::clipboard::tests::native_clipboard_roundtrips_when_available ... ok
+test text::tests::prewarm_fills_atlas_once ... ok
+test text::tests::scale_changes_cache_but_not_logical_width ... ok
+test text::tests::weighted_faces_load_and_measure_differently ... ok
+test text::tests::wrap_breaks_a_word_longer_than_the_line ... ok
+test screens::queue::tests::row_click_emits_queue_jump ... ok
+test text::tests::wrap_gap_is_only_the_whitespace_between_words ... ok
+test text::tests::wrap_does_not_double_count_the_line_prefix ... ok
+test text::tests::wrap_and_ellipsize_are_robust_for_random_unicode_and_widths ... ok
+test text::tests::wrap_honours_explicit_newlines_and_max_width ... ok
+test text::tests::wrap_splits_at_words_within_width ... ok
+test text::tests::wrap_text_inserts_newlines ... ok
+test ui::clipboard::tests::ui_pastes_from_and_copies_to_the_real_os_clipboard ... ok
+test ui::clipboard::tests::ui_tolerates_an_unavailable_native_clipboard ... ok
+test ui::fuzz::deferred_content_paints_once_and_disappears ... ok
+test ui::gallery::render_image_texture_png ... ignored, requires a Vulkan device; run manually for visual QA
+test ui::gallery::render_widget_gallery_png ... ignored, requires a Vulkan device; run manually for visual QA
+test ui::icons::tests::all_codepoints_has_no_duplicates_within_font ... ok
+test ui::icons::tests::all_is_complete_for_required_names ... ok
+test ui::icons::tests::codepoints_are_in_private_use_area ... ok
+test ui::id::tests::children_do_not_collide_for_neighbours ... ok
+test ui::id::tests::string_ids_are_stable_and_distinct ... ok
+test ui::id::tests::with_is_sensitive_to_key_type_and_value ... ok
+test ui::input::tests::end_frame_consumes_focus_lost ... ok
+test ui::input::tests::focus_lost_defaults_to_false ... ok
+test ui::layout::tests::align_centers_size ... ok
+test ui::layout::tests::column_cursor_clamps_to_bounds ... ok
+test ui::layout::tests::inset_pad_uses_each_edge ... ok
+test ui::layout::tests::row_cursor_respects_gaps_and_remaining ... ok
+test ui::layout::tests::splitting_columns_accounts_for_gaps ... ok
+test ui::layout::tests::vec2_math ... ok
+test ui::fuzz::injected_clipboard_takes_precedence_over_the_native_backend ... ok
+test screens::queue::tests::shrinking_queue_clears_a_stale_drag_index ... ok
+test ui::tests::button_styles_use_theme_tokens ... ok
+test ui::fuzz::open_popup_cannot_leak_to_another_screen ... ok
+test ui::fuzz::text_input_caret_and_edit_bounds_are_safe ... ok
+test ui::fuzz::text_input_enter_submits_and_escape_cancels_and_blurs ... ok
+test ui::fuzz::random_resizes_and_scale_changes_keep_paint_valid ... ok
+test ui::fuzz::text_input_selection_shift_home_end_and_ctrl_a_replace ... ok
+test ui::fuzz::text_input_long_text_keeps_editing_inside_the_field ... ok
+test ui::fuzz::text_input_without_clipboard_copies_are_no_ops ... ok
+test ui::gallery::gallery_builds_a_non_empty_paint_list ... ok
+test ui::tests::button_click_requires_press_and_release_inside ... ok
+test ui::tests::button_release_outside_does_not_click ... ok
+test ui::tests::clickable_hover_requests_the_pointer_cursor ... ok
+test ui::tests::clicking_a_focusable_widget_focuses_it_without_visible_ring ... ok
+test ui::tests::clips_become_layers_and_preserve_order ... ok
+test ui::fuzz::text_input_clipboard_works_with_injected_clipboard ... ok
+test ui::tests::cover_widget_uses_fallback_glyph_without_texture ... ok
+test ui::tests::cursor_resets_to_default_on_every_frame ... ok
+test ui::tests::deferred_content_paints_after_base_content ... ok
+test ui::tests::dropped_textures_survive_into_the_next_frame ... ok
+test ui::tests::empty_rects_and_transparent_colors_are_skipped ... ok
+test ui::tests::end_frame_without_begin_frame_is_tolerated_and_flushes_uploads ... ok
+test ui::tests::escape_closes_an_open_popup ... ok
+test ui::tests::fill_emits_one_rect_prim_with_theme_clear ... ok
+test ui::tests::focus_loss_clears_the_active_latch_so_the_next_click_works ... ok
+test ui::tests::focused_text_input_accepts_typed_characters ... ok
+test ui::tests::glyph_uvs_point_at_the_font_atlas ... ok
+test ui::tests::icons_emit_image_prims ... ok
+test ui::fuzz::random_input_sequences_never_break_ui_invariants ... ok
+test ui::tests::id_derivation_is_stable_across_frames ... ok
+test ui::tests::in_frame_texture_upload_appears_exactly_once ... ok
+test ui::tests::nested_clips_intersect ... ok
+test ui::tests::open_popup_blocks_interaction_underneath_next_frame ... ok
+test ui::tests::popup_draws_deferred_and_click_outside_closes_it ... ok
+test ui::tests::explicit_cursor_requests_win_over_the_automatic_pointer ... ok
+test ui::tests::scroll_offsets_are_retained_and_resettable ... ok
+test ui::tests::scroll_content_rect_is_offset_and_stable_gutter_reserves_width ... ok
+test ui::tests::hover_only_and_disabled_widgets_keep_the_default_cursor ... ok
+test ui::tests::tab_focus_cycles_through_widgets_in_paint_order ... ok
+test screens::track_list::tests::each_track_menu_entry_emits_its_action ... ok
+test ui::tests::text_emits_one_image_prim_per_nonspace_glyph ... ok
+test ui::tests::text_input_escape_cancels_and_blurs ... ok
+test ui::tests::text_input_backspace_and_enter ... ok
+test ui::tests::inter_frame_texture_upload_reaches_the_next_paint_list ... ok
+test ui::tests::texture_lifecycle_is_forwarded_to_the_paint_list ... ok
+test ui::tests::the_font_atlas_is_uploaded_once_as_texture_one ... ok
+test ui::tests::toast_is_queued_drawn_and_expires ... ok
+test ui::tests::tooltip_appears_after_hover_delay ... ok
+test ui::tests::wheel_scrolls_the_hovered_container ... ok
+test ui::tests_polish::slider_track_color_matches_the_browser_default ... ok
+test ui::tests::widgets_outside_clip_do_not_hover ... ok
+test ui::tests::wheel_does_not_scroll_when_pointer_is_outside ... ok
+test window_state::tests::a_failed_save_is_swallowed ... ok
+test window_state::tests::clamps_unusable_geometry ... ok
+test window_state::tests::falls_back_to_the_first_window_object_for_another_label ... ok
+test window_state::tests::loads_the_existing_legacy_plugin_document ... ok
+test window_state::tests::missing_file_is_not_an_error ... ok
+test window_state::tests::save_creates_the_directory_and_leaves_no_scratch ... ok
+test ui::tests_polish::clicking_a_menu_item_activates_it ... ok
+test window_state::tests::save_then_load_round_trips ... ok
+test window_state::tests::the_default_geometry_matches_the_old_window ... ok
+test window_state::tests::save_writes_the_plugin_schema ... ok
+test ui::tests_polish::a_new_toast_replaces_the_previous_one ... ok
+test screens::track_list::tests::heart_click_emits_toggle_like_without_playing ... ok
+test ui::tests_polish::disabled_button_does_not_click ... ok
+test ui::tests_polish::disabled_switch_does_not_toggle ... ok
+test ui::tests_polish::dynamic_scroll_uses_previous_content_height ... ok
+test ui::tests::text_is_ellipsized_to_the_rect ... ok
+test ui::tests_polish::focus_ring_inset_draws_inside_the_rect ... ok
+test ui::tests_polish::escape_closes_menu_and_returns_focus_to_trigger ... ok
+test ui::tests_polish::menu_focuses_first_item_and_arrow_keys_move ... ok
+test ui::tests_polish::slider_thumb_stays_inside_the_track ... ok
+test ui::tests_polish::menu_item_submenu_draws_a_caret ... ok
+test ui::tests_polish::style_helpers_still_match_theme_tokens ... ok
+test ui::tests_polish::sticky_toast_does_not_expire ... ok
+test screens::track_list::tests::kebab_click_opens_the_track_menu ... ok
+
+test result: ok. 296 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 14.91s
+
+     Running unittests src\main.rs (target\debug\deps\rift_music-5fd7cfd47471722e.exe)
+
+running 1 test
+test tests::apply_focus_lost_releases_state_without_a_synthetic_release_edge ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\live_backend.rs (target\debug\deps\live_backend-45ce3ba2f82f61c6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\ui_flow.rs (target\debug\deps\ui_flow-8fe27af713980b54.exe)
+
+running 10 tests
+test boot_frame_paints_the_window_bands ... ok
+test player_bar_clicks_reach_the_backend_bridge ... ok
+test keyboard_shortcuts_work_without_text_focus ... ok
+test queue_panel_collapses_clears_and_jumps ... ok
+test context_menu_opens_closes_and_dispatches_an_action ... ok
+test settings_toggles_sliders_and_probes_map_to_commands ... ok
+test sidebar_rows_navigate ... ok
+test text_editing_handles_backspace_and_enter_submit ... ok
+test titlebar_search_types_submits_and_clears ... ok
+test window_controls_emit_window_commands ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.24s
+
+   Doc-tests rift_desktop
+
+running 10 tests
+test crates\rift-desktop\src\screens\menu\mod.rs - screens::menu (line 19) ... ignored
+test crates\rift-desktop\src\screens\menu\mod.rs - screens::menu (line 28) ... ignored
+test crates\rift-desktop\src\screens\menu\mod.rs - screens::menu (line 35) ... ignored
+test crates\rift-desktop\src\ui\id.rs - ui::id (line 8) ... ignored
+test crates\rift-desktop\src\ui\layout.rs - ui::layout::Row (line 287) ... ignored
+test crates\rift-desktop\src\ui\mod.rs - ui (line 6) ... ignored
+test crates\rift-desktop\src\ui\mod.rs - ui::CursorShape (line 87) ... ignored
+test crates\rift-desktop\src\ui\paint.rs - ui::paint (line 7) ... ignored
+test crates\rift-desktop\src\ui\popup.rs - ui::popup (line 9) ... ignored
+test crates\rift-desktop\src\ui\text_input.rs - ui::text_input (line 9) ... ignored
+
+test result: ok. 0 passed; 0 failed; 10 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+PASS: cargo test -p rift-desktop --no-default-features (26.7s)
+
+=== release build (-p rift-desktop --features backend) ===
+   Compiling rift-types v0.5.0 (<repo>\crates\rift-types)
+   Compiling rift-ytmusic v0.5.0 (<repo>\crates\rift-ytmusic)
+   Compiling rift v0.5.0 (<repo>\crates\rift)
+   Compiling rift-desktop v0.5.0 (<repo>\crates\rift-desktop)
+    Finished `release` profile [optimized] target(s) in 1m 30s
+binary: <repo>\target\release\rift-music.exe (18,417,152 bytes / 17.6 MiB)
+PASS: release build (-p rift-desktop --features backend) (90.1s)
+
+=== preview mode is stripped from the release build ===
+Error: --preview is a development-only option and is not available in release builds
+PASS: preview mode is stripped from the release build (0s)
+
+=== offscreen release screenshot ===
+   Compiling rift-desktop v0.5.0 (<repo>\crates\rift-desktop)
+    Finished `release` profile [optimized] target(s) in 1m 30s
+--- ci-home.stdout.log ---
+2026-10-19T21:28:50.240003Z  INFO rift_music: rift-desktop starting: Args { preview: true, screenshot: Some("<repo>\\artifacts\\screens\\ci-home.png"), size: (1160, 740), view: Some("home"), pointer: None, scale: 1.0 }
+2026-10-19T21:28:50.379236Z  INFO rift_desktop::gfx::gpu: Vulkan renderer initialised device=AMD Radeon RX 7800 XT device_type=DiscreteGpu api=1.3.281 queue_family=0
+2026-10-19T21:28:50.396309Z  INFO rift_desktop::gfx::pipeline: quad pipeline ready format=R8G8B8A8_SRGB
+2026-10-19T21:28:50.436822Z DEBUG rift_desktop::gfx::texture: texture sync created=4 updated=0 dropped=0 uploaded=4 upload_ids=[1, 1000000, 1000001, 1000002] dropped_ids=[] live=0
+2026-10-19T21:28:50.510794Z  INFO rift_music: wrote 1160x740 screenshot (scale 1) to <repo>\artifacts\screens\ci-home.png
+--- ci-home.stderr.log ---
+screenshot: <repo>\artifacts\screens\ci-home.png (117989 bytes)
+   Compiling rift-desktop v0.5.0 (<repo>\crates\rift-desktop)
+    Finished `release` profile [optimized] target(s) in 1m 16s
+restored shipped release build (preview feature disabled)
+PASS: offscreen release screenshot (167.1s)
+
+=== screenshot vs reference (metrics only) ===
+reference : <repo>\docs\vulkan-migration\reference-old-ui.png
+candidate : <repo>\artifacts\screens\ci-home.png
+size      : 1160x740
+mean |dc| : 2.14 (0 = identical)
+max  |dc| : 234
+pixels >16: 2.97%
+artifacts : artifacts/compare\ci-home_side_by_side.png, artifacts/compare\ci-home_diff.png, artifacts/compare\ci-home_overlay.png
+PASS: screenshot vs reference (metrics only) (0.2s)
+
+=== no legacy webview crates in the app dependency tree ===
+cargo tree -p rift-desktop: no legacy webview crates
+PASS: no legacy webview crates in the app dependency tree (0.2s)
+
+=== no legacy webview/WASM manifests in the workspace ===
+scanned 5 workspace Cargo.toml file(s): clean
+PASS: no legacy webview/WASM manifests in the workspace (0s)
+
+=== duplicate dependency baseline ===
+No new duplicate versions on MINGW64_NT-10.0-26300: bitflags getrandom hashbrown miniz_oxide syn windows windows-sys windows-targets windows_x86_64_msvc
+PASS: duplicate dependency baseline (0.6s)
+
+SKIP: supply-chain checks (cargo-deny not installed; cargo install --locked cargo-deny to enable)
+
+================ SUMMARY ================
+PASS    toolchain consistency                                     0.8s
+PASS    cargo fmt --all -- --check                                0.4s
+PASS    cargo clippy (-D warnings)                                2.7s
+PASS    cargo doc -p rift -p rift-types -p rift-ytmusic           1.5s
+PASS    cargo test                                               34.6s
+PASS    cargo test -p rift-desktop --no-default-features         26.7s
+PASS    release build (-p rift-desktop --features backend)       90.1s
+PASS    preview mode is stripped from the release build           0.0s
+PASS    offscreen release screenshot                            167.1s
+PASS    screenshot vs reference (metrics only)                    0.2s
+PASS    no legacy webview crates in the app dependency tree       0.2s
+PASS    no legacy webview/WASM manifests in the workspace         0.0s
+PASS    duplicate dependency baseline                             0.6s
+SKIP    cargo deny check (skipped)                                0.0s  cargo-deny not installed
+=========================================
+GATE: PASSED
+log: <repo>\artifacts\ci-local-20261019-172442.log

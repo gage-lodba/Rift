@@ -220,7 +220,7 @@ Two consequences for a client:
 
 - **Do not key a song on the video id alone.** Rift's likes, recently played,
   playlist duplicate check and credit backfill compare songs through
-  `Track::same_song` (`types/src/lib.rs`), and the UI asks a `SongIndex` built
+  `Track::same_song` (`crates/rift-types/src/lib.rs`), and the UI asks a `SongIndex` built
   from the liked list, so the heart agrees with the library whichever surface
   rendered the row. The rule uses the title plus whichever of compatible
   credits, known durations (a couple of seconds apart is one recording) and

@@ -12,35 +12,39 @@
 # repo has no lever".
 #
 # The regression this exists for: Rift used to ship `reqwest` 0.12 *and* 0.13 in
-# one binary — two TLS stacks. That is gone (the direct `reqwest` is 0.13,
-# matching what Tauri pulls in), and the lists below are the state *after* that
-# fix, so any of them coming back fails the build.
+# one binary — two TLS stacks. That is gone, and the lists below are the state of
+# the native app's graph, so any of them coming back fails the build.
 #
 # ## The baseline is per host
 #
 # `cargo tree` filters by the host target unless told otherwise, so the
 # duplicated set genuinely differs per platform: the `windows-*` generation is
-# not in the graph on Linux or macOS, macOS's Cocoa/Swift crates are not in the
+# not in the graph on Linux or macOS, macOS's Cocoa/objc2 crates are not in the
 # Linux graph, and Linux's second `zbus` is not in either other graph. One
 # combined baseline would flag every platform but the one it was recorded on, for
-# reasons that are not regressions — which is exactly what happened the first
-# time this ran on CI. `baseline_shared` holds the crates duplicated on all
-# three; each host list adds its own.
+# reasons that are not regressions. The lists below were generated with
+# `cargo tree -d --locked --workspace` on each target.
 #
-# Known duplicates with no lever here, recorded rather than left to surprise
-# someone:
+# ## Known duplicates with no lever here
 #
 #   - Linux: `zbus` 3 **and** 5. `souvlaki` 0.8.3 (the newest release on
 #     crates.io) pins zbus 3 for the `use_zbus` backend the workspace selects to
-#     keep Linux pure-Rust (no libdbus); Tauri's single-instance plugin brings
-#     zbus 5. The whole zbus 3 tree is in `baseline_linux`, including `rand` 0.8
-#     beside the direct `rand` 0.10.
-#   - Linux: `heck` 0.4 (glib-macros 0.18, from the GTK bindings) beside heck
-#     0.5.
-#   - macOS: `base64` 0.21 (swift-rs via tauri-utils) beside 0.22, and the
-#     core-foundation / core-graphics families split across objc2 generations.
+#     keep Linux pure-Rust (no libdbus); `rfd`'s xdg-portal backend (ashpd)
+#     brings the newer zbus. The whole zbus 3 tree is in `baseline_linux`,
+#     including `rand` 0.8 beside the direct `rand` 0.10.
+#   - Linux: `pollster` 0.3 beside the direct `pollster` 0.4 (rfd's xdg-portal
+#     stack pins the older one), and `rand` 0.8/0.9/0.10 from the same two
+#     generations.
+#   - Windows: the `windows-*` generation is split by different transitive
+#     pins; `windows-sys` appears for both 0.60/0.61/0.62-era consumers.
+#   - macOS: the objc2 / core-foundation families split across generations
+#     (winit and souvlaki pin different objc2 majors).
 #
 # To see the full picture: cargo tree -d --locked
+#
+# When the baseline legitimately needs to change (a new dependency pins an older
+# major), regenerate it for all three targets and update these lists in the same
+# commit, so the diff is reviewable rather than the guard silently widening.
 #
 # Run this where `cargo` is on PATH and the workspace resolves. Invoking it from
 # PowerShell on Windows resolves `bash` to WSL's, which has no cargo, and a
@@ -48,64 +52,48 @@
 # to exit silently (see the capture below).
 set -euo pipefail
 
-# Duplicated on every host.
-baseline_shared=$(cat <<'EOF'
+# Windows-only: Microsoft's windows-* generation.
+baseline_windows=$(cat <<'EOF'
 bitflags
 getrandom
 hashbrown
-http
-indexmap
 miniz_oxide
 syn
-thiserror
-thiserror-impl
-toml
-toml_datetime
-uuid
-winnow
-EOF
-)
-
-# Windows-only: Microsoft's windows-* generation, plus cpufeatures (also
-# duplicated on Linux, not on macOS).
-baseline_windows=$(cat <<'EOF'
-cpufeatures
 windows
-windows-collections
-windows-core
-windows-future
-windows-link
-windows-numerics
-windows-result
-windows-strings
 windows-sys
 windows-targets
-windows-threading
 windows_x86_64_msvc
 EOF
 )
 
-# Linux-only: the zbus 3 tree souvlaki pins (see the header), heck, plus
-# cpufeatures.
+# Linux-only: the zbus 3 tree (souvlaki) beside the newer zbus pulled by rfd's
+# xdg-portal backend, plus the usual portable-atomic/rustix families.
 baseline_linux=$(cat <<'EOF'
 async-broadcast
-async-io
-async-lock
+bitflags
 cpufeatures
 event-listener
 fastrand
 futures-lite
-heck
+getrandom
+hashbrown
 linux-raw-sys
-memoffset
+miniz_oxide
 polling
+pollster
 proc-macro-crate
 rand
+rand_chacha
 rand_core
 rustix
-serde_spanned
 socket2
+syn
+thiserror
+thiserror-impl
+toml_datetime
 toml_edit
+uuid
+winnow
 zbus
 zbus_macros
 zbus_names
@@ -115,15 +103,21 @@ zvariant_utils
 EOF
 )
 
-# macOS-only: the Cocoa/Swift families.
+# macOS-only: the Cocoa/Swift/objc2 families.
 baseline_macos=$(cat <<'EOF'
-base64
+bitflags
+block2
 core-foundation
 core-graphics
-core-graphics-types
 foreign-types
 foreign-types-shared
-png
+getrandom
+hashbrown
+miniz_oxide
+objc2
+objc2-app-kit
+objc2-foundation
+syn
 EOF
 )
 
@@ -138,7 +132,11 @@ case "$host" in
     exit 1
     ;;
 esac
-baseline=$(printf '%s\n%s\n' "$baseline_shared" "$host_baseline" | sed '/^[[:space:]]*$/d' | sort)
+baseline=$(printf '%s\n' "$host_baseline" | sed '/^[[:space:]]*$/d' | sort)
+
+# `--workspace` covers the four native members under `crates/`; the legacy web
+# frontend member is gone, so there is nothing to exclude any more.
+tree_args=(tree -d --locked --workspace)
 
 # "<crate> <version>" per distinct version, skipping the repeated
 # feature-split nodes.
@@ -151,9 +149,9 @@ baseline=$(printf '%s\n%s\n' "$baseline_shared" "$host_baseline" | sed '/^[[:spa
 # ran. Failing without saying why is the shape this whole script exists to catch,
 # so the invocation is captured and checked first.
 status=0
-tree_output=$(cargo tree -d --locked) || status=$?
+tree_output=$(cargo "${tree_args[@]}") || status=$?
 if [ "$status" -ne 0 ]; then
-  echo "::error::'cargo tree -d --locked' failed (exit $status). This guard needs cargo on PATH and a"
+  echo "::error::'cargo ${tree_args[*]}' failed (exit $status). This guard needs cargo on PATH and a"
   echo "::error::resolvable workspace; run it from the repository root with that toolchain's shell."
   echo "::error::On Windows that means Git Bash, not WSL's bash — WSL has no cargo. Nothing about the"
   echo "::error::dependency graph was checked."
@@ -196,7 +194,7 @@ if [ -n "$new_duplicates" ]; then
   echo "baseline in this script with a note saying which dependency pins the"
   echo "older major."
   echo
-  cargo tree -d --locked
+  cargo "${tree_args[@]}"
   exit 1
 fi
 

@@ -1,0 +1,61 @@
+[package]
+name = "rift-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# Never published to crates.io (the app ships as a binary); marking it private
+# also lets cargo-deny accept the unversioned path dependencies below (deny.toml).
+publish = false
+description = "An ad-free YouTube Music player, rendered directly with Vulkan"
+
+# The executable is named `rift-music` (not `rift`) so Discord's automatic game
+# detection doesn't mistake the process for the game "RIFT". The library target
+# is `rift_desktop`, so the immediate-mode UI and renderer are unit-testable
+# without starting a window or a GPU.
+[[bin]]
+name = "rift-music"
+path = "src/main.rs"
+
+[lib]
+name = "rift_desktop"
+path = "src/lib.rs"
+
+[features]
+# The backend is a normal library dependency of the application: the default
+# build is the real app (live backend). `--no-default-features` builds the same
+# UI with an inert controller, which is useful when only the renderer or the
+# immediate-mode framework needs to be compiled/tested (it skips the audio,
+# network and platform integration stack).
+default = ["backend"]
+backend = ["dep:rift"]
+# Development-only preview/screenshot support: placeholder data, `--preview`
+# and `--screenshot`. Debug builds get it automatically; release builds get it
+# ONLY when this feature is enabled explicitly (the local acceptance gate does
+# that for its screenshot binary). The shipped release build never enables it,
+# so the placeholder data and the dev CLI are absent there. Do not add this to
+# `default`.
+preview = []
+
+[dependencies]
+anyhow = "1.0.102"
+arboard = "3"
+bytemuck = { version = "1", features = ["derive"] }
+fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+rift-types = { path = "../rift-types" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+vulkano = { version = "0.35.2", default-features = false, features = ["macros"] }
+winit = "0.30"
+# The backend bridge (enabled by default; see the `backend` feature above).
+rift = { path = "../rift", optional = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

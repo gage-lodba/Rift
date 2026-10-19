@@ -1,17 +1,18 @@
 # Rift
 
 [![CI](https://github.com/gage-lodba/Rift/actions/workflows/ci.yml/badge.svg)](https://github.com/gage-lodba/Rift/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Rust 1.88](https://img.shields.io/badge/rust-1.88-orange.svg)
 
-A minimal, ad-free desktop music player, written (almost) entirely in Rust.
+A minimal, ad-free desktop music player for YouTube Music — written entirely in
+Rust and rendered directly with **Vulkan**. No webview, no browser engine, no
+JavaScript.
 
-![Preview](Previews/image.png)
+![Rift — home screen](Previews/image.png)
 
-- **Backend:** Tauri 2, tokio, rodio (playback), rift-ytmusic (metadata), serde, tracing
-- **Frontend:** Yew (Rust → WASM), built with Trunk
+## Features
 
-No ads, no tracking, no account. Features:
-
-- Search songs, artists, and albums; browse artist pages (top songs, full
+- Search songs, artists and albums; browse artist pages (top songs, full
   discography split into albums and singles) and album pages.
 - Shuffle and repeat playback modes.
 - Like songs, build and manage playlists, and resume your session on next launch.
@@ -19,107 +20,100 @@ No ads, no tracking, no account. Features:
 - Crossfade between tracks, OS media-key / now-playing integration, and Discord
   Rich Presence.
 - Filters out music-video versions so results stay audio-only.
-- Built-in yt-dlp detection (with one-click install) and an update checker.
+- Built-in yt-dlp detection with one-click install, plus an update checker.
 
 ## Download
 
-Grab the installer for your platform from the
-[latest release](https://github.com/gage-lodba/Rift/releases/latest) — `.AppImage`,
-`.deb` or `.rpm` for Linux, `.dmg` for macOS, `.msi` or `.exe` for Windows.
-Playback needs [yt-dlp](https://github.com/yt-dlp/yt-dlp) (see below); Rift
-detects it automatically and can install it for you from **Settings** if it's
-missing.
-
-To build from source instead, read on.
+Prebuilt binaries are attached to the
+[latest GitHub release](https://github.com/gage-lodba/Rift/releases/latest):
+Windows (`rift-music-windows-x86_64.exe`), macOS (`rift-music-macos-universal`)
+and Linux (`rift-music-linux-x86_64`). The app needs a Vulkan-capable GPU driver
+and [yt-dlp](https://github.com/yt-dlp/yt-dlp) for streaming.
 
 ## Requirements
 
-Common to all platforms:
+| Platform | Requirements |
+|---|---|
+| **Windows** | Windows 10/11, an up-to-date GPU driver with Vulkan, and the [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) when building from source |
+| **macOS** | macOS 13+, an up-to-date GPU driver, and Xcode Command Line Tools when building from source |
+| **Linux** | A Vulkan driver, ALSA and the X11/Wayland/xkbcommon development headers |
 
-| Dependency | Why | Install |
-|---|---|---|
-| Rust + cargo | everything | [rustup.rs](https://rustup.rs), or `pacman -S rustup` / `winget install Rustlang.Rustup` |
-| `wasm32-unknown-unknown` target | Yew frontend | `rustup target add wasm32-unknown-unknown` |
-| [Trunk](https://trunkrs.dev) | WASM bundler | `cargo binstall trunk` (prebuilt) or `cargo install trunk` |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | stream fetching (see below) | `pacman -S yt-dlp` / `winget install yt-dlp.yt-dlp`, or one-click from **Settings** |
+Also required: **Rust 1.88** (pinned by [`rust-toolchain.toml`](rust-toolchain.toml))
+and **yt-dlp** (`winget install yt-dlp.yt-dlp`, `brew install yt-dlp`,
+`pacman -S yt-dlp`, or install it from **Settings → yt-dlp** inside the app).
 
-Linux (Arch shown; use your distro's equivalents):
+Linux build dependencies:
 
-| Dependency | Why | Install |
-|---|---|---|
-| webkit2gtk-4.1 | Tauri webview | `pacman -S webkit2gtk-4.1` |
-| ALSA | audio output | preinstalled on most systems |
-
-Windows:
-
-| Dependency | Why | Install |
-|---|---|---|
-| Visual Studio C++ Build Tools | MSVC linker for Rust | `winget install Microsoft.VisualStudio.2022.BuildTools` (select the "Desktop development with C++" workload) |
-| WebView2 runtime | Tauri webview | preinstalled on Windows 10/11 |
-
-Audio output on Windows uses WASAPI directly — nothing extra to install.
+```sh
+sudo apt install libasound2-dev libvulkan-dev libxkbcommon-dev libwayland-dev \
+  libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+```
 
 ## Build & run
 
-The frontend must be built first: the Tauri backend embeds `./dist` at compile time,
-so `cargo run` picks up whatever the last `trunk build` produced.
-
 ```sh
-# 1. build the frontend (outputs to ./dist)
-cd ui && trunk build --release && cd ..
-
-# 2. run the app
-cd src-tauri && cargo run --release
+git clone https://github.com/gage-lodba/Rift.git
+cd Rift
+cargo run -p rift-desktop              # debug build, live backend
+cargo build --release -p rift-desktop  # release binary: target/release/rift-music
 ```
 
-The same commands work on Windows in PowerShell 7 or `cmd` (Windows
-PowerShell 5 doesn't support `&&` — run the commands one at a time there).
-
-For a distributable bundle, install `tauri-cli` (`cargo install tauri-cli`) and run
-`cargo tauri build`.
-
-## How streaming works (and why yt-dlp is needed)
-
-Rift resolves its audio through [yt-dlp](https://github.com/yt-dlp/yt-dlp):
-the subprocess fetches the m4a, which Rift reads back into memory and decodes
-with rodio. yt-dlp is actively maintained against YouTube's changes and owns
-the signature/`n` deobfuscation and proof-of-origin token handling that a
-pure-Rust client would otherwise have to chase continuously — there is no
-pure-Rust PO-token path to depend on today. The reasoning, with the evidence,
-is written up in [`docs/innertube-research.md`](docs/innertube-research.md).
-
-Search, metadata, artist/album pages, and playlist import are handled in Rust
-by `crates/ytmusic` (`rift-ytmusic`), a clean-room client for the anonymous
-YouTube Music innertube API. Everything else — UI, queue, playback, library —
-also stays in Rust.
-
-You can verify the streaming pipeline from the command line:
+## Development
 
 ```sh
-cd src-tauri && cargo run --example probe -- your search terms
+cargo test -p rift -p rift-types -p rift-ytmusic -p rift-desktop
+cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-desktop --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-The metadata client has its own parser tests against recorded responses:
+The full local acceptance gate (formatting, lints, docs, both feature
+configurations, release build, offscreen screenshot comparison, dependency guards)
+runs on Windows:
+
+```powershell
+pwsh tools/ci-local.ps1
+```
+
+For UI work without real data, development builds support deterministic preview
+mode (placeholder library, no backend, no network). Preview and screenshot
+support is dev-only and is not compiled into shipped release binaries:
 
 ```sh
-cargo test -p rift-ytmusic
+cargo run -p rift-desktop -- --preview --screenshot artifacts/screens/home.png --size 1160x740 --view home
+RIFT_PREVIEW=1 cargo run -p rift-desktop
 ```
 
-## Data
+## Architecture
 
-Your library (liked songs, playlists, recently played) is stored as JSON in
-`~/.local/share/dev.jerimiah.rift/library.json` on Linux, or
-`%APPDATA%\dev.jerimiah.rift\library.json` on Windows. Logs follow `RUST_LOG`
-(default `rift=debug,rift_music=debug`).
+One `cargo build`, one binary. Everything is plain Rust:
 
-## Discord Rich Presence
+| Path | Crate | What it is |
+|---|---|---|
+| [`crates/rift-desktop/`](crates/rift-desktop/) | `rift-desktop` | **The application.** `winit` window, `vulkano` renderer and a hand-written immediate-mode GUI (layout, text/font atlas, widgets, screens). Owns the event loop, window and controller. |
+| [`crates/rift/`](crates/rift/) | `rift` | **Native backend library.** Audio thread (rodio), playback queue and crossfade, persisted library, offline downloads, settings, yt-dlp resolution and install, OS media keys / now-playing, Discord Rich Presence and the YouTube Music client wiring. |
+| [`crates/rift-ytmusic/`](crates/rift-ytmusic/) | `rift-ytmusic` | Clean-room client for the anonymous YouTube Music innertube API (search, artist/album/playlist pages, stream metadata). |
+| [`crates/rift-types/`](crates/rift-types/) | `rift-types` | Shared data models (`Track`, `Library`, `QueueSnapshot`, …). |
 
-Rift advertises the currently playing track as a "Listening to Rift" status on
-Discord. This uses a Discord application ID baked into the build. **Forks** need
-their own Discord application: create one at the
-[Discord Developer Portal](https://discord.com/developers/applications), then
-replace `APP_ID` in `src-tauri/src/discord.rs` with your application's ID.
+The immediate-mode UI repaints every frame from application state: no retained
+widget tree and no IPC boundary. The app drains backend events once per frame and
+calls backend commands directly.
+
+## Documentation
+
+Developer documentation lives in [`docs/vulkan-migration/README.md`](docs/vulkan-migration/README.md):
+
+- [`architecture.md`](docs/vulkan-migration/architecture.md) — module ownership, render model, paint/UI contracts, windowing.
+- [`backend-api.md`](docs/vulkan-migration/backend-api.md) — backend construction, command/event APIs, data directories.
+- [`imgui-api.md`](docs/vulkan-migration/imgui-api.md) and [`ui-spec.md`](docs/vulkan-migration/ui-spec.md) — immediate-mode GUI API and the screen-by-screen visual spec.
+- [`vulkano-recipe.md`](docs/vulkan-migration/vulkano-recipe.md) — practical Vulkano 0.35 renderer notes.
+
+## Contributing
+
+Issues and pull requests are welcome. Please run `pwsh tools/ci-local.ps1`
+(or the equivalent `cargo` steps above) before opening a PR; all new code must
+pass `cargo fmt`, clippy with `-D warnings`, and the test suites.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+[Apache-2.0](LICENSE). Rift is an independent project and is not affiliated with
+YouTube or Google.

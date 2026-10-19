@@ -1,7 +1,7 @@
 # Pins the Rust toolchain for local builds, CI, and release.
 #
 # Without this, `dtolnay/rust-toolchain@stable` follows whatever `stable` is that
-# week, so CI and the released installers could be built by different compilers
+# week, so CI and the released binaries could be built by different compilers
 # from the same commit. `rustup` honours this file automatically, so a plain
 # `cargo build` in this repo also gets the pinned version.
 #
@@ -17,7 +17,11 @@
 #
 # Keep in step with the `toolchain:` input in .github/workflows/*.yml and with
 # `rust-version` in Cargo.toml.
+#
+# No extra targets are listed: the app is a native binary built for the host
+# toolchain. (The legacy webview's `wasm32-unknown-unknown` target went away with
+# that frontend; the release workflow installs the two macOS targets it needs for
+# its universal binary explicitly.)
 [toolchain]
 channel = "1.88.0"
 components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]

@@ -1,0 +1,61 @@
+[package]
+name = "rift"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Never published to crates.io (the app ships as a binary); marking it private
+# also lets cargo-deny accept the unversioned path dependencies below (deny.toml).
+publish = false
+description = "An ad-free YouTube Music player — native, framework-agnostic backend library"
+
+# The backend is a plain library: it owns audio, playback, the library store,
+# downloads, settings, the ytmusic client, OS media integration and Discord Rich
+# Presence, and exposes them through `RiftBackend` plus a channel-based event
+# bus. The desktop application (`rift-desktop`, in `crates/rift-desktop/`) is the
+# only binary and owns winit/Vulkano and the UI.
+[lib]
+name = "rift"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+directories = "6"
+discord-rich-presence = "1.1.0"
+rand = "0.10.1"
+reqwest = "0.13"
+rift-types = { path = "../rift-types" }
+rift-ytmusic = { path = "../rift-ytmusic" }
+rodio = "0.22.2"
+serde.workspace = true
+serde_json.workspace = true
+# OS media-key / now-playing integration: MPRIS (Linux), SMTC (Windows),
+# MPNowPlayingInfoCenter (macOS). use_zbus keeps the Linux backend pure-Rust
+# (no libdbus); the dbus/zbus deps are Linux-gated inside souvlaki, so this is
+# harmless on Windows/macOS.
+souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
+tracing = "0.1.44"
+
+# Native file dialogs for playlist import/export. `rfd` replaces the old
+# shell's dialog plugin. Dialogs are only opened on the backend's blocking pool
+# (never on the UI thread), so the synchronous API is what we use.
+#
+# The feature split matters: the portal/GTK backends are Linux-only in rfd, and
+# leaving the default `async-std` + `xdg-portal` features on would drag a portal
+# stack into every platform. On Linux, rfd needs exactly one backend, so it gets
+# `xdg-portal` there; Windows/macOS always use their native backends.
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "0.16", default-features = false }
+
+[dev-dependencies]
+# Used by `examples/probe.rs` to show the fetch pipeline's log output; the app
+# crate owns the real subscriber.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[lints]
+workspace = true

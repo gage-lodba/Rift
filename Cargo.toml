@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["types", "ui", "src-tauri", "crates/ytmusic"]
+members = ["crates/rift-types", "crates/rift-ytmusic", "crates/rift", "crates/rift-desktop"]
 
 [workspace.package]
 version = "0.5.0"
@@ -8,15 +8,15 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["Gage Lodba"]
 repository = "https://github.com/gage-lodba/Rift"
-# The real floor of the resolved graph, not a guess: the highest `rust-version`
-# declared by anything Cargo.lock pins is 1.88 (`time`, `plist`, `darling`,
-# `icu_*`), with `rodio` 1.87 and `reqwest` 1.85 just behind. Verified by
-# building, testing, and linting the workspace on 1.88.0.
+# The real floor of the resolved graph, not a guess. It was 1.88 for the old
+# webview/frontend graph; after the native Vulkan rewrite the workspace still
+# pins 1.88 and CI/local gates build at exactly 1.88.0 (`rust-toolchain.toml`),
+# not at `stable`, so the floor is exercised on every run.
 #
 # Keeping it true is the point of two other things, not this comment: every CI
-# job builds at 1.88.0 rather than at `stable`, so the floor is exercised on each
-# run, and `.github/scripts/check-toolchain-consistency.sh` fails if this value,
-# the rust-toolchain.toml channel, and the workflow pins ever disagree.
+# job builds at 1.88.0 rather than at `stable`, and
+# `.github/scripts/check-toolchain-consistency.sh` fails if this value, the
+# rust-toolchain.toml channel, and the workflow pins ever disagree.
 #
 # Declaring it also makes clippy refuse to suggest APIs newer than the floor, so
 # a lint cannot "fix" something into breaking the oldest toolchain we support.
@@ -26,6 +26,37 @@ rust-version = "1.88"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Shared lint policy. Members opt in with `[lints] workspace = true`.
+#
+# `unsafe_op_in_unsafe_fn` becomes the 2024-edition default; declaring it now
+# keeps any future `unsafe fn` explicit. `unused_must_use` is deny (the CI gate
+# already treats warnings as errors, this documents the intent).
+#
+# The clippy lints here are the "would be a bug" class rather than style:
+# every `unsafe` block needs a `// SAFETY:` note, and debug/todo leftovers must
+# not ship.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [profile.release]
 lto = true
 codegen-units = 1
+# Strip the symbol table from the shipped executable. `strip = "symbols"` drops
+# DWARF/debug symbol names from the linked binary while keeping the unwind tables
+# needed for `RUST_BACKTRACE=1`; it shrinks the release artifact (~18.5 MB before
+# this) and the object files in the build cache are untouched.
+strip = "symbols"
+# `panic = "abort"` is deliberately NOT set. Unwinding is what lets a panic in
+# one thread be caught with `catch_unwind` instead of killing the whole process,
+# and it is what makes a `RUST_BACKTRACE=1` report from a user's crash useful.
+# For a GUI app, a failing audio/network/UI thread should be diagnosable, not
+# silently fatal to every open window ("abort" would skip the unwinding path
+# entirely, so both of those properties are lost). The size cost of unwinding is
+# negligible next to LTO + symbol stripping.
