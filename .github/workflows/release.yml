@@ -59,7 +59,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The tag names the artifacts and is what `check_update` compares against
       # the running version, so a tag that disagrees with the workspace version
@@ -108,7 +108,7 @@ jobs:
           toolchain: 1.88.0
           targets: ${{ matrix.rust-targets }}
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Keep per-platform (and per-target) caches separate.
           key: ${{ matrix.platform }}-${{ matrix.target }}
