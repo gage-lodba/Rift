@@ -27,7 +27,7 @@ rand = "0.10.1"
 reqwest = "0.13"
 rift-types = { path = "../rift-types" }
 rift-ytmusic = { path = "../rift-ytmusic" }
-rodio = "0.22.2"
+rodio = "0.23.0"
 serde.workspace = true
 serde_json.workspace = true
 # OS media-key / now-playing integration: MPRIS (Linux), SMTC (Windows),
