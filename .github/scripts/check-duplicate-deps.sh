@@ -38,6 +38,9 @@
 #   - Linux: `pollster` 0.3 beside the direct `pollster` 0.4 (rfd's xdg-portal
 #     stack pins the older one), and `rand` 0.8/0.9/0.10 from the same two
 #     generations.
+#   - All hosts: `base64` 0.22 (hyper-util) beside 0.23 (reqwest 0.13.5's
+#     response decoding); both are internal wire encoders and no types cross the
+#     boundary.
 #   - Windows: the `windows-*` generation is split by different transitive
 #     pins; `windows-sys` appears for both 0.60/0.61/0.62-era consumers.
 #   - macOS: the objc2 / core-foundation families split across generations
@@ -57,6 +60,7 @@ set -euo pipefail
 
 # Windows-only: Microsoft's windows-* generation.
 baseline_windows=$(cat <<'EOF'
+base64
 bitflags
 getrandom
 hashbrown
@@ -73,6 +77,7 @@ EOF
 # xdg-portal backend, plus the usual portable-atomic/rustix families.
 baseline_linux=$(cat <<'EOF'
 async-broadcast
+base64
 bitflags
 cpufeatures
 event-listener
@@ -109,6 +114,7 @@ EOF
 
 # macOS-only: the Cocoa/Swift/objc2 families.
 baseline_macos=$(cat <<'EOF'
+base64
 bitflags
 block2
 core-foundation

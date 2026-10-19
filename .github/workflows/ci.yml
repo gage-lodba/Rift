@@ -19,7 +19,7 @@ jobs:
     name: toolchain version is consistent
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # `rust-version` in Cargo.toml, the channel in rust-toolchain.toml, and the
       # `toolchain:` inputs below all state the same version, and they are not
       # redundant — see the script's header. Fails if they disagree, so the
@@ -43,7 +43,7 @@ jobs:
       # is mutable, so `@v5` is a moving target that can be repointed at
       # arbitrary code without this file changing. Dependabot understands the
       # comment form and will keep the SHAs current.
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
           # The declared MSRV. Every job builds at the floor on purpose: that is
@@ -67,7 +67,7 @@ jobs:
         # dylibs for proc-macros. macos-15 is the known-good released image.
         os: [ubuntu-22.04, macos-15, windows-latest]
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Native build dependencies. The app is winit + Vulkano + rodio:
       #   * ALSA (rodio/cpal) is the only hard link dependency on Linux;
@@ -102,7 +102,7 @@ jobs:
           toolchain: 1.88.0
           components: clippy
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # Explicit package list rather than `--workspace`: it documents exactly the
       # crates the native application is built from (the workspace members are
@@ -181,7 +181,7 @@ jobs:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # SHA-pinned like every other action here; `v2` in the comment is what
       # Dependabot tracks. The action is a Docker image with cargo-deny 0.20.x
       # baked in — there is no separate Rust-install step, and the version is

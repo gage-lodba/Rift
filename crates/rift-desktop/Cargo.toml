@@ -43,7 +43,7 @@ arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
 fontdue = "0.9"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-pollster = "0.4"
+pollster = "1.0"
 raw-window-handle = "0.6"
 rift-types = { path = "../rift-types" }
 serde_json = "1"
