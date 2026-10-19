@@ -11,7 +11,7 @@
 //! | `invoke("set_volume", json!({ "volume": v }))` | `backend.set_volume(v)` |
 //!
 //! Each area lives in its own submodule; the methods attach to the same type,
-//! so no re-exports are needed. See `docs/vulkan-migration/backend-api.md` for
+//! so no re-exports are needed. See `docs/backend-api.md` for
 //! the full signature table.
 
 mod bootstrap;

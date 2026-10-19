@@ -11,7 +11,7 @@
 #   4. cargo test -p rift                    (backend unit/integration tests)
 #   5. cargo test -p rift-desktop            (state/controller logic tests)
 #   6. cargo run -p rift-desktop -- --preview --screenshot ... for every view
-#   7. python tools/compare_images.py docs/vulkan-migration/reference-old-ui.png artifacts/screens/home.png
+#   7. python tools/compare_images.py tools/reference-old-ui.png artifacts/screens/home.png
 #
 # Exits non-zero on the first failing step (except the screenshot comparisons,
 # which report only).
@@ -55,10 +55,10 @@ if (-not $SkipScreens) {
             cargo run -q -p rift-desktop -- --preview --screenshot "$out/$view.png" --size 1160x740 --view $view
         }
     }
-    if (Test-Path "docs/vulkan-migration/reference-old-ui.png") {
+    if (Test-Path "tools/reference-old-ui.png") {
         Write-Host ""
         Write-Host "===== compare home against the archived old-UI reference =====" -ForegroundColor Cyan
-        python tools/compare_images.py docs/vulkan-migration/reference-old-ui.png "$out/home.png" --label home || $true
+        python tools/compare_images.py tools/reference-old-ui.png "$out/home.png" --label home || $true
     }
 }
 

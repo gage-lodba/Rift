@@ -4,8 +4,8 @@
 //! layout constants/style helpers and re-exports every public item, so
 //! `screens::cards::*` call sites are unchanged.
 //!
-//! Every number here comes from `docs/vulkan-migration/ui-spec.md` (measured off
-//! the archived old-UI capture `docs/vulkan-migration/reference-old-ui.png` and
+//! Every number here comes from `docs/ui-spec.md` (measured off
+//! the archived old-UI capture `tools/reference-old-ui.png` and
 //! the removed `ui/styles.css`). The immediate-mode API is `crate::ui`: paint +
 //! hit-test in one call, state in the `Ui` context keyed by [`Id`].
 //!

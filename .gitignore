@@ -26,8 +26,6 @@ target-*
 # Runtime logs (a redirected launch keeps these open for as long as the app runs,
 # so they can't be deleted while testing)
 *.log
-# The committed acceptance log is evidence, not runtime noise.
-!docs/vulkan-migration/evidence/final-gate.log
 
 # Python tooling caches
 __pycache__/

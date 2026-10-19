@@ -21,7 +21,7 @@
 //! matter where in the frame they were declared.
 //!
 //! The full widget/API reference for screen authors is
-//! `docs/vulkan-migration/imgui-api.md`.
+//! `docs/imgui-api.md`.
 
 pub mod clipboard;
 #[cfg(test)]

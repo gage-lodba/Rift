@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     // A second instance exits immediately: the old build used a shell-level
     // single-instance plugin to focus the running window; the native app just
     // refuses to start a rival audio thread/GPU context (documented in
-    // docs/vulkan-migration/native-platform.md).
+    // docs/native-platform.md).
     let _single_instance = match single_instance::acquire() {
         Some(guard) => guard,
         None => {

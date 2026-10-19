@@ -1,22 +1,20 @@
 # Backend API — `rift` crate (native backend library)
 
-Status: **published contract for the app crate** (M4 of the migration plan in
-[`architecture.md`](architecture.md)). This crate is the old backend crate
-extracted from the previous desktop shell. It is a framework-agnostic
-**library**: no window, no webview, no IPC, no winit, no Vulkano. The desktop
-app (`crates/rift-desktop/`, package `rift-desktop`) owns those and drives this
+Status: **published contract for the app crate** (see
+[`architecture.md`](architecture.md)). It is a framework-agnostic **library**:
+no window, no webview, no IPC, no winit, no Vulkano. The desktop app
+(`crates/rift-desktop/`, package `rift-desktop`) owns those and drives this
 crate through:
 
 1. one constructor, `RiftBackend::new`,
 2. one event channel of `BackendEvent` values, drained per frame,
-3. legacy IPC commands as plain methods on `BackendHandle`
+3. backend commands as plain methods on `BackendHandle`
    (reachable directly on `RiftBackend` through `Deref`).
 
-Verified state: `cargo check -p rift` clean, `cargo test -p rift` **179 passed /
-0 failed** (includes the unchanged player, library, downloads, settings, util,
-sha256 and fetch suites plus new glue tests), `cargo clippy -p rift --all-targets`
-clean, `cargo tree -p rift` has no desktop-shell framework crates, `examples/probe.rs`
-compiles. A complete `grep`-able mapping of the old command names is at the end.
+The crate builds with `cargo check -p rift`; its test suites cover the player,
+library, downloads, settings, util, sha256 and fetch paths; `cargo tree -p rift`
+has no desktop-shell framework crates; `examples/probe.rs` compiles. A complete
+`grep`-able mapping of the old command names is at the end.
 
 ---
 

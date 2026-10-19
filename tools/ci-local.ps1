@@ -26,7 +26,7 @@
          compiled into release without the explicit `preview` feature)
       7. offscreen acceptance screenshot at 1160x740 from an acceptance-only
          release build with the explicit `preview` feature, compared against
-         `docs/vulkan-migration/reference-old-ui.png` (comparison reports metrics
+         `tools/reference-old-ui.png` (comparison reports metrics
          only — a visual delta does not fail the gate)
       8. legacy-dependency guard: `cargo tree -p rift-desktop` has no webview
          shell/frontend crates, and no workspace Cargo.toml declares one
@@ -431,7 +431,7 @@ if ($SkipRelease) {
         Write-Log "restored shipped release build (preview feature disabled)"
     }
 
-    $reference = Join-Path $root "docs/vulkan-migration/reference-old-ui.png"
+    $reference = Join-Path $root "tools/reference-old-ui.png"
     if (-not $script:python) {
         Write-Log ""
         Write-Log "SKIP: screenshot vs reference (no Python with Pillow+numpy found; set RIFT_PYTHON)" Yellow

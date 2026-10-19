@@ -22,7 +22,7 @@
 //!
 //! The authoritative reference — constructor, every method signature, error and
 //! blocking notes, the event payloads, the data-directory layout and the
-//! command-mapping table — is `docs/vulkan-migration/backend-api.md` in the
+//! command-mapping table — is `docs/backend-api.md` in the
 //! repository. Read it before wiring the app crate.
 //!
 //! # Example
@@ -64,7 +64,7 @@
 // dependencies (rodio, souvlaki, discord-rich-presence), not in this crate.
 #![forbid(unsafe_code)]
 // This crate is consumed by the desktop app and documented as the contract in
-// `docs/vulkan-migration/backend-api.md`; a new public item must be documented.
+// `docs/backend-api.md`; a new public item must be documented.
 #![warn(missing_docs)]
 
 mod audio;

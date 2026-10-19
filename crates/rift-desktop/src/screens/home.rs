@@ -1,7 +1,7 @@
 //! Home view: "Your library" cover cards + "Recently played" track list.
 //! Owned by `screens-chrome`.
 //!
-//! Reference geometry (`docs/vulkan-migration/ui-spec.md` §7.1, measured on
+//! Reference geometry (`docs/ui-spec.md` §7.1, measured on
 //! `Previews/image.png`): h2 line box at the content top, 4-across card grid of
 //! 178 px cards (18 px gap), 26 px below the grid the second heading, then the
 //! 12 recently played rows (54 px each). All of it scrolls inside `main`; this

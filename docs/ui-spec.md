@@ -4,7 +4,7 @@
 the hand-written immediate-mode UI in `crates/rift-desktop/`. It is distilled from
 the legacy webview UI — its stylesheet (all numbers), app shell (state machine /
 layout composition) and component tree (every screen) — and cross-checked
-pixel-by-pixel against the acceptance screenshot `docs/vulkan-migration/reference-old-ui.png` (1160x740).
+pixel-by-pixel against the acceptance screenshot `../tools/reference-old-ui.png` (1160x740).
 
 **Audience:** every screen implementer (`screens-chrome`, `screens-pages`), plus
 the Lead for `theme.rs`/`state.rs` integration. Where this file and the old CSS
@@ -15,11 +15,11 @@ CSS is normative for every other window size / responsive rule.
 tree. Where this document cites `ui/styles.css`, `ui/src/**` or `ui/logo.svg`, it
 is naming that legacy source, kept as the provenance for the measured numbers
 (available in git history); the files themselves no longer exist. The archived
-reference screenshot is `docs/vulkan-migration/reference-old-ui.png`, and the
+reference screenshot is `../tools/reference-old-ui.png`, and the
 logo source/texture live in `crates/rift-desktop/assets/logo/`.
 
 Measured numbers below were taken with a Python/Pillow column-row scanner over
-`docs/vulkan-migration/reference-old-ui.png`. The screenshot was captured in a WebView with ClearType
+`../tools/reference-old-ui.png`. The screenshot was captured in a WebView with ClearType
 subpixel antialiasing, so individual glyph edge pixels have red/blue fringes;
 measurements therefore use the *ink bounding box* (first/last non-background
 row/column), which is ±1 px. The native renderer draws grayscale-antialiased
@@ -39,7 +39,7 @@ the acceptance target, not literal glyph pixels.**
 * **§10** maps the legacy app state machine onto the native state model.
 * **§11** lists the `Action` vocabulary screens emit (proposal for Lead).
 * **§12** ASCII layout diagrams with pixel measurements.
-* **§13** region-by-region description of `docs/vulkan-migration/reference-old-ui.png` (the only screen
+* **§13** region-by-region description of `../tools/reference-old-ui.png` (the only screen
   the reference shows; it is Home + expanded queue + hovered recent row).
 * **§14** acceptance checklist.
 * **§15** known discrepancies / requests for other owners.
@@ -60,7 +60,7 @@ Window: **1160 × 740 logical px** (legacy window config: 1160x740, min 940x620,
 `decorations: false`, resizable, centered). `scale_factor = 1.0` for the
 reference shot.
 
-The three horizontal bands, measured from `docs/vulkan-migration/reference-old-ui.png`:
+The three horizontal bands, measured from `../tools/reference-old-ui.png`:
 
 | Band | y (incl) | height | color |
 |---|---|---|---|
@@ -1238,7 +1238,7 @@ Titlebar (46 px):
 
 ---
 
-## 13. `docs/vulkan-migration/reference-old-ui.png` region by region (acceptance target)
+## 13. `../tools/reference-old-ui.png` region by region (acceptance target)
 
 Image is exactly 1160×740, sRGB, no window chrome (decorations off), dark theme.
 Captured with RIFT_PREVIEW=1, sidebar width 335, mouse hovering the first
@@ -1318,7 +1318,7 @@ hover-revealed kebab/download icons in the image are the only pointer evidence.
 ## 14. Acceptance checklist (M5)
 
 `cargo run -p rift-desktop -- --preview --screenshot target/preview.png --size 1160x740`
-then compare to `docs/vulkan-migration/reference-old-ui.png`:
+then compare to `../tools/reference-old-ui.png`:
 
 - [ ] Band edges exactly y=45/46 (titlebar border), y=420/421 (queue border),
       y=655/656 (player border); player 84 px; titlebar 46 px.
@@ -1358,7 +1358,7 @@ then compare to `docs/vulkan-migration/reference-old-ui.png`:
      `#1c1c20`, scrollbar thumb `#2a2a30`.
 2. **Reference sidebar width = 335.** The old app's default is 216 (CSS
    `width: 216px`, persisted `localStorage["sidebar-width"]`), but
-   `docs/vulkan-migration/reference-old-ui.png` was captured with a user-resized sidebar of 335. To pass
+   `../tools/reference-old-ui.png` was captured with a user-resized sidebar of 335. To pass
    the screenshot comparison, the preview/screenshot path should use **335**
    while the interactive default stays 216. Decision needed from Lead. (Every
    measured x in §13 is based on 335; §1.1 gives the formulas for other widths.)

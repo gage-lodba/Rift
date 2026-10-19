@@ -464,34 +464,19 @@ Feature-independent (no live backend, no network, no window):
 | `cover.rs`: 8 tests | 256 px cap (landscape/portrait/panorama), no upscale, RGBA/alpha preservation, garbage bytes → `Err`, tracker dedupe/failure/bound |
 | `backend_event_tests::every_backend_event_maps_one_to_one` (feature-gated) | all 9 backend event payloads → their `ControllerEvent`; library/current mirrors |
 
-### Verification commands and results (final tree, 2026-10-18)
+### Test commands
 
-Run from the repository root (Rust 1.88 pinned). On the final tree the app crate's
-default features include `backend` (the real app), and `--no-default-features`
-builds the inert-controller UI used by renderer/imgui-only work:
+Run from the repository root (Rust 1.88 pinned). The app crate's default
+features include ackend; --no-default-features builds the inert-controller
+UI used for renderer/immediate-mode work.
 
-```powershell
+`powershell
 cargo test -p rift-desktop
-#   lib:          297 passed; 0 failed; 7 ignored
-#   ui_flow:       10 passed; 0 failed              (§14)
-#   live_backend:   0 passed; 5 ignored (manual)    (§15)
-cargo test -p rift-desktop --lib -- controller:: cover::
-#   37 passed; 0 failed        (36 + the feature-gated backend-event mapping test)
-cargo test -p rift-desktop --no-default-features --lib -- controller:: cover::
-#   36 passed; 0 failed        (the same suite without the backend feature)
+cargo test -p rift-desktop --no-default-features
 cargo test -p rift-desktop --test live_backend -- --ignored --nocapture
-#   5 passed; 0 failed; finished in 6.21 s            (§15, needs network + yt-dlp)
-
-cargo clippy -p rift-desktop --all-targets -- -D warnings   # clean
-cargo fmt --check                                           # clean
-```
-
-`cargo test -p rift-desktop --lib -- controller:: cover::` runs the 36
-feature-independent controller/cover tests; because the default build enables
-`backend`, `backend_event_tests::every_backend_event_maps_one_to_one` adds the
-37th. The interaction suite and the live smoke suite each run in their own
-integration-test process, so they cannot race the library unit tests' static
-state. `--features backend` remains accepted but is redundant on the final tree.
+cargo clippy -p rift-desktop --all-targets -- -D warnings
+cargo fmt --check
+`
 
 ---
 
@@ -587,7 +572,7 @@ binary and the real cover pipeline. They are `#[ignore]`d because they need
 network + yt-dlp (not CI), and they are run manually:
 
 ```powershell
-# final tree: default features already include `backend`, so the flag is
+# current tree: default features already include `backend`, so the flag is
 # redundant (but accepted). `--test-threads=1` is unnecessary: the tests
 # serialise themselves on the process-global RIFT_DATA_DIR.
 cargo test -p rift-desktop --test live_backend -- --ignored --nocapture
@@ -632,48 +617,3 @@ run (untouched).
    `found=true` with the seeded path and version; `check_update()` reports the
    running version (and degrades to "latest unknown" rather than hanging if
    GitHub is unreachable).
-
-### Recorded run (final tree, 2026-10-18, `--nocapture`, condensed)
-
-```
-running 5 tests
-bootstrap in 62.6µs: data_dir=…\Temp\rift-live-smoke-bootstrap-27764-0, library=0 liked/0
-  playlists/0 recent, state=Stopped, volume=1, discord_rpc=true, preview=false
-event pump: 'Library' arrived after 66.9µs (1 events in total: ["Library"])
-idle pump: 308.2843ms for 300 ms of polling (1 events; no audio output expected)
-clean shutdown in 630.3µs
-test live_bootstrap_event_pump_and_clean_shutdown ... ok
-
-search returned a cover URL: https://yt3.googleusercontent.com/…=w120-h120-l90-rj
-cover decoded in 129.7647ms: 120x120 (57600 RGBA bytes)
-dedupe: 0 extra Cover events for the same URL (extra events: [])
-requesting the large variant to prove downscaling: …=w544-h544-l90-rj
-large cover decoded in 358.453ms: 256x256 — capped at 256: true
-dead cover URL reported CoverFailed: true
-known-failed URL re-emitted CoverFailed 1 time(s) with no new fetch
-clean shutdown in 2.6348ms
-test live_cover_fetch_decode_and_dedupe ... ok
-
-live search "daft punk get lucky" → 20 songs in 466.2412ms; shown_query="daft punk get lucky";
-  first=Some(("Get Lucky (feat. Pharrell Williams and Nile Rodgers)", "Daft Punk, Pharrell Williams, Nile Rodgers"))
-clean shutdown in 699.1µs
-test live_search_through_app_state ... ok
-
-stale-generation search: 1 SearchResults in 464.5842ms; queries=["kavinsky nightcall"]
-newest query "kavinsky nightcall" returned 20 songs (first: Some("Nightcall"))
-clean shutdown in 8.9587ms
-test live_stale_search_generation_is_filtered ... ok
-
-yt-dlp probe in 796.2734ms: found=true, path=Some("C:\\Users\\…\\bin\\yt-dlp.exe"), version=Some("2026.08.19")
-update check in 60.3126ms: current="0.5.0", latest=Some("0.4.3"), update_available=false,
-  url=Some("https://github.com/gage-lodba/Rift/releases/tag/v0.4.3")
-clean shutdown in 570.2µs
-test live_update_check_and_ytdlp_probe ... ok
-
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.21s
-```
-
-Earlier full runs on the pre-cleanup tree showed the same flows green
-(lib results in §13); the final-tree run above is the recorded acceptance
-evidence. Expected log noise: one `Dropping DeviceSink …` line per backend, which
-is rodio telling us the idle audio sink is being dropped at shutdown.

@@ -1,15 +1,13 @@
-# Native platform parity: window state + single instance
+# Platform integration: window state + single instance
 
-The previous desktop shell supplied two pieces of desktop behaviour through
-plugins. With the shell removed, the app crate owns them again as small
-dependency-free modules. The Lead wires both into
-`crates/rift-desktop/src/main.rs` / `crates/rift-desktop/src/lib.rs`; this
-document is the module contract.
+The app owns two pieces of desktop behaviour as small dependency-free modules.
+They are wired into `crates/rift-desktop/src/main.rs` / `crates/rift-desktop/src/lib.rs`;
+this document is the module contract.
 
-| Old shell plugin | Native replacement | File |
+| Feature | Native implementation | File |
 |---|---|---|
-| window-state plugin | [`window_state`](#window-state) | `crates/rift-desktop/src/window_state.rs` |
-| single-instance plugin | [`single_instance`](#single-instance) | `crates/rift-desktop/src/single_instance.rs` |
+| Window state | [`window_state`](#window-state) | `crates/rift-desktop/src/window_state.rs` |
+| Single instance | [`single_instance`](#single-instance) | `crates/rift-desktop/src/single_instance.rs` |
 
 Neither module adds a dependency: `window_state` uses `winit` (already a direct
 dependency) + `serde_json` + `tracing`; `single_instance` uses raw `kernel32`

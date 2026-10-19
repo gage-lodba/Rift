@@ -100,12 +100,11 @@ calls backend commands directly.
 
 ## Documentation
 
-Developer documentation lives in [`docs/vulkan-migration/README.md`](docs/vulkan-migration/README.md):
+Developer documentation lives in [`docs/README.md`](docs/README.md):
 
-- [`architecture.md`](docs/vulkan-migration/architecture.md) — module ownership, render model, paint/UI contracts, windowing.
-- [`backend-api.md`](docs/vulkan-migration/backend-api.md) — backend construction, command/event APIs, data directories.
-- [`imgui-api.md`](docs/vulkan-migration/imgui-api.md) and [`ui-spec.md`](docs/vulkan-migration/ui-spec.md) — immediate-mode GUI API and the screen-by-screen visual spec.
-- [`vulkano-recipe.md`](docs/vulkan-migration/vulkano-recipe.md) — practical Vulkano 0.35 renderer notes.
+- [`architecture.md`](docs/architecture.md) — module layout, render model, paint/UI contracts, windowing.
+- [`backend-api.md`](docs/backend-api.md) — backend construction, command/event APIs, data directories.
+- [`imgui-api.md`](docs/imgui-api.md) and [`ui-spec.md`](docs/ui-spec.md) — immediate-mode GUI API and the screen-by-screen visual spec.
 
 ## Contributing
 

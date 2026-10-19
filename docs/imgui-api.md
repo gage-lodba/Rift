@@ -634,7 +634,7 @@ screen needs to match them.
     validated against `styles.css` by screens-chrome's `ui-spec.md`. Message
     Lead if a token value looks wrong.
 
-## Testing and acceptance evidence
+## Testing
 
 ### Test inventory (all pure-logic unless marked GPU)
 
@@ -657,50 +657,12 @@ state):
 cargo test -p rift-desktop --lib ui::gallery -- --ignored --nocapture
 ```
 
-Final-tree test counts: **`ui::` 76 passed + 2 ignored** (the ignored ones are the
-GPU gallery tests), **`text::` 29 passed**; the whole crate is
-`cargo test -p rift-desktop --lib` = **297 passed, 0 failed, 7 ignored** + **10/10
-integration tests** (`tests/ui_flow.rs`) passed. `cargo clippy -p rift-desktop
---all-targets -- -D warnings` is clean crate-wide and the framework files are
-rustfmt-formatted.
+Run the crate tests for the current counts:
 
-### Acceptance evidence (final tree)
+```powershell
+cargo test -p rift-desktop --lib
+cargo test -p rift-desktop --test ui_flow
+```
 
-Generated on the final tree (legacy `ui/` and `dist/` removed, default `backend`
-feature, `Cargo.lock` pruned) against
-`docs/vulkan-migration/reference-old-ui.png` (the preserved old-UI reference;
-`Previews/image.png` is now the new native render) at 1160×740, scale 1.0:
-
-* **Overall reference diff: mean |Δchannel| = 2.142** over the whole frame;
-  **2.97 % of pixels (25,464 / 858,400) have any channel difference > 16**
-  (was 2.86 mean before the CSS line-box baseline fix) — remaining difference is
-  dominated by Inter-vs-Segoe glyph shapes, which ui-spec §15.3 accepts.
-* **Real-window clipboard spot check (final binary)**: PASS — external
-  `Set-Clipboard "daft punk"` → app search box Ctrl+V showed the text
-  (`target/clip-auto-1-pasted.png`), Ctrl+A/Backspace restored the placeholder
-  (`clip-auto-2-cleared.png`), re-paste worked again (`clip-auto-3-repasted.png`),
-  and app Ctrl+A/C put `daft punk` back on the OS clipboard (read back from
-  PowerShell: `COPY_CHECK=PASS`).
-* **Text ink positions: 0–1 px** vs ui-spec Appendix A for every measured label
-  (headings, card names/subs, row titles, durations, sidebar items, eyebrow
-  labels, seek times, now-playing block). Horizontal right-edge deltas (+1…+4 px
-  on long strings) are Inter's wider advances, not layout error.
-* **HiDPI**: `crates/rift-desktop/target/ui-gallery-150.png` (1740×1110 from a 1160×740 logical
-  frame at scale 1.5) shows glyphs rasterised at physical size with logical
-  quads; same layout as the 1.0 render, no blur.
-* **`ui.image` / texture path**: `crates/rift-desktop/target/ui-image-check.png` — a 64×64 RGBA
-  gradient uploaded via `ui.upload_texture` renders the light→dark gradient and
-  a red tint multiplies G/B down; the test asserts those pixels.
-* **Live cover art**: texture uploads queued between frames (controller events)
-  now reach the next `PaintList`, fixing blank cover tiles in live mode.
-* Regeneration commands:
-  `cargo run -p rift-desktop -- --preview --screenshot target/acceptance-home.png --size 1160x740`
-  and the GPU gallery test command above.
-* Known remaining reference deltas (owner): cover fallback gradient was
-  screens-side and now matches; queue-row vertical offset (~5 px, screens-chrome);
-  player seek track ±1 px and card-grid subpixel rounding (screens-chrome);
-  Material-font glyphs where the old app used custom SVG paths (ui-spec §3
-  chose the Material glyphs, e.g. `music_note`).
-
-Screens can add tests for their formatting/spec helpers next to their modules the
-same way.
+GPU gallery tests are ignored by default; run them manually with
+`cargo test -p rift-desktop --lib ui::gallery -- --ignored --nocapture`.

@@ -4,8 +4,8 @@
 //! so `screens::chrome::*` call sites (root.rs) are unchanged.
 //!
 //! Every rectangle is derived from `screens::layout`, and every visual number
-//! comes from `docs/vulkan-migration/ui-spec.md` §6 (measured off the archived
-//! old-UI capture `docs/vulkan-migration/reference-old-ui.png` at 1160×740 and
+//! comes from `docs/ui-spec.md` §6 (measured off the archived
+//! old-UI capture `tools/reference-old-ui.png` at 1160×740 and
 //! the removed `ui/styles.css`). Keep it that way: the acceptance test is a
 //! screenshot comparison.
 

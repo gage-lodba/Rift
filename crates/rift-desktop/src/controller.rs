@@ -4,7 +4,7 @@
 //! calls on this controller, and drains [`ControllerEvent`]s from it once per
 //! frame. With the `backend` cargo feature enabled the events/commands are
 //! serviced by `rift::RiftBackend` (see
-//! `docs/vulkan-migration/backend-api.md`); without it (and in preview/screenshot
+//! `docs/backend-api.md`); without it (and in preview/screenshot
 //! mode) the controller is inert, which is what lets the renderer and UI be
 //! built and tested before the port lands.
 //!
@@ -164,7 +164,7 @@ pub enum ControllerEvent {
 ///   [`ControllerEvent::Error`] (e.g. a blank playlist name, a refused URL).
 ///
 /// The parameter names mirror the backend API so the mapping table in
-/// `docs/vulkan-migration/controller-notes.md` reads 1:1.
+/// `docs/controller-notes.md` reads 1:1.
 pub trait BackendCommands: Send + Sync + 'static {
     // ------------------------------------------------------------- startup
     /// Synchronous launch snapshot (`backend.bootstrap()`).
