@@ -24,7 +24,15 @@ jobs:
       # `toolchain:` inputs below all state the same version, and they are not
       # redundant — see the script's header. Fails if they disagree, so the
       # declared minimum cannot quietly stop being what anything is built with.
+      # `shell: bash` is stated rather than inherited. The scripts carry a bash
+      # shebang and are committed executable, so Linux and macOS would run them
+      # from the default shell either way — but the Windows runner's default shell
+      # is pwsh, where a bare `.sh` path is resolved by file association rather
+      # than by the shebang. Stating the shell makes all three platforms run the
+      # script the way its header documents, and is what makes the executable bit
+      # sufficient instead of load-bearing.
       - name: Check toolchain consistency
+        shell: bash
         run: .github/scripts/check-toolchain-consistency.sh
       # The test runner refuses a wasm test binary built against a different
       # `wasm-bindgen` than its own, and `wasm-bindgen` is a transitive
@@ -32,6 +40,7 @@ jobs:
       # the frontend job because it is a comparison of two files, and belongs
       # before anything compiles.
       - name: Check wasm-bindgen version consistency
+        shell: bash
         run: .github/scripts/check-wasm-bindgen-version.sh
 
   fmt:
@@ -199,6 +208,7 @@ jobs:
       # one version split across feature sets) and compares against the
       # recorded baseline, because `cargo tree -d` exits 0 either way.
       - name: Check for duplicate dependency versions
+        shell: bash
         run: .github/scripts/check-duplicate-deps.sh
 
       # Compile the packaged artifact. Clippy already links the crate, so a
