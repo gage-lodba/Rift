@@ -32,6 +32,9 @@
 #     keep Linux pure-Rust (no libdbus); `rfd`'s xdg-portal backend (ashpd)
 #     brings the newer zbus. The whole zbus 3 tree is in `baseline_linux`,
 #     including `rand` 0.8 beside the direct `rand` 0.10.
+#   - Linux: `libloading` 0.7 through `dlib` (wayland-sys/xkbcommon-dl) beside
+#     the 0.8 generation used by ash/vulkano/x11rb; both are dlopen plumbing and
+#     no types cross the boundary.
 #   - Linux: `pollster` 0.3 beside the direct `pollster` 0.4 (rfd's xdg-portal
 #     stack pins the older one), and `rand` 0.8/0.9/0.10 from the same two
 #     generations.
@@ -77,6 +80,7 @@ fastrand
 futures-lite
 getrandom
 hashbrown
+libloading
 linux-raw-sys
 miniz_oxide
 polling
