@@ -38,79 +38,80 @@ fn meta_height(tracks: &[rift_types::Track]) -> f32 {
 
 /// Draw the album page at `area`.
 pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rect, id: &str) {
-    let Some(page) = state.album_page.as_ref().filter(|p| p.id == id).cloned() else {
+    // Move the page cache out of `State` for the frame: the cover request and
+    // the rows need `&mut State`, so borrowing `state.album_page` directly would
+    // conflict — and cloning the page (with every track) per frame would
+    // allocate on the hot path. It goes back before returning.
+    let page = state.album_page.take();
+    let Some(album) = page.as_ref().filter(|page| page.id == id) else {
+        state.album_page = page;
         pages::empty(ui, area.x, area.y, area.w, "Loading album...");
         return;
     };
     let theme = ui.theme().clone();
 
     // ---- page head: cover + centred meta ----
-    pages::album_art(ui, state, area.x, area.y, &page.cover);
+    pages::album_art(ui, state, area.x, area.y, &album.cover);
     let meta_x = area.x + pages::ALBUM_ART + pages::PAGE_HEAD_GAP;
     let meta_w = (area.w - pages::ALBUM_ART - pages::PAGE_HEAD_GAP).max(0.0);
-    let kind = match page.year {
-        Some(year) => format!("{} • {year}", page.album_type),
-        None => page.album_type.clone(),
+    let kind = match album.year {
+        Some(year) => format!("{} • {year}", album.album_type),
+        None => album.album_type.clone(),
     };
-    let meta_h = meta_height(&page.tracks);
+    let meta_h = meta_height(&album.tracks);
     let head_h = meta_h.max(pages::ALBUM_ART);
     let mut y = pages::centered_meta_y(area.y, head_h, meta_h);
 
     y = pages::page_kind(ui, meta_x, y, meta_w, &kind);
-    y = pages::page_title(ui, meta_x, y, meta_w, &page.name);
+    y = pages::page_title(ui, meta_x, y, meta_w, &album.name);
 
     // sub: artist link + " • N songs • duration"
     let sub_y = y + 6.0;
-    let total: u32 = page.tracks.iter().filter_map(|t| t.duration).sum();
+    let total: u32 = album.tracks.iter().filter_map(|t| t.duration).sum();
     let rest = format!(
         " • {} songs • {}",
-        page.tracks.len(),
+        album.tracks.len(),
         crate::state::fmt_total_duration(total)
     );
+    let artist_style = cards::style_lh(13.0, Weight::Regular, theme.text_dim, 17.0);
     let link_w;
-    if let Some(artist_id) = page.artist_id.clone() {
-        let style = cards::style_lh(13.0, Weight::Regular, theme.text_dim, 17.0);
-        link_w = ui.text_width(&page.artist, &style);
+    if let Some(artist_id) = album.artist_id.as_deref() {
+        link_w = ui.text_width(&album.artist, &artist_style);
         let rect = Rect::new(meta_x, sub_y, link_w + 4.0, 17.0);
-        let mut resp = ui.interact(rect, Id::from_str("album/artist-link"), Sense::CLICK);
+        let resp = ui.interact(rect, Id::from_str("album/artist-link"), Sense::CLICK);
         let color = if resp.hovered {
             theme.text
         } else {
             theme.text_dim
         };
-        ui.text(rect, &page.artist, &style.with_color(color));
+        ui.text(rect, &album.artist, &artist_style.with_color(color));
         if resp.hovered {
             ui.hline(rect.x, rect.y + 15.0, link_w, 1.0, theme.text);
         }
         if resp.focus_visible {
             ui.focus_ring(rect, 4.0);
         }
-        resp.clicked |= ui.keyboard_activated() && resp.focused;
         if resp.clicked {
-            actions.push(Action::OpenArtist(artist_id));
+            actions.push(Action::OpenArtist(artist_id.to_string()));
         }
     } else {
         ui.text(
             Rect::new(meta_x, sub_y, meta_w, 17.0),
-            &page.artist,
-            &cards::style_lh(13.0, Weight::Regular, theme.text_dim, 17.0),
+            &album.artist,
+            &artist_style,
         );
-        link_w = ui.text_width(
-            &page.artist,
-            &cards::style(13.0, Weight::Regular, theme.text_dim),
-        );
+        link_w = ui.text_width(&album.artist, &artist_style);
     }
     ui.text(
         Rect::new(meta_x + link_w, sub_y, (meta_w - link_w).max(0.0), 17.0),
         &rest,
-        &cards::style_lh(13.0, Weight::Regular, theme.text_dim, 17.0),
+        &artist_style,
     );
     y += pages::PAGE_SUB_H;
 
     // actions row inside the meta block
-    let tracks = page.tracks.clone();
-    if !tracks.is_empty() {
-        let source = format!("album:{}", page.id);
+    let source = format!("album:{}", album.id);
+    if !album.tracks.is_empty() {
         y = track_list::head_actions(
             ui,
             state,
@@ -118,9 +119,9 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
             track_list::HeadActions {
                 x: meta_x,
                 y,
-                tracks: &tracks,
+                tracks: &album.tracks,
                 source: Some(source.as_str()),
-                id_key: &format!("album:{}", page.id),
+                id_key: &source,
             },
         );
     }
@@ -128,8 +129,7 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
 
     // ---- track list ----
     let list_y = area.y + head_h + pages::PAGE_HEAD_MARGIN_BOTTOM;
-    if !tracks.is_empty() {
-        let source = format!("album:{}", page.id);
+    if !album.tracks.is_empty() {
         let opts = track_list::TrackListOpts {
             source: Some(source.as_str()),
             id: "album-list",
@@ -143,12 +143,13 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
                 area.x,
                 list_y,
                 area.w,
-                track_list::list_height(tracks.len()),
+                track_list::list_height(album.tracks.len()),
             ),
-            &tracks,
+            &album.tracks,
             &opts,
         );
     }
+    state.album_page = page;
 }
 
 #[cfg(test)]
@@ -176,6 +177,40 @@ mod tests {
         assert_eq!(
             height(&mut ui, &state, 766.0, "preview-album-1"),
             194.0 + n as f32 * 54.0
+        );
+    }
+
+    /// The page cache is restored after drawing (it is moved out for the frame
+    /// so the row painters can mutate `State` for cover requests).
+    #[test]
+    fn view_restores_the_album_page() {
+        let mut ui = Ui::new();
+        let viewport = Rect::new(0.0, 0.0, 1160.0, 740.0);
+        let input = crate::ui::InputState {
+            viewport,
+            mouse_pos: (0.0, 0.0),
+            mouse_in_window: true,
+            time: 1.0,
+            ..Default::default()
+        };
+        ui.begin_frame(input, viewport);
+        let mut state = State {
+            album_page: Some(preview::preview_album_page()),
+            ..State::default()
+        };
+        let mut actions = Vec::new();
+        view(
+            &mut ui,
+            &mut state,
+            &mut actions,
+            Rect::new(359.0, 66.0, 767.0, 600.0),
+            "preview-album-1",
+        );
+        let _ = ui.end_frame();
+        assert_eq!(
+            state.album_page.as_ref().map(|page| page.id.as_str()),
+            Some("preview-album-1"),
+            "album page restored"
         );
     }
 }

@@ -91,16 +91,23 @@ pub fn remove_from_queue(core: &mut PlayerCore, index: usize) -> RemoveOutcome {
             RemoveOutcome::EmitOnly
         }
         // The playing track was removed: move to whatever took its place, or
-        // stop if it was the last one. Under shuffle, `play_index` anchors the
-        // replacement in the surviving order: if it has played this cycle the
-        // cursor steps back to it (so Next replays where you came from, exactly
-        // as a direct jump does), otherwise it joins as the newest entry.
+        // stop if it was the last one. The replacement is written into `current`
+        // immediately, before the lock is released: the caller starts it through
+        // `play_index`, and a snapshot taken in between (the UI's
+        // `queue_snapshot` accessor runs on the app thread) must never see an
+        // out-of-range `current` naming the truncated queue's old last slot.
+        // Under shuffle, `play_index` then anchors the replacement in the
+        // surviving order: if it has played this cycle the cursor steps back to
+        // it (so Next replays where you came from, exactly as a direct jump
+        // does), otherwise it joins as the newest entry.
         Some(cur) if index == cur => {
             if core.queue.is_empty() {
                 core.current = None;
                 RemoveOutcome::Stop
             } else {
-                RemoveOutcome::PlayIndex(cur.min(core.queue.len() - 1))
+                let replacement = cur.min(core.queue.len() - 1);
+                core.current = Some(replacement);
+                RemoveOutcome::PlayIndex(replacement)
             }
         }
         // Removal was after the current track: its index is unchanged.
@@ -153,7 +160,12 @@ pub fn insert_next(core: &mut PlayerCore, tracks: Vec<Track>) -> AddOutcome {
     }
     let inserted = new.len();
     if let Some(cur) = core.current {
-        let at = cur + 1;
+        // `current` is a live index in every state the command layer leaves
+        // behind, but it is not re-validated against the queue here: a
+        // concurrent `play_tracks` replaces the queue and bumps `current` a
+        // moment later, so clamp the insertion point rather than panic in
+        // `splice` on an out-of-range start.
+        let at = cur.saturating_add(1).min(core.queue.len());
         core.queue.splice(at..at, new);
         // Indices past the insertion point moved, so a prefetched crossfade
         // pick would now point at the wrong track. Drop it (the crossfade

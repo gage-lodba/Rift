@@ -14,25 +14,31 @@
       1. toolchain consistency (`.github/scripts/check-toolchain-consistency.sh`
          via Git Bash; falls back to an equivalent PowerShell check and says so)
       2. `cargo fmt --all -- --check`
-      3. `cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-desktop
-         --all-targets -- -D warnings`
-      4. `cargo doc -p rift -p rift-types -p rift-ytmusic --no-deps` with
-         `RUSTDOCFLAGS=-D warnings` (the library crates enforce missing_docs)
+      3. `cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-discord
+         -p rift-desktop --all-targets -- -D warnings`
+      4. `cargo doc -p rift -p rift-types -p rift-ytmusic -p rift-discord
+         --no-deps` with `RUSTDOCFLAGS=-D warnings` (the library crates enforce
+         missing_docs)
       5. `cargo test` for those packages, plus the app in **both feature
          configurations** (default backend + `--no-default-features` UI-only)
       6. `cargo build --release -p rift-desktop --features backend` (the shipped
          configuration, + binary size) and check the shipped binary rejects the
          development-only `--preview`/`--screenshot` flags (preview data is not
          compiled into release without the explicit `preview` feature)
-      7. offscreen acceptance screenshot at 1160x740 from an acceptance-only
+      7. Windows executable file icon: `.github/scripts/check-windows-icon.ps1`
+         proves `target/release/rift-music.exe` carries the app icon as a PE
+         resource — the *file* icon Explorer/Start menu/shortcuts read, not the
+         runtime window icon. Runs on Windows only, mirroring the CI step's
+         `runner.os == 'Windows'` gate
+      8. offscreen acceptance screenshot at 1160x740 from an acceptance-only
          release build with the explicit `preview` feature, compared against
          `tools/reference-old-ui.png` (comparison reports metrics
          only — a visual delta does not fail the gate)
-      8. legacy-dependency guard: `cargo tree -p rift-desktop` has no webview
+      9. legacy-dependency guard: `cargo tree -p rift-desktop` has no webview
          shell/frontend crates, and no workspace Cargo.toml declares one
-      9. duplicate-dependency baseline (`.github/scripts/check-duplicate-deps.sh`
-         via Git Bash; skipped with a note when Git Bash is unavailable)
-      10. supply-chain checks: `cargo deny check all` (advisories, licenses,
+      10. duplicate-dependency baseline (`.github/scripts/check-duplicate-deps.sh`
+          via Git Bash; skipped with a note when Git Bash is unavailable)
+      11. supply-chain checks: `cargo deny check all` (advisories, licenses,
           bans, sources) from `deny.toml`; skipped with a note when `cargo-deny`
           is not installed
 
@@ -44,7 +50,8 @@
     Skip the `cargo test` steps (fast iteration).
 
 .PARAMETER SkipRelease
-    Skip the release build and the screenshot acceptance steps.
+    Skip the release build, the Windows executable file-icon check and the
+    screenshot acceptance steps.
 
 .PARAMETER AllowLockUpdate
     Do not pass `--locked` to cargo (use while Cargo.lock is being regenerated).
@@ -206,7 +213,7 @@ $script:lockedArgs = [string[]]@()
 if (-not $AllowLockUpdate) {
     $script:lockedArgs = [string[]]@("--locked")
 }
-$script:packages = @("-p", "rift", "-p", "rift-types", "-p", "rift-ytmusic", "-p", "rift-desktop")
+$script:packages = @("-p", "rift", "-p", "rift-types", "-p", "rift-ytmusic", "-p", "rift-discord", "-p", "rift-desktop")
 
 # A Python with Pillow + numpy is needed for the image comparison only. The
 # bundled DSH runtime has both; a stock Python usually has neither, hence the
@@ -312,16 +319,16 @@ Invoke-Step "cargo clippy (-D warnings)" {
     if ($LASTEXITCODE -ne 0) { throw "clippy reported warnings/errors above" }
 }
 
-# 3b. Documentation (library crates; rustdoc warnings are errors) ----------
-# The three reusable crates opt into `#![warn(missing_docs)]`, so a doc
+# 4. Documentation (library crates; rustdoc warnings are errors) -----------
+# The four reusable crates opt into `#![warn(missing_docs)]`, so a doc
 # regression must fail the gate rather than silently rot. rift-desktop is an
 # internal app crate and is deliberately excluded (see README conventions).
-Invoke-Step "cargo doc -p rift -p rift-types -p rift-ytmusic" {
+Invoke-Step "cargo doc -p rift -p rift-types -p rift-ytmusic -p rift-discord" {
     $locked = $script:lockedArgs
     $previous = $env:RUSTDOCFLAGS
     $env:RUSTDOCFLAGS = "-D warnings"
     try {
-        & cargo doc -p rift -p rift-types -p rift-ytmusic --no-deps @locked
+        & cargo doc -p rift -p rift-types -p rift-ytmusic -p rift-discord --no-deps @locked
         if ($LASTEXITCODE -ne 0) { throw "rustdoc warnings/errors above" }
     } finally {
         if ($null -eq $previous) {
@@ -332,7 +339,7 @@ Invoke-Step "cargo doc -p rift -p rift-types -p rift-ytmusic" {
     }
 }
 
-# 4. Tests ----------------------------------------------------------------
+# 5. Tests ----------------------------------------------------------------
 if ($SkipTests) {
     Write-Log ""
     Write-Log "SKIP: tests (-SkipTests)" Yellow
@@ -346,7 +353,7 @@ if ($SkipTests) {
     }
     # The README promises a UI-only build (`--no-default-features`) for
     # renderer/immediate-mode work; test that configuration too instead of
-    # re-running the default (backend) one, which step 4 already covers.
+    # re-running the default (backend) one, which step 5 already covers.
     Invoke-Step "cargo test -p rift-desktop --no-default-features" {
         $locked = $script:lockedArgs
         & cargo test -p rift-desktop --no-default-features @locked
@@ -354,11 +361,12 @@ if ($SkipTests) {
     }
 }
 
-# 5. Release build + 6. screenshot acceptance -----------------------------
+# 6. Release build + 7. executable icon + 8. screenshot acceptance --------
 if ($SkipRelease) {
     Write-Log ""
-    Write-Log "SKIP: release build + screenshot (-SkipRelease)" Yellow
+    Write-Log "SKIP: release build + executable icon + screenshot (-SkipRelease)" Yellow
     Add-Result -Step "release build (skipped)" -Status "SKIP" -Detail "-SkipRelease"
+    Add-Result -Step "windows executable file icon (skipped)" -Status "SKIP" -Detail "-SkipRelease"
 } else {
     $releaseBinary = Join-Path $root "target/release/rift-music.exe"
     Invoke-Step "release build (-p rift-desktop --features backend)" {
@@ -368,6 +376,29 @@ if ($SkipRelease) {
         if (-not (Test-Path -LiteralPath $releaseBinary)) { throw "release binary missing: $releaseBinary" }
         $size = (Get-Item -LiteralPath $releaseBinary).Length
         Write-Log ("binary: {0} ({1:N0} bytes / {2:N1} MiB)" -f $releaseBinary, $size, ($size / 1MB))
+    }
+
+    # 7. Windows executable file icon -------------------------------------
+    # The executable's *file* icon is a Windows PE resource (RT_GROUP_ICON plus
+    # its RT_ICON images) inside the binary: Explorer, the Start menu, shortcuts
+    # and taskbar pinning read it from the file and never start the app. It is
+    # not the runtime window icon (`window_icon()` in main.rs sets that from
+    # 128x128.png and it only affects the live window/taskbar button). CI gates
+    # this on Windows only; mirror that gate here so a non-Windows host skips
+    # instead of failing on a PE resource it never builds. It sits inside the
+    # release block because it inspects the shipped binary.
+    if ($IsWindows) {
+        $iconScript = Join-Path $root ".github/scripts/check-windows-icon.ps1"
+        Invoke-Step "windows executable file icon" {
+            & $iconScript -Path $releaseBinary
+            if ($LASTEXITCODE -ne 0) {
+                throw "the shipped executable has no Windows icon resource (see the ::error:: lines above; it is embedded by crates/rift-desktop/build.rs from assets/icons/rift.rc)"
+            }
+        }
+    } else {
+        Write-Log ""
+        Write-Log "SKIP: windows executable file icon (not a Windows host; mirrors ci.yml's runner.os gate)" Yellow
+        Add-Result -Step "windows executable file icon (skipped)" -Status "SKIP" -Detail "not Windows"
     }
 
     $screenshot = Join-Path $root "artifacts/screens/ci-home.png"
@@ -449,7 +480,7 @@ if ($SkipRelease) {
     }
 }
 
-# 7. Legacy-dependency guards ---------------------------------------------
+# 9. Legacy-dependency guards ---------------------------------------------
 # The forbidden dependency names are assembled from fragments so the retired
 # framework's brand does not appear in the project text; the guard itself stays.
 $legacyPrefix = ("tau" + "ri|y" + "ew|wasm-bindgen|wasm_bindgen")
@@ -503,7 +534,7 @@ Invoke-Step "no legacy webview/WASM manifests in the workspace" {
     Write-Log "scanned $($manifests.Count) workspace Cargo.toml file(s): clean"
 }
 
-# 8. Duplicate-dependency baseline ---------------------------------------
+# 10. Duplicate-dependency baseline --------------------------------------
 if ($script:gitBash) {
     Invoke-Step "duplicate dependency baseline" {
         & $script:gitBash .github/scripts/check-duplicate-deps.sh
@@ -515,7 +546,7 @@ if ($script:gitBash) {
     Add-Result -Step "duplicate dependency baseline" -Status "SKIP" -Detail "Git Bash not available"
 }
 
-# 9. Supply-chain checks ---------------------------------------------------
+# 11. Supply-chain checks --------------------------------------------------
 # The CI `deny` job is the contract; locally the tool is optional. When
 # `cargo-deny` is on PATH its failure is hard (the gate must not pass with a
 # known-vulnerable or license/ban/source-violating dependency). When it is not
@@ -528,8 +559,9 @@ if (-not (Get-Command cargo-deny -ErrorAction SilentlyContinue)) {
 } else {
     Invoke-Step "cargo deny check all" {
         # The policy, target/feature graph and license allow-list come from
-        # `deny.toml`; no extra flags here so CI and this gate run the same
-        # configuration.
+        # `deny.toml`. CI additionally passes `--all-features --locked`; the
+        # config already sets `all-features = true`, and the committed lockfile
+        # is what both read, so the interpreted graph is the same.
         & cargo deny check all
         if ($LASTEXITCODE -ne 0) {
             throw "cargo-deny reported a vulnerability, license, ban or source problem (see diagnostics above and deny.toml)"

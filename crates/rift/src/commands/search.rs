@@ -14,6 +14,11 @@ impl BackendHandle {
     ///
     /// Network I/O: fetch the future in a task (`backend.spawn` / the app's
     /// controller). Never call this on the UI thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"search failed: …"` when the innertube request or its parse
+    /// fails (offline, blocked, or an unexpected response shape).
     pub async fn search(&self, query: String) -> Result<Vec<Track>, String> {
         info!("searching: {query}");
         let tracks = self
@@ -27,6 +32,11 @@ impl BackendHandle {
     }
 
     /// Search for artists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"artist search failed: …"` when the innertube request or its
+    /// parse fails.
     pub async fn search_artists(&self, query: String) -> Result<Vec<ArtistSummary>, String> {
         self.inner
             .player
@@ -37,6 +47,11 @@ impl BackendHandle {
     }
 
     /// Search for albums.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"album search failed: …"` when the innertube request or its
+    /// parse fails.
     pub async fn search_albums(&self, query: String) -> Result<Vec<AlbumSummary>, String> {
         self.inner
             .player
@@ -47,6 +62,11 @@ impl BackendHandle {
     }
 
     /// Load an artist page, keeping only audio tracks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"could not load artist: …"` when the innertube request or its
+    /// parse fails.
     pub async fn get_artist(&self, id: String) -> Result<ArtistPage, String> {
         let mut page = self
             .inner
@@ -61,6 +81,13 @@ impl BackendHandle {
 
     /// Load an artist's full song catalog (the "Show all songs" view), filtered
     /// audio-only. Album attribution is backfilled in two passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"could not load artist: …"` / `"could not load songs: …"` when a
+    /// request or parse fails, and `"artist has no songs list"` when the artist
+    /// page carries no songs playlist id. The album/credits backfill passes are
+    /// best-effort and simply leave `album` unset on failure.
     pub async fn get_artist_songs(&self, id: String) -> Result<Vec<Track>, String> {
         let page = self
             .inner
@@ -149,6 +176,11 @@ impl BackendHandle {
     }
 
     /// Load an album page, keeping only audio tracks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"could not load album: …"` when the innertube request or its
+    /// parse fails.
     pub async fn get_album(&self, id: String) -> Result<AlbumPage, String> {
         let mut page = self
             .inner

@@ -8,7 +8,7 @@ use rift_types::{PlaybackState, RepeatMode};
 use tracing::{debug, warn};
 
 use crate::controller::{Controller, ControllerEvent};
-use crate::gfx::paint::PaintList;
+use crate::gfx::paint::{PaintList, TextureId};
 #[cfg(any(debug_assertions, feature = "preview", test))]
 use crate::preview;
 use crate::screens;
@@ -25,6 +25,17 @@ pub enum WindowCommand {
     Close,
     BeginResize(ResizeEdge),
 }
+
+/// Upper bound on cached cover textures.
+///
+/// A 256 px RGBA8 cover is 256 KiB of VRAM, and a long browsing session can visit
+/// thousands of distinct URLs (every album/artist card and every track row has
+/// one). `State::covers` therefore cannot grow without limit: once this many
+/// decoded covers are cached, [`App::trim_cover_textures`] evicts the oldest
+/// textures and hands them back to the renderer, and a later frame that still
+/// shows an evicted cover simply re-requests it (the controller's tracker allows
+/// a re-fetch after a success, and the UI's texture is the cache).
+const MAX_CACHED_COVERS: usize = 256;
 
 /// The whole application.
 pub struct App {
@@ -44,6 +55,25 @@ impl App {
     /// Build the app. `controller` decides whether it is a live application or
     /// preview/screenshot mode; `preview` seeds the placeholder data.
     pub fn new(preview: bool, controller: Controller) -> Self {
+        let ui_started = std::time::Instant::now();
+        let ui = Ui::new();
+        debug!(
+            "startup: ui/fonts {:.1} ms",
+            ui_started.elapsed().as_secs_f64() * 1000.0
+        );
+        Self::new_with_ui(preview, controller, ui)
+    }
+
+    /// Build the app around an already-constructed [`Ui`] context.
+    ///
+    /// The UI context's only expensive part is parsing the embedded fonts, which
+    /// is CPU-only and independent of the window and the backend. The windowed
+    /// entry point builds it on a worker thread while the main thread is inside
+    /// the Vulkan renderer construction, then hands the finished context here —
+    /// the startup path overlaps two otherwise-serial costs. Keeping the
+    /// constructor separate also means tests and the screenshot path can keep
+    /// using [`App::new`] unchanged.
+    pub fn new_with_ui(preview: bool, controller: Controller, ui: Ui) -> Self {
         let state = if preview {
             // Preview data exists only in development builds (or a build with
             // the explicit `preview` feature); the shipped release build never
@@ -61,13 +91,14 @@ impl App {
         };
         let mut app = Self {
             state,
-            ui: Ui::new(),
+            ui,
             controller,
             window_commands: Vec::new(),
             cursor_shape: CursorShape::Default,
             now: 0.0,
         };
         if app.controller.is_live() {
+            let bootstrap_started = std::time::Instant::now();
             match app.controller.bootstrap() {
                 Ok(bootstrap) => app.state.apply_bootstrap(bootstrap),
                 Err(error) => {
@@ -75,6 +106,10 @@ impl App {
                     app.toast_error(format!("bootstrap: {error}"));
                 }
             }
+            debug!(
+                "startup: bootstrap snapshot {:.1} ms",
+                bootstrap_started.elapsed().as_secs_f64() * 1000.0
+            );
         }
         app
     }
@@ -174,7 +209,10 @@ impl App {
                 self.state.toast = Some(Toast::notice(message, self.now));
             }
             ControllerEvent::OpenPlaylist(id) => {
-                self.state.view = View::Playlist(id);
+                // Route through `navigate` so the controller's page-generation
+                // bookkeeping sees the view change: an artist/album page reply
+                // that is still in flight must not land after the jump.
+                self.navigate(View::Playlist(id));
             }
             ControllerEvent::SearchResults { query, results } => {
                 if self.state.search.shown_query == query {
@@ -238,18 +276,24 @@ impl App {
                 }
                 self.state.update_status = Some(status);
             }
-            ControllerEvent::YtDlpStatus(status) => {
-                self.state.yt_dlp_status = Some(status);
-            }
             ControllerEvent::Cover(image) => {
+                // A cover can only be used if its cache entry still exists: the
+                // entry is what the screens look the texture up through, and it
+                // cannot have been evicted while the fetch was in flight (only
+                // decoded textures are evicted).
+                if !self.state.covers.contains_key(&image.url) {
+                    debug!("dropping cover for unknown url: {}", image.url);
+                    return;
+                }
                 let id = self.state.next_texture_id;
-                self.state.next_texture_id += 1;
+                self.state.next_texture_id = self.state.next_texture_id.wrapping_add(1);
                 if let Some(entry) = self.state.covers.get_mut(&image.url) {
                     entry.texture = Some(id);
                     entry.requested = false;
                 }
                 self.ui
                     .upload_texture(id, image.width, image.height, image.rgba);
+                self.trim_cover_textures();
             }
             ControllerEvent::CoverFailed(url) => {
                 if let Some(entry) = self.state.covers.get_mut(&url) {
@@ -264,6 +308,44 @@ impl App {
             ControllerEvent::Online(online) => {
                 self.state.online = online;
                 debug!("network reachability: {online}");
+            }
+        }
+    }
+
+    /// Keep the cover-texture cache bounded (see [`MAX_CACHED_COVERS`]).
+    ///
+    /// Evicts the oldest decoded covers — texture ids are handed out in upload
+    /// order, so the lowest id is the oldest — and releases their GPU images
+    /// through the UI's dropped-texture list (the renderer retires them safely
+    /// after the in-flight frames). The cache entries stay consistent: only
+    /// entries that own a texture are chosen, so an in-flight fetch is never
+    /// orphaned. Called after every decoded cover arrives.
+    fn trim_cover_textures(&mut self) {
+        if self.state.covers.len() <= MAX_CACHED_COVERS {
+            return;
+        }
+        let mut loaded: Vec<(TextureId, String)> = self
+            .state
+            .covers
+            .iter()
+            .filter_map(|(url, entry)| entry.texture.map(|id| (id, url.clone())))
+            .collect();
+        if loaded.len() <= MAX_CACHED_COVERS {
+            return;
+        }
+        loaded.sort_unstable_by_key(|(id, _)| *id);
+        let excess = loaded.len() - MAX_CACHED_COVERS;
+        for (id, url) in loaded.into_iter().take(excess) {
+            // The entry may have been replaced by a re-request in the meantime;
+            // only drop the texture that is still stored for this URL.
+            if self
+                .state
+                .covers
+                .get(&url)
+                .is_some_and(|entry| entry.texture == Some(id))
+            {
+                self.state.covers.remove(&url);
+                self.ui.drop_texture(id);
             }
         }
     }
@@ -485,5 +567,67 @@ impl crate::state::SearchState {
         self.artists = None;
         self.albums = None;
         self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cover::CoverImage;
+
+    fn cover_event(url: &str) -> ControllerEvent {
+        ControllerEvent::Cover(CoverImage {
+            url: url.to_string(),
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        })
+    }
+
+    /// A long browsing session visits more distinct cover URLs than are worth
+    /// keeping in VRAM: the cache must stay bounded, evict oldest-first, and hand
+    /// evicted textures to the renderer instead of leaking them.
+    #[test]
+    fn the_cover_texture_cache_is_bounded_and_releases_evicted_textures() {
+        let mut app = App::new(false, Controller::new_preview());
+        let total = MAX_CACHED_COVERS + 8;
+        for index in 0..total {
+            let url = format!("https://img.example/{index}");
+            // The screens mark a URL as wanted first; the controller's decoded
+            // reply then fills that entry in.
+            assert!(app.state.request_cover(&url).is_none());
+            app.apply_controller_event(cover_event(&url));
+        }
+
+        assert_eq!(app.state.covers.len(), MAX_CACHED_COVERS, "bounded cache");
+        assert!(
+            app.state
+                .covers
+                .contains_key(&format!("https://img.example/{}", total - 1)),
+            "the newest cover must survive"
+        );
+        assert!(
+            !app.state.covers.contains_key("https://img.example/0"),
+            "the oldest cover is evicted first"
+        );
+
+        // The evicted textures are handed to the renderer: the UI flushes its
+        // drop list into the next frame's paint list.
+        let paint = app.ui.end_frame();
+        assert_eq!(paint.dropped.len(), total - MAX_CACHED_COVERS);
+    }
+
+    /// A reply whose cache entry no longer exists (evicted, or never requested)
+    /// must not upload a texture that nothing can ever release.
+    #[test]
+    fn a_cover_reply_for_an_unknown_url_uploads_nothing() {
+        let mut app = App::new(false, Controller::new_preview());
+        let before = app.state.next_texture_id;
+        app.apply_controller_event(cover_event("https://img.example/orphan"));
+        assert_eq!(app.state.next_texture_id, before, "no texture id consumed");
+        assert!(
+            app.ui.end_frame().created.is_empty(),
+            "no texture may be uploaded for an unknown url"
+        );
     }
 }

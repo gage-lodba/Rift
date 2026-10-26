@@ -17,27 +17,24 @@
 //!    (`Ui::shadow`).
 
 use crate::text::{TextStyle, Weight};
-use crate::ui::layout::{Align, Size, VAlign};
-use crate::ui::{Color, Prim, Rect};
+use crate::ui::Color;
 
 mod buttons;
 mod card;
 mod cover;
 mod section;
 mod slider;
-mod text_field;
 mod textures;
 mod track_row;
 
 pub use buttons::{
-    accent_button, button, icon_button, link_button, mix, primary_button, secondary_button,
-    secondary_pill, ButtonColors, ButtonStyle,
+    accent_button, button, icon_button, link_button, mix, paint_icon_button, primary_button,
+    secondary_button, secondary_pill, ButtonColors, ButtonStyle,
 };
 pub use card::{card, card_height, grid_metrics};
-pub use cover::{cover_tile, track_cover};
+pub use cover::cover_tile;
 pub use section::{section_header, section_header_action};
 pub use slider::{slider, SliderOutcome};
-pub use text_field::text_field;
 pub use textures::{
     ensure_textures, fallback_cover_rgba, music_note_rgba, COVER_FALLBACK_TEX, LOGO_DRAW_SIZE,
     LOGO_TEX, LOGO_TILE_INSET, NOTE_TEX,
@@ -90,21 +87,6 @@ pub fn style(size: f32, weight: Weight, color: Color) -> TextStyle {
 /// A text style with an explicit line height in px.
 pub fn style_lh(size: f32, weight: Weight, color: Color, line_height: f32) -> TextStyle {
     TextStyle::new(size, weight, color).with_line_height(line_height)
-}
-
-/// A disabled/inert spacer so hidden controls keep their horizontal slot.
-pub fn none_rect() -> Rect {
-    Rect::ZERO
-}
-
-/// Debug helper: the exact paint primitive for a rectangle (used by tests).
-pub fn rect_prim(rect: Rect, color: Color) -> Prim {
-    Prim::rect(rect, color)
-}
-
-/// Helper for callers that want a fixed-size box aligned in a row.
-pub fn boxed(rect: Rect, size: Size, v: VAlign) -> Rect {
-    rect.align(size, Align::Left, v)
 }
 
 #[cfg(test)]

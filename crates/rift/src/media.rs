@@ -122,6 +122,7 @@ pub(crate) fn spawn(hwnd: Option<isize>, backend_slot: BackendSlot) -> MediaHand
 }
 
 fn run(mut rx: UnboundedReceiver<MediaCmd>, hwnd: Option<isize>, backend_slot: BackendSlot) {
+    let started = std::time::Instant::now();
     let config = PlatformConfig {
         dbus_name: "rift",
         display_name: "Rift",
@@ -144,7 +145,7 @@ fn run(mut rx: UnboundedReceiver<MediaCmd>, hwnd: Option<isize>, backend_slot: B
     if let Err(e) = controls.attach(move |event| {
         // The handler runs on the OS's own thread; upgrade per event so a
         // dropped backend means "ignore the key", not a resurrected one.
-        let Some(inner) = handler_slot.get().and_then(Weak::upgrade) else {
+        let Some(inner) = event_target(&handler_slot) else {
             return;
         };
         handle_event(&inner, event);
@@ -152,6 +153,10 @@ fn run(mut rx: UnboundedReceiver<MediaCmd>, hwnd: Option<isize>, backend_slot: B
         warn!("could not attach media controls: {e:?}");
         return;
     }
+    debug!(
+        "media controls ready (+{:.1} ms on the media thread)",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
 
     // souvlaki services the OS side on its own thread/run loop; here we just
     // apply updates as the player sends them (blocking off the tokio channel).
@@ -168,10 +173,10 @@ fn run(mut rx: UnboundedReceiver<MediaCmd>, hwnd: Option<isize>, backend_slot: B
                 artist: Some(&artist),
                 album: album.as_deref(),
                 cover_url: (!cover.is_empty()).then_some(cover.as_str()),
-                duration: (duration > 0.0).then(|| Duration::from_secs_f64(duration)),
+                duration: media_duration(duration),
             }),
             MediaCmd::State { state, position } => {
-                let progress = Some(MediaPosition(Duration::from_secs_f64(position.max(0.0))));
+                let progress = Some(media_position(position));
                 let playback = match state {
                     PlaybackState::Playing => MediaPlayback::Playing { progress },
                     PlaybackState::Paused | PlaybackState::Loading => {
@@ -188,6 +193,34 @@ fn run(mut rx: UnboundedReceiver<MediaCmd>, hwnd: Option<isize>, backend_slot: B
         }
     }
     debug!("media thread stopped");
+}
+
+/// Convert a seconds value from the player into a `Duration` for souvlaki.
+///
+/// `Duration::from_secs_f64` panics on NaN, infinities and out-of-range values,
+/// and this conversion runs on the media thread, which has no supervisor: one
+/// absurd value from a corrupt length probe would kill media keys and
+/// now-playing for the rest of the session. `None` means "don't publish this
+/// value".
+fn media_duration(secs: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64(secs)
+        .ok()
+        .filter(|duration| !duration.is_zero())
+}
+
+/// A playback position to publish. An unusable value (NaN, infinity or
+/// negative) becomes zero rather than panicking the media thread.
+fn media_position(secs: f64) -> MediaPosition {
+    MediaPosition(media_duration(secs).unwrap_or(Duration::ZERO))
+}
+
+/// The backend the media thread should route an OS event to, if it is still
+/// alive. The slot holds a `Weak` reference and is upgraded per event (never
+/// cached): that is what lets a dropped backend be ignored — rather than
+/// resurrected — and lets the media thread exit instead of pinning the whole
+/// application.
+fn event_target(slot: &BackendSlot) -> Option<Arc<BackendInner>> {
+    slot.get().and_then(Weak::upgrade)
 }
 
 /// Translate one OS media-key event into the corresponding player action.
@@ -237,5 +270,29 @@ mod tests {
     fn an_empty_backend_slot_means_ignore_the_event() {
         let slot: BackendSlot = Arc::new(OnceLock::new());
         assert!(slot.get().is_none());
+        assert!(event_target(&slot).is_none(), "a media event is dropped");
+    }
+
+    /// The metadata/progress conversions are the media thread's only `f64` →
+    /// `Duration` bridge, and `Duration::from_secs_f64` panics on values a
+    /// corrupt probe can produce. The thread has no supervisor, so such values
+    /// must degrade instead of ending media integration.
+    #[test]
+    fn unusable_media_times_never_panic_the_thread() {
+        assert_eq!(media_duration(12.5), Some(Duration::from_secs_f64(12.5)));
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            f64::MAX,
+        ] {
+            assert!(media_duration(bad).is_none(), "must reject {bad}");
+        }
+        assert_eq!(media_position(12.0).0, Duration::from_secs(12));
+        assert_eq!(media_position(-5.0).0, Duration::ZERO);
+        assert_eq!(media_position(f64::NAN).0, Duration::ZERO);
+        assert_eq!(media_position(f64::INFINITY).0, Duration::ZERO);
     }
 }

@@ -197,7 +197,7 @@ fn build_gallery(ui: &mut Ui, upload_assets: bool) {
     let desc = TextStyle::new(13.0, Weight::Regular, theme.text_dim).with_line_height(17.0);
     ui.text_wrapped(
         Rect::new(row.x, row.y, row.w * 0.5, row.h),
-        "Rift uses yt-dlp to fetch audio. It's auto-detected from your PATH and common install locations.",
+        "Overlap the end of each track with the start of the next for a smooth transition.",
         &desc,
     );
 

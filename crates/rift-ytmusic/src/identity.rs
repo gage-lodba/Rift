@@ -64,20 +64,61 @@ pub fn ban(id: &str) {
     p.ids.retain(|i| i != id);
 }
 
+/// Largest home-page body the visitor scrape will buffer.
+///
+/// The page is a few hundred kilobytes; this is a generous ceiling that still
+/// stops a broken (or hostile) response from growing the scrape buffer for as
+/// long as it keeps sending. The request's own 30 s timeout bounds time, not
+/// bytes.
+const HOME_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 async fn fetch(http: &reqwest::Client, user_agent: &str) -> Result<String> {
     let resp = http
         .get(home())
         .header(reqwest::header::USER_AGENT, user_agent)
         .header(reqwest::header::COOKIE, CONSENT_COOKIE)
         .send()
-        .await?;
+        .await?
+        // A non-success page cannot carry a usable `visitorData`; report the
+        // status instead of the generic "home page did not expose visitor data".
+        .error_for_status()?;
 
-    if let Some(v) = yec_from_cookie(&resp) {
-        return Ok(v);
-    }
-    let body = resp.text().await?;
-    visitor_data_from_html(&body)
+    // The cookie is read before the body because it is the cheaper source, but
+    // it is not enough on its own: `YouTube` currently sets `__Secure-YEC=` with
+    // no value (observed 2026-10-26). An empty visitor id is not "anonymous" —
+    // the player and metadata endpoints answer `LOGIN_REQUIRED`/"Sign in to
+    // confirm you're not a bot" for it — so an empty cookie has to fall through
+    // to the `visitorData` literal embedded in the page.
+    let yec = yec_from_cookie(&resp);
+    let body = read_home_body(resp).await?;
+    resolve_visitor(yec, &body)
         .ok_or_else(|| Error::Bootstrap("home page did not expose visitor data".into()))
+}
+
+/// Read the home page with a hard size ceiling (see [`HOME_MAX_BYTES`]).
+async fn read_home_body(mut resp: reqwest::Response) -> Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > HOME_MAX_BYTES {
+            return Err(Error::Bootstrap(
+                "home page body is too large to scrape visitor data".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Choose the visitor id from one home-page response.
+///
+/// A non-empty `__Secure-YEC` cookie wins: it is the id the page was served
+/// with. An empty one (or no cookie at all) falls through to the
+/// `"visitorData"` literal embedded in the page's `ytcfg` JSON. Both halves are
+/// pinned by `an_empty_yec_cookie_falls_through_to_the_page_visitor_data`, so the
+/// fallback cannot silently take over the happy path.
+fn resolve_visitor(yec: Option<String>, body: &str) -> Option<String> {
+    yec.filter(|id| !id.is_empty())
+        .or_else(|| visitor_data_from_html(body))
 }
 
 /// The `__Secure-YEC` consent-session cookie `YouTube` sets on the home page.
@@ -264,5 +305,43 @@ mod tests {
         // The capture requires at least one character, so an empty value is
         // "absent" rather than an empty id the client would send.
         assert_eq!(visitor_data_from_html(r#"{"visitorData":""}"#), None);
+    }
+
+    /// The source rule for a home-page visitor id: a non-empty `__Secure-YEC`
+    /// cookie wins; an empty one falls through to the page's `visitorData`.
+    ///
+    /// Live regression guard (observed 2026-10-26): `YouTube` sets
+    /// `Set-Cookie: __Secure-YEC=; …` with no value. Before the fallback, the
+    /// pool was filled with `""` and every request sent an empty
+    /// `X-Goog-Visitor-Id`, which is not treated as anonymous: the player and
+    /// metadata endpoints answer `LOGIN_REQUIRED`/"Sign in to confirm you're not
+    /// a bot" instead of data. Both halves are asserted so the fallback cannot
+    /// silently change where a *present* cookie sends the visitor id.
+    #[test]
+    fn an_empty_yec_cookie_falls_through_to_the_page_visitor_data() {
+        const FROM_HTML: &str = "CgsxMjM0NQ%3D%3D";
+        let html =
+            format!(r#"<script>window["ytcfg"].set({{"visitorData":"{FROM_HTML}"}});</script>"#);
+
+        assert_eq!(
+            resolve_visitor(Some("yec-from-cookie".to_owned()), &html).as_deref(),
+            Some("yec-from-cookie"),
+            "a non-empty YEC must keep winning"
+        );
+        assert_eq!(
+            resolve_visitor(Some(String::new()), &html).as_deref(),
+            Some(FROM_HTML),
+            "an empty YEC must fall through to the page's visitorData"
+        );
+        assert_eq!(
+            resolve_visitor(None, &html).as_deref(),
+            Some(FROM_HTML),
+            "a missing YEC uses the same fallback"
+        );
+        assert_eq!(
+            resolve_visitor(Some(String::new()), "<html></html>"),
+            None,
+            "no usable id anywhere is the existing Bootstrap error, never an empty id"
+        );
     }
 }

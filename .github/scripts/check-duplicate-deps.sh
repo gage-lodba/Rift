@@ -62,7 +62,6 @@ set -euo pipefail
 baseline_windows=$(cat <<'EOF'
 base64
 bitflags
-getrandom
 hashbrown
 miniz_oxide
 syn
@@ -144,7 +143,7 @@ case "$host" in
 esac
 baseline=$(printf '%s\n' "$host_baseline" | sed '/^[[:space:]]*$/d' | sort)
 
-# `--workspace` covers the four native members under `crates/`; the legacy web
+# `--workspace` covers the five native members under `crates/`; the legacy web
 # frontend member is gone, so there is nothing to exclude any more.
 tree_args=(tree -d --locked --workspace)
 

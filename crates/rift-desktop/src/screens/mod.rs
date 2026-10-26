@@ -162,6 +162,14 @@ pub fn root(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>) {
     // player bar, then the overlays.
     ui.fill(l.viewport, theme.bg);
 
+    // Window-anchored overlays (toast / update banner) interact *first* even
+    // though they paint last: immediate-mode input is first-come-first-served,
+    // so a press over a banner button would otherwise be latched by the queue
+    // row or player control painted underneath it. They draw into the UI's
+    // deferred buffer, so the paint order is still "above every band".
+    chrome::toast(ui, state, l.viewport);
+    chrome::update_banner(ui, state, actions, l.viewport);
+
     // ---- main view ----
     ui.fill(l.main, theme.bg);
     // Context menus (screens-pages' `menu.rs`) consume the click that dismissed
@@ -214,10 +222,6 @@ pub fn root(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>) {
     chrome::titlebar(ui, state, actions, l.titlebar);
     chrome::sidebar(ui, state, actions, l.sidebar);
     chrome::player_bar(ui, state, actions, l.player);
-
-    // ---- overlays (window-anchored) ----
-    chrome::toast(ui, state, actions, l.viewport);
-    chrome::update_banner(ui, state, actions, l.viewport);
 
     // A menu opened by this frame's content/chrome must be drawn now: the UI
     // auto-dismisses popups that were opened but never drawn before `end_frame`.

@@ -34,6 +34,12 @@ impl BackendHandle {
     /// * transport/HTTP error → `"image fetch failed: …"`
     /// * body larger than [`MAX_IMAGE_BYTES`] (declared or actual) →
     ///   `"image too large …"`
+    ///
+    /// # Errors
+    ///
+    /// Returns one of the messages above: the URL did not pass the scheme/host
+    /// shape gate, the request failed or the server returned an error status, or
+    /// the body exceeded the cap. A missing cover is non-fatal to the caller.
     pub async fn fetch_image(&self, url: String) -> Result<Vec<u8>, String> {
         let trimmed = url.trim();
         if !is_fetchable_image_url(trimmed) {

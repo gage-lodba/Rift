@@ -1,18 +1,16 @@
-//! The Settings view painter: the four `.settings-row` cards, their controls and
+//! The Settings view painter: the three `.settings-row` cards, their controls and
 //! the h2 title.
 
 use crate::screens::cards;
 use crate::state::{Action, State};
 use crate::text::Weight;
-use crate::ui::{Id, Padding, Rect, SliderStyle, TextInputStyle, Ui};
+use crate::ui::{Id, Rect, SliderStyle, Ui};
 
 use super::layout::{
-    btn_width, is_missing, row_heights, BLOCK_GAP, BTN_H, DESC_GAP, LABEL_H, LINE_13, ROW_GAP,
-    ROW_MAX_W, ROW_PAD_X, ROW_PAD_Y, ROW_RADIUS, ROW_SPACING, SWITCH_H, SWITCH_W, TITLE_BLOCK_H,
+    btn_width, row_heights, BLOCK_GAP, BTN_H, DESC_GAP, LABEL_H, LINE_13, ROW_GAP, ROW_MAX_W,
+    ROW_PAD_X, ROW_PAD_Y, ROW_RADIUS, ROW_SPACING, SWITCH_H, SWITCH_W, TITLE_BLOCK_H,
 };
-use super::state::{downloading, path_draft, set_downloading, store_path_draft, PATH_DRAFT};
 use super::updates::draw_update_status;
-use super::ytdlp::draw_ytdlp_status;
 
 // ---------------------------------------------------------------------------
 // drawing
@@ -118,7 +116,7 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
                 32.0,
                 LINE_13,
             ),
-            &format!("{}s", state.crossfade.round() as i32),
+            &format!("{}s", value.round() as i32),
             &meta_style,
         );
     }
@@ -140,128 +138,9 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
     y += heights[1] + ROW_SPACING;
 
     // =====================================================================
-    // 3. Streaming engine (yt-dlp)
+    // 3. Updates
     // =====================================================================
     let rect = Rect::new(area.x, y, width, heights[2]);
-    draw_row_frame(ui, rect, &theme);
-    let check_w = btn_width(ui, "Check again");
-    let text_w = row_text_w(rect.w, check_w);
-    let inner_x = rect.x + ROW_PAD_X;
-    let inner_y = rect.y + ROW_PAD_Y;
-    ui.text(
-        Rect::new(inner_x, inner_y, text_w, LABEL_H),
-        "Streaming engine (yt-dlp)",
-        &label_style,
-    );
-    let mut cy = inner_y + LABEL_H + DESC_GAP;
-    let desc_h = ui
-        .measure_text_wrapped(
-            "Rift uses yt-dlp to fetch audio. It's auto-detected from your PATH and common install locations; set a custom path below if it lives elsewhere.",
-            &desc_style,
-            text_w,
-        )
-        .h;
-    ui.text_wrapped(
-        Rect::new(inner_x, cy, text_w, desc_h),
-        "Rift uses yt-dlp to fetch audio. It's auto-detected from your PATH and common install locations; set a custom path below if it lives elsewhere.",
-        &desc_style,
-    );
-    cy += desc_h + BLOCK_GAP;
-    cy = draw_ytdlp_status(ui, state, inner_x, cy, text_w, &theme, &desc_style);
-    if is_missing(state.yt_dlp_status.as_ref()) {
-        cy += BLOCK_GAP;
-        let label = if downloading() {
-            "Downloading…"
-        } else {
-            "Download yt-dlp"
-        };
-        let w = btn_width(ui, label);
-        let resp = cards::primary_button(
-            ui,
-            Rect::new(inner_x, cy, w, BTN_H),
-            Id::from_str("settings/ytdlp-download"),
-            label,
-            !downloading(),
-        );
-        ui.text(
-            Rect::new(
-                inner_x + w + 10.0,
-                cy + (BTN_H - 16.0) * 0.5,
-                (text_w - w - 10.0).max(0.0),
-                16.0,
-            ),
-            "Fetches the latest build into Rift's data folder.",
-            &cards::style_lh(12.0, Weight::Regular, theme.text_dim, 16.0),
-        );
-        if resp.clicked {
-            set_downloading(true);
-            actions.push(Action::DownloadYtDlp);
-        }
-        // Once a probe comes back, the command has resolved.
-        if state.yt_dlp_status.is_some() {
-            set_downloading(false);
-        }
-        cy += BTN_H;
-    }
-    // custom path row
-    cy += BLOCK_GAP;
-    {
-        let mut draft = path_draft(state);
-        let input_w = text_w.min(360.0);
-        let mut style = TextInputStyle::default_theme(&theme);
-        style.bg = theme.bg;
-        style.padding = Padding::symmetric(10.0, 7.0);
-        style.text = cards::style_lh(13.0, Weight::Regular, theme.text, LINE_13);
-        let resp = ui.text_input(
-            Rect::new(inner_x, cy, input_w, BTN_H),
-            Id::from_str("settings/ytdlp-path"),
-            &mut draft,
-            "Custom yt-dlp path (leave blank to auto-detect)",
-            &style,
-        );
-        store_path_draft(draft.clone());
-        let save_x = inner_x + input_w + 8.0;
-        let save_w = btn_width(ui, "Save");
-        let save_resp = cards::secondary_button(
-            ui,
-            Rect::new(save_x, cy, save_w, BTN_H),
-            Id::from_str("settings/ytdlp-save"),
-            "Save",
-        );
-        if resp.submitted || save_resp.clicked {
-            let trimmed = draft.trim().to_string();
-            actions.push(Action::SetYtDlpPath(if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }));
-        }
-    }
-    // right column: "Check again"
-    {
-        let w = btn_width(ui, "Check again");
-        let resp = cards::secondary_button(
-            ui,
-            Rect::new(
-                rect.right() - ROW_PAD_X - w,
-                rect.y + (rect.h - BTN_H) * 0.5,
-                w,
-                BTN_H,
-            ),
-            Id::from_str("settings/ytdlp-check"),
-            "Check again",
-        );
-        if resp.clicked {
-            PATH_DRAFT.lock().unwrap_or_else(|e| e.into_inner()).take();
-            actions.push(Action::CheckYtDlp);
-        }
-    }
-    y += heights[2] + ROW_SPACING;
-
-    // =====================================================================
-    // 4. Updates
-    // =====================================================================
-    let rect = Rect::new(area.x, y, width, heights[3]);
     draw_row_frame(ui, rect, &theme);
     let text_w = row_text_w(rect.w, SWITCH_W);
     let inner_x = rect.x + ROW_PAD_X;
@@ -298,7 +177,6 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         if resp.clicked {
             actions.push(Action::CheckUpdate);
         }
-        let mut x = inner_x + w + 10.0;
         if state
             .update_status
             .as_ref()
@@ -306,10 +184,11 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         {
             let url = state.update_status.as_ref().and_then(|u| u.url.clone());
             let label = "Download update";
-            let w = btn_width(ui, label);
+            let dl_w = btn_width(ui, label);
+            let x = inner_x + w + 10.0;
             let resp = cards::primary_button(
                 ui,
-                Rect::new(x, cy, w, BTN_H),
+                Rect::new(x, cy, dl_w, BTN_H),
                 Id::from_str("settings/download-update"),
                 label,
                 true,
@@ -319,9 +198,7 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
                     actions.push(Action::OpenUrl(url));
                 }
             }
-            x += w;
         }
-        let _ = x;
     }
     {
         let mut on = state.update_notifications;

@@ -28,11 +28,14 @@ pub struct TrackListOpts<'a> {
     pub show_album: bool,
     pub show_download: bool,
     pub show_like: bool,
+    /// Every row in this list is liked by definition (the Liked Songs view), so
+    /// the per-frame liked index does not have to be built.
+    pub all_liked: bool,
     /// Id namespace (must be stable per list across frames).
     pub id: &'a str,
 }
 
-impl<'a> Default for TrackListOpts<'a> {
+impl Default for TrackListOpts<'_> {
     fn default() -> Self {
         Self {
             source: None,
@@ -41,6 +44,7 @@ impl<'a> Default for TrackListOpts<'a> {
             show_album: true,
             show_download: true,
             show_like: true,
+            all_liked: false,
             id: "track-list",
         }
     }
@@ -52,6 +56,10 @@ impl<'a> Default for TrackListOpts<'a> {
 /// ([`TrackListOpts::single_click`]) or are inert while a menu is open (the menu
 /// backdrop owns that frame's click). Nested controls (heart, kebab, album link,
 /// download) never play the row.
+///
+/// Rows outside the current clip (the scroll viewport) are skipped entirely:
+/// the container clips their paint, but drawing a 5,000-row playlist would still
+/// cost a text layout + interaction pass per row every frame.
 pub fn track_list(
     ui: &mut Ui,
     state: &mut State,
@@ -64,25 +72,29 @@ pub fn track_list(
         return 0.0;
     }
     let list_id = Id::from_str(opts.id);
-    let liked = state.liked_index();
+    let liked = (!opts.all_liked).then(|| state.liked_index());
     let blocked = menu::is_open();
 
-    for (i, track) in tracks.iter().enumerate() {
-        let row_rect = Rect::new(
-            rect.x,
-            rect.y + i as f32 * cards::TROW_HEIGHT,
-            rect.w,
-            cards::TROW_HEIGHT,
-        );
+    // Visible row range. Without an active clip (direct screen tests) fall back
+    // to the viewport so the whole list still draws.
+    let clip = ui.clip_rect().unwrap_or_else(|| ui.viewport());
+    let row_h = cards::TROW_HEIGHT;
+    let first = (((clip.top() - rect.y) / row_h).floor() as isize).max(0) as usize;
+    let last =
+        ((((clip.bottom() - rect.y) / row_h).ceil() as isize).max(0) as usize).min(tracks.len());
+
+    for (i, track) in tracks.iter().enumerate().take(last).skip(first) {
+        let row_rect = Rect::new(rect.x, rect.y + i as f32 * row_h, rect.w, row_h);
         let downloaded = state.downloads.downloaded.contains(&track.id);
         let unavailable = !state.online && !downloaded;
         let row_opts = cards::TrackRowOpts {
             playing: state.track.as_ref().is_some_and(|t| t.id == track.id),
-            liked: liked.contains(track),
+            liked: opts.all_liked || liked.as_ref().is_some_and(|index| index.contains(track)),
             unavailable,
             show_album: opts.show_album,
             show_download: opts.show_download,
             download: state.download_status(track),
+            download_progress: state.download_fraction(&track.id),
             show_like: opts.show_like,
             reveal: false,
         };

@@ -106,20 +106,20 @@ jobs:
 
       # Explicit package list rather than `--workspace`: it documents exactly the
       # crates the native application is built from (the workspace members are
-      # the four crates under `crates/`).
+      # the five crates under `crates/`).
       - name: Clippy
-        run: cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-desktop --all-targets --locked -- -D warnings
+        run: cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop --all-targets --locked -- -D warnings
 
-      # The three library crates opt into `#![warn(missing_docs)]`; deny rustdoc
+      # The four library crates opt into `#![warn(missing_docs)]`; deny rustdoc
       # warnings so doc coverage cannot regress silently. rift-desktop is an
       # internal app crate and is deliberately excluded (see README conventions).
       - name: Docs (library crates, warnings denied)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc -p rift -p rift-types -p rift-ytmusic --no-deps --locked
+        run: cargo doc -p rift -p rift-types -p rift-ytmusic -p rift-discord --no-deps --locked
 
       - name: Test
-        run: cargo test -p rift -p rift-types -p rift-ytmusic -p rift-desktop --locked
+        run: cargo test -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop --locked
 
       # The README promises a UI-only build (`--no-default-features`) for
       # renderer/immediate-mode work. Compile and test that configuration so it
@@ -145,6 +145,23 @@ jobs:
       # ships a plain binary (see release.yml).
       - name: Build the app (release)
         run: cargo build --release -p rift-desktop --locked
+
+      # The executable's file icon is a Windows PE resource (RT_GROUP_ICON plus
+      # its RT_ICON images), not something the program can decide at runtime:
+      # Explorer, the Start menu, shortcuts and taskbar pinning read it out of
+      # the file without ever starting the app. The runtime window icon set by
+      # `main.rs::window_icon()` is a different thing and cannot substitute for
+      # it. The native rewrite replaced the previous shell's build step with a
+      # plain `cargo build`, silently dropped the embedded icon once, and
+      # nothing failed — the app built and ran, and only Explorer showed the
+      # generic Windows application icon. `.github/scripts/check-windows-icon.ps1`
+      # parses the PE resource directory itself (no SDK tooling, so it cannot be
+      # skipped by a runner without a developer prompt) and fails this step if
+      # the icon resource is absent.
+      - name: Executable carries the Windows app icon resource
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/check-windows-icon.ps1 -Path target/release/rift-music.exe
 
       # The shipped release binary must not contain the development-only preview
       # mode / placeholder data. The dev flags are compiled out unless the

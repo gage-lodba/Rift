@@ -14,6 +14,27 @@ fn fonts() -> Fonts {
     Fonts::new()
 }
 
+/// The faces are parsed concurrently on startup; every slot must still come
+/// back populated in the documented order. (A slot order mistake would make
+/// weights render with the wrong font instead of failing loudly.)
+#[test]
+fn all_six_embedded_faces_parse_into_their_slots() {
+    let faces = super::load_faces();
+    assert!(
+        faces.iter().all(Option::is_some),
+        "embedded font assets must all parse: {:?}",
+        faces.iter().map(Option::is_some).collect::<Vec<_>>()
+    );
+    // Spot-check the slot order: the icon faces carry glyphs the UI fonts do
+    // not, and the regular UI face must be first.
+    let mut fonts = Fonts::new();
+    let icon = TextStyle::new(16.0, Weight::Regular, Color::WHITE);
+    assert!(
+        fonts.measure("\u{e037}", &icon).w > 0.0,
+        "first icon glyph must be found in the embedded icon faces"
+    );
+}
+
 fn width_of(f: &mut Fonts, s: &str, style: &TextStyle) -> f32 {
     f.line_width(s, style)
 }
@@ -79,7 +100,7 @@ fn measure_does_not_rasterize_and_layout_caches() {
         after_first,
         "second layout of the same text must hit the glyph cache"
     );
-    assert_eq!(f.atlas().allocations() as u64, after_first);
+    assert_eq!(f.atlas().allocations(), after_first);
 }
 
 #[test]
@@ -556,7 +577,8 @@ impl Lcg {
         }
     }
     fn f32(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * ((self.next() >> 40) as f32 / (1u32 << 24) as f32)
+        let t = (self.next() >> 40) as f32 / (1u32 << 24) as f32;
+        lo + (hi - lo) * t
     }
 }
 

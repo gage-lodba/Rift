@@ -69,7 +69,6 @@ pub(crate) struct TextureManager {
     /// 1x1 opaque white texture bound for solid-color prims (`NO_TEXTURE`).
     white: GpuTexture,
     frame: u64,
-    rasterized_pixels: u64,
     /// Monotonic counters, for acceptance logs/diagnostics.
     created_total: u64,
     dropped_total: u64,
@@ -112,7 +111,6 @@ impl TextureManager {
             retired: Vec::new(),
             white,
             frame: 0,
-            rasterized_pixels: 0,
             created_total: 0,
             dropped_total: 0,
             updated_total: 0,
@@ -134,7 +132,6 @@ impl TextureManager {
         id == NO_TEXTURE || self.textures.contains_key(&id)
     }
 
-    #[allow(dead_code)] // used by renderer diagnostics / future stats HUD
     pub fn len(&self) -> usize {
         self.textures.len()
     }
@@ -152,6 +149,42 @@ impl TextureManager {
     /// Total number of texture pixel replacements since startup (diagnostics).
     pub fn updated_total(&self) -> u64 {
         self.updated_total
+    }
+
+    /// Reallocate every descriptor set against a new set layout.
+    ///
+    /// The renderer rebuilds its pipeline when the swapchain image format
+    /// changes, which also replaces the combined-image-sampler set layout the
+    /// sets were allocated from. The images and views only depend on the
+    /// texture format (always `R8G8B8A8_SRGB`), so they are reused; only the
+    /// layout-dependent descriptor sets are reallocated. In-flight frames keep
+    /// the old sets alive through their command buffers until they complete, so
+    /// no `wait_idle` is needed here.
+    pub fn rebuild_descriptor_sets(&mut self, set_layout: Arc<DescriptorSetLayout>) -> Result<()> {
+        let allocator = self.descriptor_set_allocator.clone();
+        let sampler = self.sampler.clone();
+        let build = |view: &Arc<ImageView>| -> Result<Arc<DescriptorSet>> {
+            DescriptorSet::new(
+                allocator.clone(),
+                set_layout.clone(),
+                [WriteDescriptorSet::image_view_sampler(
+                    0,
+                    view.clone(),
+                    sampler.clone(),
+                )],
+                [],
+            )
+            .context("reallocating a texture descriptor set")
+        };
+
+        let white_set = build(&self.white._view)?;
+        self.white.set = white_set;
+        for texture in self.textures.values_mut() {
+            let set = build(&texture._view)?;
+            texture.set = set;
+        }
+        self.set_layout = set_layout;
+        Ok(())
     }
 
     /// Applies one frame's `created` / `updated` / `dropped` lists.
@@ -239,7 +272,6 @@ impl TextureManager {
                     ))
                     .context("recording a staging -> image copy")?;
                 staging.push((image, buffer));
-                self.rasterized_pixels += upload.width as u64 * upload.height as u64;
             }
 
             let command_buffer = builder
@@ -289,7 +321,13 @@ impl TextureManager {
         height: u32,
         rgba: &[u8],
     ) -> Result<GpuTexture> {
+        // Only called for the 1x1 white fallback at renderer construction, so
+        // these are one-time startup diagnostics (not per-frame noise).
+        let stage = std::time::Instant::now();
+        let ms = |start: std::time::Instant| start.elapsed().as_secs_f64() * 1000.0;
         let image = upload_image(&ctx.memory_allocator, width, height)?;
+        tracing::debug!("startup: white texture image alloc {:.1} ms", ms(stage));
+        let stage = std::time::Instant::now();
         let buffer = Buffer::from_iter(
             ctx.memory_allocator.clone(),
             BufferCreateInfo {
@@ -303,6 +341,8 @@ impl TextureManager {
             },
             rgba.iter().copied(),
         )?;
+        tracing::debug!("startup: white texture staging buffer {:.1} ms", ms(stage));
+        let stage = std::time::Instant::now();
         let mut builder = AutoCommandBufferBuilder::primary(
             ctx.command_buffer_allocator.clone(),
             ctx.queue.queue_family_index(),
@@ -314,7 +354,11 @@ impl TextureManager {
             .execute(ctx.queue.clone())?
             .then_signal_fence_and_flush()?
             .wait(None)?;
-        build_gpu_texture(&ctx.descriptor_set_allocator, set_layout, sampler, image)
+        tracing::debug!("startup: white texture upload+GPU wait {:.1} ms", ms(stage));
+        let stage = std::time::Instant::now();
+        let texture = build_gpu_texture(&ctx.descriptor_set_allocator, set_layout, sampler, image);
+        tracing::debug!("startup: white texture descriptor set {:.1} ms", ms(stage));
+        texture
     }
 }
 

@@ -2,7 +2,7 @@
 //! controls, and the draggable region.
 
 use crate::screens::cards;
-use crate::state::{Action, State};
+use crate::state::{Action, State, View};
 use crate::text::Weight;
 use crate::theme::Theme;
 use crate::ui::{Color, CursorShape, Icon, Id, Key, Rect, Sense, Ui};
@@ -30,53 +30,7 @@ pub fn titlebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect:
     ui.hline(rect.x, rect.bottom() - 1.0, rect.w, 1.0, theme.border);
 
     // ---- logo mark + gradient wordmark (x=14, 22×22, gap 9) ----
-    cards::ensure_textures(ui);
-    let mark = Rect::new(rect.x + 14.0, rect.y + (rect.h - 22.0) * 0.5, 22.0, 22.0);
-    let logo = Rect::new(
-        mark.x - cards::LOGO_TILE_INSET,
-        mark.y - cards::LOGO_TILE_INSET,
-        cards::LOGO_DRAW_SIZE,
-        cards::LOGO_DRAW_SIZE,
-    );
-    ui.image(logo, cards::LOGO_TEX, Color::WHITE, 0.0);
-    // Wordmark gradient: `linear-gradient(110deg, #7df9ff, #c084fc, #ff8df5)`.
-    // Painted per glyph at the colour of the glyph's centre position along the
-    // word, which reproduces the reference's R/I/F/T cores.
-    let word_style =
-        cards::style_lh(17.0, Weight::Bold, theme.accent, 22.0).with_letter_spacing(2.0);
-    let word_y = rect.y + (rect.h - 22.0) * 0.5;
-    let stops = [
-        Color::hex(0x7df9ff),
-        Color::hex(0xc084fc),
-        Color::hex(0xff8df5),
-    ];
-    let glyphs: Vec<(char, f32)> = "RIFT"
-        .chars()
-        .map(|ch| (ch, ui.text_width(&ch.to_string(), &word_style) + 2.0))
-        .collect();
-    let total_w: f32 = glyphs.iter().map(|(_, w)| *w).sum::<f32>() - 2.0;
-    let mut x = mark.right() + 9.0;
-    let mut advance = 0.0f32;
-    for (ch, w) in &glyphs {
-        let s = ch.to_string();
-        let t = if total_w > 0.0 {
-            ((advance + w * 0.5) / total_w).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let color = if t < 0.5 {
-            cards::mix(stops[0], stops[1], t / 0.5)
-        } else {
-            cards::mix(stops[1], stops[2], (t - 0.5) / 0.5)
-        };
-        ui.text(
-            Rect::new(x, word_y, w + 2.0, 22.0),
-            &s,
-            &word_style.with_color(color),
-        );
-        x += w;
-        advance += w;
-    }
+    logo(ui, rect, &theme);
 
     // ---- search box (absolutely centred, 480×31 at y=7) ----
     let box_w = SEARCH_BOX_W.min(rect.w * 0.42);
@@ -121,7 +75,11 @@ pub fn titlebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect:
         box_rect.h - 2.0,
     );
     let input_id = Id::from_str("titlebar/search-input");
-    let mut query = state.search.query.clone();
+    // Move the query out for the widget (the text input binds `&mut String`) and
+    // put it back before returning: cloning it every frame would allocate on the
+    // hot path, and nothing else reads it during the titlebar pass (main content
+    // is drawn earlier in the frame).
+    let mut query = std::mem::take(&mut state.search.query);
     // Escape releases the field on this frame (the old UI cleared the box and
     // stepped off the search view). Handling it before the widget lets the UI's
     // `wants_keyboard()` be false at the end of this frame, so app-level
@@ -155,6 +113,9 @@ pub fn titlebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect:
         let trimmed = query.trim();
         if !trimmed.is_empty() {
             actions.push(Action::Search(trimmed.to_string()));
+        } else if state.view == View::Search {
+            // Clearing the box leaves Search for Home (`SearchClear`, ui-spec §7.4).
+            actions.push(Action::Navigate(View::Home));
         }
     }
     if (btn.clicked || input.submitted) && !query.trim().is_empty() {
@@ -164,7 +125,11 @@ pub fn titlebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect:
         // `SearchQueryChanged("")` makes app.rs cancel the in-flight search and
         // drop the previous results, like the old on_clear.
         actions.push(Action::SearchQueryChanged(String::new()));
+        if state.view == View::Search {
+            actions.push(Action::Navigate(View::Home));
+        }
     }
+    state.search.query = query;
 
     // ---- window controls (46×46 each, flush right) ----
     let controls_x = rect.right() - WIN_BTN_W * 3.0;
@@ -243,6 +208,65 @@ pub fn titlebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect:
         if drag.hovered {
             ui.set_cursor(CursorShape::Default);
         }
+    }
+}
+
+/// The 22×22 logo mark (prerasterized `logo.svg`, 32 px canvas with the glow
+/// margin) and the gradient "RIFT" wordmark at x=14/45, vertically centred.
+fn logo(ui: &mut Ui, rect: Rect, theme: &Theme) {
+    cards::ensure_textures(ui);
+    let mark = Rect::new(rect.x + 14.0, rect.y + (rect.h - 22.0) * 0.5, 22.0, 22.0);
+    let logo_rect = Rect::new(
+        mark.x - cards::LOGO_TILE_INSET,
+        mark.y - cards::LOGO_TILE_INSET,
+        cards::LOGO_DRAW_SIZE,
+        cards::LOGO_DRAW_SIZE,
+    );
+    ui.image(logo_rect, cards::LOGO_TEX, Color::WHITE, 0.0);
+
+    // Wordmark gradient: `linear-gradient(110deg, #7df9ff, #c084fc, #ff8df5)`.
+    // Painted per glyph at the colour of the glyph's centre position along the
+    // word, which reproduces the reference's R/I/F/T cores. The glyph widths are
+    // measured into a fixed array and the characters encoded into a stack buffer
+    // (the titlebar repaints every frame; per-glyph `String`s would allocate).
+    let word_style =
+        cards::style_lh(17.0, Weight::Bold, theme.accent, 22.0).with_letter_spacing(2.0);
+    let word_y = mark.y;
+    let stops = [
+        Color::hex(0x7df9ff),
+        Color::hex(0xc084fc),
+        Color::hex(0xff8df5),
+    ];
+    const WORDMARK: [char; 4] = ['R', 'I', 'F', 'T'];
+    let mut buf = [0u8; 4];
+    let mut glyph_w = [0.0f32; WORDMARK.len()];
+    let mut total_w = 0.0;
+    for (i, ch) in WORDMARK.into_iter().enumerate() {
+        glyph_w[i] = ui.text_width(ch.encode_utf8(&mut buf), &word_style) + 2.0;
+        total_w += glyph_w[i];
+    }
+    total_w -= 2.0;
+    let mut x = mark.right() + 9.0;
+    let mut advance = 0.0f32;
+    for (i, ch) in WORDMARK.into_iter().enumerate() {
+        let w = glyph_w[i];
+        let t = if total_w > 0.0 {
+            ((advance + w * 0.5) / total_w).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let color = if t < 0.5 {
+            cards::mix(stops[0], stops[1], t / 0.5)
+        } else {
+            cards::mix(stops[1], stops[2], (t - 0.5) / 0.5)
+        };
+        ui.text(
+            Rect::new(x, word_y, w + 2.0, 22.0),
+            ch.encode_utf8(&mut buf),
+            &word_style.with_color(color),
+        );
+        x += w;
+        advance += w;
     }
 }
 

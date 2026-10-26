@@ -32,23 +32,32 @@ impl BackendHandle {
 
     /// Toggle a track in the user's likes.
     pub fn toggle_like(&self, track: Track) {
-        let mut lib = self.inner.library.lock_safe();
-        lib.toggle_like(track);
-        drop(lib);
-        let library = self.inner.library.lock_safe().data.clone();
+        // Mutate and snapshot under one guard: the emitted `Library` is then
+        // exactly the state this command produced, not whatever a concurrent
+        // command left behind between two lock acquisitions.
+        let library = {
+            let mut lib = self.inner.library.lock_safe();
+            lib.toggle_like(track);
+            lib.data.clone()
+        };
         self.emit_library(&library);
     }
 
     /// Create an empty playlist. Errors on a blank (or whitespace-only) name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"playlist name cannot be empty"` when `name` trims to nothing.
     pub fn create_playlist(&self, name: String) -> Result<Playlist, String> {
         let name = name.trim();
         if name.is_empty() {
             return Err("playlist name cannot be empty".into());
         }
-        let mut lib = self.inner.library.lock_safe();
-        let playlist = lib.create_playlist(name.to_string());
-        let library = lib.data.clone();
-        drop(lib);
+        let (playlist, library) = {
+            let mut lib = self.inner.library.lock_safe();
+            let playlist = lib.create_playlist(name.to_string());
+            (playlist, lib.data.clone())
+        };
         self.emit_library(&library);
         Ok(playlist)
     }
@@ -63,6 +72,13 @@ impl BackendHandle {
     /// fold + insert (which queues the save on the durable writer) — there is no
     /// `std::fs` call on this path, so a large import never blocks a runtime
     /// worker on `library.json` I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns `"Couldn't find a playlist ID in that link."` for input with no
+    /// usable playlist id, a `"could not load playlist: …"` message when the
+    /// innertube request/parse fails, and `"That playlist has no playable
+    /// songs."` when every fetched row is filtered out as video/episode content.
     pub async fn import_yt_playlist(&self, url: String) -> Result<Playlist, String> {
         let id = parse_playlist_id(&url)
             .ok_or_else(|| "Couldn't find a playlist ID in that link.".to_string())?;
@@ -89,14 +105,12 @@ impl BackendHandle {
         } else {
             name
         };
-        let playlist = {
+        let (playlist, library) = {
             let mut lib = self.inner.library.lock_safe();
             let playlist = lib.create_playlist_with(name, tracks);
-            let library = lib.data.clone();
-            drop(lib);
-            self.emit_library(&library);
-            playlist
+            (playlist, lib.data.clone())
         };
+        self.emit_library(&library);
         Ok(playlist)
     }
 
@@ -109,18 +123,23 @@ impl BackendHandle {
     /// cancelled dialog emits nothing. Safe to call from the UI thread, though
     /// it is still a command: dispatch it from the controller like the rest.
     pub fn export_playlist(&self, id: String) {
-        // Snapshot and serialize under the lock, before showing the dialog.
-        let (file_name, json) = {
+        // Clone the playlist out under the lock, then serialize on this thread
+        // without it: a 1000-track playlist is a few hundred KiB of JSON, and
+        // walking it while holding the library lock would stall every other
+        // library command for the duration.
+        let playlist = {
             let lib = self.inner.library.lock_safe();
             let Some(p) = lib.data.playlists.iter().find(|p| p.id == id) else {
                 return;
             };
-            match serde_json::to_vec_pretty(p) {
-                Ok(json) => (format!("{}.json", safe_filename(&p.name)), json),
-                Err(e) => {
-                    warn!("could not serialize playlist {id}: {e}");
-                    return;
-                }
+            p.clone()
+        };
+        let file_name = format!("{}.json", safe_filename(&playlist.name));
+        let json = match serde_json::to_vec_pretty(&playlist) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("could not serialize playlist {id}: {e}");
+                return;
             }
         };
 
@@ -133,7 +152,10 @@ impl BackendHandle {
             else {
                 return; // cancelled
             };
-            match std::fs::write(&path, &json) {
+            // Publish the export atomically (temp file + rename in the chosen
+            // file's own directory): overwriting yesterday's export must not be
+            // able to leave a truncated JSON file if the write is interrupted.
+            match crate::util::atomic_write(&path, &json) {
                 Ok(()) => backend.emit(BackendEvent::Notice(format!(
                     "Exported to {}",
                     path.display()
@@ -186,30 +208,40 @@ impl BackendHandle {
         });
     }
 
-    /// Delete a playlist by id.
+    /// Delete a playlist by id. Emits `Library` only when a playlist was
+    /// actually removed.
     pub fn delete_playlist(&self, id: String) {
-        let mut lib = self.inner.library.lock_safe();
-        lib.delete_playlist(&id);
-        let library = lib.data.clone();
-        drop(lib);
-        self.emit_library(&library);
+        let library = {
+            let mut lib = self.inner.library.lock_safe();
+            if lib.data.playlists.iter().any(|p| p.id == id) {
+                lib.delete_playlist(&id);
+                Some(lib.data.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(library) = library {
+            self.emit_library(&library);
+        }
     }
 
     /// Rename a playlist.
     pub fn rename_playlist(&self, id: String, name: String) {
-        let mut lib = self.inner.library.lock_safe();
-        lib.rename_playlist(&id, name);
-        let library = lib.data.clone();
-        drop(lib);
+        let library = {
+            let mut lib = self.inner.library.lock_safe();
+            lib.rename_playlist(&id, name);
+            lib.data.clone()
+        };
         self.emit_library(&library);
     }
 
     /// Move a playlist to position `to` in the sidebar order.
     pub fn move_playlist(&self, id: String, to: usize) {
-        let mut lib = self.inner.library.lock_safe();
-        let moved = lib.move_playlist(&id, to);
-        let library = lib.data.clone();
-        drop(lib);
+        let (moved, library) = {
+            let mut lib = self.inner.library.lock_safe();
+            let moved = lib.move_playlist(&id, to);
+            (moved, lib.data.clone())
+        };
         if moved {
             self.emit_library(&library);
         }
@@ -230,9 +262,16 @@ impl BackendHandle {
         // asks it: a playlist that already holds this recording under the other
         // surface's video id will refuse the add, and downloading a row that was
         // never added would leave the offline copy dangling outside the playlist.
-        let keep_offline = {
-            let lib = self.inner.library.lock_safe();
-            lib.data
+        //
+        // The decision and the add happen under one guard: split across two, a
+        // concurrent edit could change the playlist between "it is fully
+        // downloaded" and the insert, and the new row would be pulled down for a
+        // playlist that no longer qualified (or not pulled down for one that
+        // did).
+        let (library, downloaded_track) = {
+            let mut lib = self.inner.library.lock_safe();
+            let keep_offline = lib
+                .data
                 .playlists
                 .iter()
                 .find(|p| p.id == id)
@@ -241,28 +280,25 @@ impl BackendHandle {
                         && super::downloads::playlist_fully_downloaded(p, |tid| {
                             self.inner.downloads.is_downloaded(tid)
                         })
-                })
+                });
+            // Clone only on the path that actually needs the track afterwards.
+            let downloaded_track = keep_offline.then(|| track.clone());
+            lib.add_to_playlist(&id, track);
+            (lib.data.clone(), downloaded_track)
         };
-
-        {
-            let mut lib = self.inner.library.lock_safe();
-            lib.add_to_playlist(&id, track.clone());
-            let library = lib.data.clone();
-            drop(lib);
-            self.emit_library(&library);
-        }
-
-        if keep_offline {
+        self.emit_library(&library);
+        if let Some(track) = downloaded_track {
             start_downloads(&self.inner, vec![track]);
         }
     }
 
     /// Remove a track (by id) from a playlist.
     pub fn remove_from_playlist(&self, id: String, track_id: String) {
-        let mut lib = self.inner.library.lock_safe();
-        lib.remove_from_playlist(&id, &track_id);
-        let library = lib.data.clone();
-        drop(lib);
+        let library = {
+            let mut lib = self.inner.library.lock_safe();
+            lib.remove_from_playlist(&id, &track_id);
+            lib.data.clone()
+        };
         self.emit_library(&library);
     }
 }

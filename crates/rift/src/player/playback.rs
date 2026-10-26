@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use rift_types::{ArtistRef, PlaybackState, Progress, Track};
+use rift_types::{ArtistRef, PlaybackState, Progress, RepeatMode, Track};
 use tracing::{debug, error, info};
 
 use super::nav::{pick_next, play_next};
@@ -18,6 +18,29 @@ use crate::util::LockExt;
 /// Decoding is from memory, so this is milliseconds in practice; the bound only
 /// exists so a wedged audio thread cannot hang the playback task forever.
 const DECODE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Report a hard playback failure for the request identified by `generation`:
+/// stop the player state and surface the reason as an error toast.
+///
+/// The generation check is what keeps a stale request — one the user already
+/// skipped past — from clobbering a newer track's state or showing an error
+/// about a track that is no longer current.
+fn fail_playback(
+    backend: &Arc<BackendInner>,
+    shared: &Arc<PlayerShared>,
+    generation: u64,
+    message: String,
+) {
+    {
+        let mut core = shared.core.lock_safe();
+        if core.generation != generation {
+            return;
+        }
+        core.state = PlaybackState::Stopped;
+    }
+    backend.emit(BackendEvent::Error(message));
+    emit_state(backend, PlaybackState::Stopped);
+}
 
 /// The length to show for a track whose stream is still being fetched.
 ///
@@ -65,6 +88,35 @@ pub(crate) fn adopt_fetched_duration(track: &mut Track, dur: f64) -> bool {
     true
 }
 
+/// Whether a position tick should start a crossfade into the next track.
+///
+/// Records the arm — keyed by [`PlayerCore::generation`] — when it returns
+/// `true`, so the watcher fires at most once per track. Pure, so the rules this
+/// encodes are testable without an audio thread:
+///
+/// * crossfades must be enabled (`crossfade > 0`) and a length must be known;
+/// * only while actually playing; repeat-one is excluded because a track cannot
+///   overlap itself (and the repeat is a hard replay);
+/// * a crossfade already armed for this generation, or a prefetched pick still
+///   in flight, must not draw a second target;
+/// * the tick has to be inside the overlap window at the end of the track.
+///
+/// Keys the arm on the generation rather than a bool so a seek that clears the
+/// flag (to re-evaluate the window) and a new track both behave correctly.
+pub(crate) fn should_arm_crossfade(core: &mut PlayerCore, position: f64) -> bool {
+    let arm = core.crossfade > 0.0
+        && core.state == PlaybackState::Playing
+        && core.repeat != RepeatMode::One
+        && core.duration > 0.0
+        && core.crossfade_armed_for != Some(core.generation)
+        && core.pending_next.is_none()
+        && core.duration - position <= core.crossfade;
+    if arm {
+        core.crossfade_armed_for = Some(core.generation);
+    }
+    arm
+}
+
 /// Start playing the track at `index`, treating it as a fresh anchor for the
 /// shuffle history. Used by direct jumps — clicking a track, starting a
 /// collection, resuming a stopped track. Sequential and shuffle Next/Previous
@@ -103,7 +155,26 @@ pub(crate) fn start_playback(backend: &Arc<BackendInner>, index: usize) {
         core.duration = preseed_duration(track.duration, core.duration);
         (track, core.generation)
     };
-    let _ = shared.audio.send(AudioCmd::Stop);
+    // The audio thread is the only way anything can be heard. If it is gone
+    // (its spawn failed, or the output device/thread died), fail the request
+    // now: carrying on would fetch a stream nobody can decode and leave the UI
+    // reporting `Loading` forever.
+    if shared.audio.send(AudioCmd::Stop).is_err() {
+        error!("audio thread is gone; cannot play {}", track.id);
+        // `current` was already moved onto the requested track above; broadcast
+        // the queue so the UI's snapshot matches the Stopped state below.
+        emit_queue(backend, &shared);
+        fail_playback(
+            backend,
+            &shared,
+            generation,
+            format!(
+                "Could not play \u{201c}{}\u{201d}: audio output is unavailable",
+                track.title
+            ),
+        );
+        return;
+    }
 
     info!(
         "playing \"{}\" by {} ({})",
@@ -143,7 +214,19 @@ pub(crate) fn start_playback(backend: &Arc<BackendInner>, index: usize) {
                     .send(AudioCmd::Play(data, Some(ack_tx)))
                     .is_err()
                 {
+                    // The thread died between the stop above and this hand-off.
+                    // Commit the failure (a stale request must not touch a newer
+                    // track's state) instead of leaving `Loading` up forever.
                     error!("audio thread is gone; cannot play {}", track.id);
+                    fail_playback(
+                        &backend,
+                        &shared,
+                        generation,
+                        format!(
+                            "Could not play \u{201c}{}\u{201d}: audio output is unavailable",
+                            track.title
+                        ),
+                    );
                     return;
                 }
                 // The audio thread decodes in-memory bytes, so this is a few
@@ -168,18 +251,12 @@ pub(crate) fn start_playback(backend: &Arc<BackendInner>, index: usize) {
                         // deliberately stays quiet so only one path advances the
                         // queue).
                         error!("failed to play {}: {msg}", track.id);
-                        {
-                            let mut core = shared.core.lock_safe();
-                            if core.generation != generation {
-                                return;
-                            }
-                            core.state = PlaybackState::Stopped;
-                        }
-                        backend.emit(BackendEvent::Error(format!(
-                            "Could not play \u{201c}{}\u{201d}: {msg}",
-                            track.title
-                        )));
-                        emit_state(&backend, PlaybackState::Stopped);
+                        fail_playback(
+                            &backend,
+                            &shared,
+                            generation,
+                            format!("Could not play \u{201c}{}\u{201d}: {msg}", track.title),
+                        );
                         return;
                     }
                 };
@@ -212,7 +289,7 @@ pub(crate) fn start_playback(backend: &Arc<BackendInner>, index: usize) {
                     position: 0.0,
                     duration: dur,
                 }));
-                announce_track(&backend, &shared, &library, index, track, dur).await;
+                announce_track(&backend, &shared, &library, index, generation, track, dur).await;
             }
             Err(e) => {
                 error!("failed to play {}: {e:#}", track.id);
@@ -293,18 +370,41 @@ async fn enrich_track(yt: &rift_ytmusic::Client, track: &mut Track) -> bool {
     true
 }
 
+/// Whether playback is still on the request that produced `generation`.
+///
+/// [`announce_track`] re-checks this after every await before publishing
+/// now-playing state: a skip bumps the generation, so a late credit/duration
+/// update for the skipped track must not emit a stale `Track` event — the UI
+/// (and for the media-session publish, the OS) would show the track the user
+/// skipped past as now playing. Pure so the gate is testable.
+pub(super) fn is_current_generation(core: &PlayerCore, generation: u64) -> bool {
+    core.generation == generation
+}
+
 /// Refresh the now-playing surfaces once a track is actually playing: publish
 /// it to the OS media session, backfill artist credits (persisting them so list
 /// rows become linkable), and record it in the library's recents. Shared by the
 /// fresh-start ([`start_playback`]) and crossfade ([`begin_crossfade`]) paths.
+///
+/// `generation` is the play request this announcement belongs to. Credit
+/// enrichment awaits a network round trip, so the user may skip to another
+/// track while it runs; every now-playing publication below is therefore gated
+/// on this request still being the current one. Without that gate a skip during
+/// enrichment would end with a stale `Track` event — the UI (and, before the
+/// gate, the OS media session) would show the track the user already skipped
+/// past as now playing. The queue-row metadata repairs are still applied when
+/// stale: they improve the row wherever it now sits in the queue.
 async fn announce_track(
     backend: &Arc<BackendInner>,
     shared: &Arc<PlayerShared>,
     library: &Arc<std::sync::Mutex<crate::library::LibraryStore>>,
     index: usize,
+    generation: u64,
     mut track: Track,
     dur: f64,
 ) {
+    let still_current = || is_current_generation(&shared.core.lock_safe(), generation);
+
     // A row liked from an album page can have no length; the stream we just
     // decoded does. Adopt it before announcing, write it into the queue row so
     // the restored session has it on the next launch, and re-publish the
@@ -320,9 +420,13 @@ async fn announce_track(
             }
         }
         emit_queue(backend, shared);
-        backend.emit(BackendEvent::Track(track.clone()));
+        if still_current() {
+            backend.emit(BackendEvent::Track(track.clone()));
+        }
     }
-    backend.media.set_track(&track, dur);
+    if still_current() {
+        backend.media.set_track(&track, dur);
+    }
 
     if enrich_track(&shared.yt, &mut track).await {
         {
@@ -333,8 +437,10 @@ async fn announce_track(
                 }
             }
         }
-        backend.emit(BackendEvent::Track(track.clone()));
         emit_queue(backend, shared);
+        if still_current() {
+            backend.emit(BackendEvent::Track(track.clone()));
+        }
     }
 
     let mut lib = library.lock_safe();
@@ -344,6 +450,50 @@ async fn announce_track(
     // with a single library save rather than one per step.
     lib.record_played(track);
     backend.emit(BackendEvent::Library(lib.data.clone()));
+}
+
+/// Why a fetched crossfade target cannot be committed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CrossfadeHold {
+    /// Nothing blocks the commit: the target is still the current prefetch and
+    /// playback is still inside the overlap window.
+    None,
+    /// Playback advanced while the target was fetching (a skip, a natural end,
+    /// or a new prefetch consumed/changed the pin). This prefetch is obsolete.
+    Stale,
+    /// Playback was paused (or stopped) during the prefetch. Committing would
+    /// call `player.play()` on the audio thread and resume against the user's
+    /// wish; the pin is left for the natural end-of-track path instead.
+    Paused,
+    /// A backward seek pulled the position back out of the overlap window.
+    /// Committing would cut the song short, so the pin is left for the natural
+    /// end-of-track path (a hard cut).
+    LeftWindow,
+}
+
+/// Decide whether a ready crossfade target may be committed now.
+///
+/// Pure, so the exactly-once rule this enforces is testable without a network
+/// fetch or an audio device: a target may become current only while the prefetch
+/// is still the one that is current (same generation, same pin), playback is
+/// still `Playing`, and the position is still inside the overlap window. Every
+/// rejection leaves the pin in `pending_next` for the natural end-of-track path
+/// (or, when stale, the advance that superseded it has already taken over).
+pub(super) fn crossfade_hold(
+    core: &PlayerCore,
+    anchor_generation: u64,
+    index: usize,
+) -> CrossfadeHold {
+    if core.generation != anchor_generation || core.pending_next != Some(index) {
+        return CrossfadeHold::Stale;
+    }
+    if core.state != PlaybackState::Playing {
+        return CrossfadeHold::Paused;
+    }
+    if core.duration > 0.0 && core.duration - core.position > core.crossfade {
+        return CrossfadeHold::LeftWindow;
+    }
+    CrossfadeHold::None
 }
 
 /// Commit a prefetched crossfade pick: `index` becomes the playing track. The
@@ -381,6 +531,19 @@ pub(crate) fn begin_crossfade(backend: &Arc<BackendInner>) {
 
     let (index, anchor_gen, fade) = {
         let mut core = shared.core.lock_safe();
+        // The watcher decided to arm a moment ago, outside this lock. Re-check
+        // the conditions it judged against values a concurrent command can
+        // change (a pause, a repeat-mode switch, crossfade turned off in
+        // between): pinning a target for a transition that can no longer
+        // crossfade would hold `pending_next` and block a fresh arm later.
+        // Un-arm and return instead; the next tick can arm again.
+        if core.state != PlaybackState::Playing
+            || core.repeat == RepeatMode::One
+            || core.crossfade <= 0.0
+        {
+            core.crossfade_armed_for = None;
+            return;
+        }
         // Draw the next track now and remember it. pick_next advances the
         // shuffle bookkeeping; pending_next pins the pick so the actual advance
         // (here or on a natural end) reuses it instead of drawing again.
@@ -402,47 +565,57 @@ pub(crate) fn begin_crossfade(backend: &Arc<BackendInner>) {
         };
         match crate::fetch::fetch_track(&backend.downloads.dir, &track.id).await {
             Ok((data, duration)) => {
-                let dur = {
+                let (dur, committed_generation) = {
                     let mut core = shared.core.lock_safe();
-                    // Commit only if nothing advanced while we fetched: the
-                    // generation is unchanged and our pick is still pending. If
-                    // a natural end (or a skip) beat us, it already consumed the
-                    // pick and bumped the generation — drop this crossfade.
-                    if core.generation != anchor_gen || core.pending_next != Some(index) {
-                        debug!("discarding stale crossfade for {}", track.id);
-                        return;
-                    }
-                    // The crossfade armed while Playing, but the user may have
-                    // paused (or cancelled to Stopped) during the prefetch.
-                    // Committing now would call player.play() on the audio thread
-                    // and resume against the user's wish, leaving state desynced.
-                    // Leave the pick pending so the natural end-of-track path
-                    // (after the user resumes) reuses it instead.
-                    if core.state != PlaybackState::Playing {
-                        debug!("crossfade target ready but playback is paused; deferring");
-                        return;
-                    }
-                    // A backward seek during the prefetch may have pulled the
-                    // track back out of the overlap window. Committing would cut
-                    // the song short, so leave the pick pending for the natural
-                    // end-of-track path (a hard cut) instead.
-                    if core.duration > 0.0 && core.duration - core.position > core.crossfade {
-                        debug!(
-                            "crossfade target ready but position left the overlap window; deferring"
-                        );
-                        return;
+                    match crossfade_hold(&core, anchor_gen, index) {
+                        CrossfadeHold::None => {}
+                        CrossfadeHold::Stale => {
+                            debug!("discarding stale crossfade for {}", track.id);
+                            return;
+                        }
+                        CrossfadeHold::Paused => {
+                            debug!("crossfade target ready but playback is paused; deferring");
+                            return;
+                        }
+                        CrossfadeHold::LeftWindow => {
+                            debug!(
+                                "crossfade target ready but position left the overlap window; \
+                                 deferring"
+                            );
+                            return;
+                        }
                     }
                     commit_crossfade(&mut core, index);
+                    let committed_generation = core.generation;
                     core.duration = if duration > 0.0 {
                         duration
                     } else {
                         f64::from(track.duration.unwrap_or(0))
                     };
-                    core.duration
+                    (core.duration, committed_generation)
                 };
 
                 let fade = std::time::Duration::from_secs_f64(fade.max(0.0));
-                let _ = shared.audio.send(AudioCmd::Crossfade(data, fade));
+                if shared.audio.send(AudioCmd::Crossfade(data, fade)).is_err() {
+                    // The audio thread died between the prefetch and the commit.
+                    // The bookkeeping already names the new track, but no audio
+                    // will ever start for it: report the failure rather than
+                    // leaving the UI on `Playing` with a frozen bar.
+                    error!(
+                        "audio thread is gone; crossfade to {} did not start",
+                        track.id
+                    );
+                    fail_playback(
+                        &backend,
+                        &shared,
+                        committed_generation,
+                        format!(
+                            "Could not play \u{201c}{}\u{201d}: audio output is unavailable",
+                            track.title
+                        ),
+                    );
+                    return;
+                }
                 // Playback never left the Playing state, so only the track and
                 // its surfaces need refreshing.
                 backend.emit(BackendEvent::Track(track.clone()));
@@ -453,7 +626,16 @@ pub(crate) fn begin_crossfade(backend: &Arc<BackendInner>) {
                     position: 0.0,
                     duration: dur,
                 }));
-                announce_track(&backend, &shared, &library, index, track, dur).await;
+                announce_track(
+                    &backend,
+                    &shared,
+                    &library,
+                    index,
+                    committed_generation,
+                    track,
+                    dur,
+                )
+                .await;
             }
             Err(e) => {
                 // Leave the pick pending so the natural end-of-track retries it

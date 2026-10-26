@@ -29,7 +29,7 @@ use rift_desktop::state::ResizeEdge;
 use rift_desktop::ui::input::{InputState, Key, KeyInput, Modifiers};
 use rift_desktop::ui::{CursorShape, Rect};
 use rift_desktop::{single_instance, window_state};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -45,7 +45,35 @@ const DEFAULT_HEIGHT: u32 = 740;
 /// Invisible border around the client area that starts a native window resize.
 const RESIZE_BORDER: f32 = 5.0;
 
+/// Whether the window stays hidden until the first frame has been presented.
+///
+/// A visible window that has not painted yet is composited by the OS as a plain
+/// background (bright white on Windows) until the renderer can present, which
+/// takes long enough to be visible as a startup "flash" while the app builds its
+/// Vulkan context, pipeline and fonts. Hiding the window until that first
+/// present means the window appears already showing the dark UI — the same
+/// total time to content, without the white rectangle in between. Elsewhere the
+/// platform's window servers may not allow a hidden window to be presented to,
+/// so the behaviour is Windows-only.
+#[cfg(windows)]
+const HIDE_WINDOW_UNTIL_FIRST_FRAME: bool = true;
+#[cfg(not(windows))]
+const HIDE_WINDOW_UNTIL_FIRST_FRAME: bool = false;
+
+/// Milliseconds elapsed since `main` started, for the `startup:` diagnostics.
+///
+/// Every startup log is measured from this one instant (not from the point the
+/// subsystem happened to be built), so the numbers can simply be subtracted to
+/// attribute time to a stage, and the last one is the real time-to-first-frame a
+/// launch costs.
+fn startup_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 fn main() -> anyhow::Result<()> {
+    // Started before logging init: everything from here on is startup cost the
+    // user waits for.
+    let process_start = Instant::now();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -56,6 +84,15 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse(std::env::args().skip(1))?;
     info!("rift-desktop starting: {args:?}");
+
+    // Development-only one-shot capture: it creates no window, backend, threads
+    // or user data, so it must keep working while a normal Rift instance is
+    // running (that is exactly when developers take acceptance screenshots).
+    // The single-instance guard below therefore applies to the windowed app only.
+    #[cfg(any(debug_assertions, feature = "preview"))]
+    if let Some(path) = args.screenshot.clone() {
+        return run_screenshot(&args, &path, process_start);
+    }
 
     // A second instance exits immediately: the old build used a shell-level
     // single-instance plugin to focus the running window; the native app just
@@ -70,11 +107,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    #[cfg(any(debug_assertions, feature = "preview"))]
-    if let Some(path) = args.screenshot.clone() {
-        return run_screenshot(&args, &path);
-    }
-    run_windowed(args)
+    run_windowed(args, process_start)
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +148,7 @@ fn preview_env_requested() -> bool {
 }
 
 impl Args {
-    fn parse(args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
+    fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
         #[cfg(any(debug_assertions, feature = "preview"))]
         let mut parsed = Args {
             preview: preview_env_requested(),
@@ -133,7 +166,6 @@ impl Args {
             }
             Args::default()
         };
-        let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--preview" | "--demo" => {
@@ -266,7 +298,11 @@ impl Args {
 // ---------------------------------------------------------------------------
 
 #[cfg(any(debug_assertions, feature = "preview"))]
-fn run_screenshot(args: &Args, path: &std::path::Path) -> anyhow::Result<()> {
+fn run_screenshot(
+    args: &Args,
+    path: &std::path::Path,
+    process_start: Instant,
+) -> anyhow::Result<()> {
     let (logical_w, logical_h) = args.size;
     let scale = args.scale;
     let physical_w = (logical_w as f32 * scale).round() as u32;
@@ -293,8 +329,9 @@ fn run_screenshot(args: &Args, path: &std::path::Path) -> anyhow::Result<()> {
     let paint = app.frame(input);
     gfx::screenshot(physical_w, physical_h, scale, &paint, path)?;
     info!(
-        "wrote {physical_w}x{physical_h} screenshot (scale {scale}) to {}",
-        path.display()
+        "wrote {physical_w}x{physical_h} screenshot (scale {scale}) to {} (+{:.1} ms)",
+        path.display(),
+        startup_ms(process_start)
     );
     Ok(())
 }
@@ -303,12 +340,16 @@ fn run_screenshot(args: &Args, path: &std::path::Path) -> anyhow::Result<()> {
 // Windowed mode
 // ---------------------------------------------------------------------------
 
-fn run_windowed(args: Args) -> anyhow::Result<()> {
+fn run_windowed(args: Args, process_start: Instant) -> anyhow::Result<()> {
     let event_loop = EventLoop::new().context("could not create the winit event loop")?;
+    debug!(
+        "startup: winit event loop created +{:.1} ms",
+        startup_ms(process_start)
+    );
     event_loop.set_control_flow(ControlFlow::WaitUntil(
         Instant::now() + Duration::from_millis(16),
     ));
-    let mut app = NativeApp::new(args);
+    let mut app = NativeApp::new(args, process_start);
     event_loop.run_app(&mut app).context("event loop failed")?;
     Ok(())
 }
@@ -320,10 +361,18 @@ struct NativeApp {
     app: Option<App>,
     input: InputState,
     started: Instant,
+    /// When `main` started; only used for the one-time startup diagnostics.
+    process_start: Instant,
+    /// Whether the first successfully presented frame has been logged.
+    first_frame_logged: bool,
+    /// Whether the window is currently shown (see [`HIDE_WINDOW_UNTIL_FIRST_FRAME`]).
+    window_shown: bool,
     last_frame: Instant,
     last_cursor: Option<CursorIcon>,
-    /// Mouse position in physical px, for edge hit-testing.
-    mouse_physical: PhysicalPosition<f64>,
+    /// Mouse position in physical px, for edge hit-testing. `None` until the
+    /// window has reported a cursor position: before that, `(0, 0)` would look
+    /// like the top-left resize border and the first click would start a resize.
+    mouse_physical: Option<PhysicalPosition<f64>>,
     /// Last persisted window geometry (native replacement for the old shell's
     /// window-state plugin).
     window_state: window_state::WindowState,
@@ -332,7 +381,7 @@ struct NativeApp {
 }
 
 impl NativeApp {
-    fn new(args: Args) -> Self {
+    fn new(args: Args, process_start: Instant) -> Self {
         let saved = window_state::WindowState::load_default();
         let has_saved_window_state = saved.is_some();
         let window_state = saved.unwrap_or_default();
@@ -343,16 +392,24 @@ impl NativeApp {
             app: None,
             input: InputState::default(),
             started: Instant::now(),
+            process_start,
+            first_frame_logged: false,
+            window_shown: !HIDE_WINDOW_UNTIL_FIRST_FRAME,
             last_frame: Instant::now(),
             last_cursor: None,
-            mouse_physical: PhysicalPosition::new(-1.0, -1.0),
+            mouse_physical: None,
             window_state,
             has_saved_window_state,
         }
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
+        let icon_started = Instant::now();
         let icon = window_icon();
+        debug!(
+            "startup: window icon decode {:.1} ms",
+            icon_started.elapsed().as_secs_f64() * 1000.0
+        );
         // Restore the last session's size if there is one, otherwise the old
         // Legacy default (1160x740, centred by the OS, min 940x620).
         let (width, height) = if self.window_state.width >= 1 && self.window_state.height >= 1 {
@@ -369,7 +426,7 @@ impl NativeApp {
             ))
             .with_decorations(false)
             .with_resizable(true)
-            .with_visible(true);
+            .with_visible(!HIDE_WINDOW_UNTIL_FIRST_FRAME);
         if let Some(icon) = icon {
             attributes = attributes.with_window_icon(Some(icon));
         }
@@ -391,8 +448,39 @@ impl NativeApp {
             let y = ((screen.height - height as f64) * 0.5).max(0.0);
             window.set_outer_position(LogicalPosition::new(x, y));
         }
+        // The UI context's expensive part is parsing the six embedded font
+        // faces (CPU-only, independent of the window and the backend). Parse
+        // them on a worker thread while this thread is inside the Vulkan
+        // renderer construction, so two otherwise-serial costs overlap; the join
+        // below is then usually already finished. `Ui` itself is not `Send` (it
+        // owns the clipboard hook), so only `Fonts` crosses the thread boundary;
+        // the icon prewarm is cheap and stays on this thread in `Ui::new_with_fonts`.
+        let fonts_started = Instant::now();
+        let fonts_worker = std::thread::Builder::new()
+            .name("rift-font-init".into())
+            .spawn(rift_desktop::text::Fonts::new)
+            .ok();
         let renderer =
             gfx::Renderer::new(window.clone()).context("could not create the Vulkan renderer")?;
+        debug!(
+            "startup: Vulkan renderer +{:.1} ms",
+            startup_ms(self.process_start)
+        );
+        let ui = match fonts_worker {
+            Some(worker) => match worker.join() {
+                Ok(fonts) => rift_desktop::ui::Ui::new_with_fonts(fonts),
+                Err(_) => {
+                    warn!("the font-init thread panicked; loading fonts inline");
+                    rift_desktop::ui::Ui::new()
+                }
+            },
+            None => rift_desktop::ui::Ui::new(),
+        };
+        debug!(
+            "startup: ui context joined +{:.1} ms ({:.1} ms wall on this thread)",
+            startup_ms(self.process_start),
+            fonts_started.elapsed().as_secs_f64() * 1000.0
+        );
 
         // The backend is constructed after the window so Windows media
         // integration can attach to its HWND. If it fails, the app still opens in
@@ -413,7 +501,15 @@ impl NativeApp {
                 }
             }
         };
-        let mut app = App::new(self.args.preview, controller);
+        debug!(
+            "startup: backend controller +{:.1} ms",
+            startup_ms(self.process_start)
+        );
+        let mut app = App::new_with_ui(self.args.preview, controller, ui);
+        debug!(
+            "startup: app state + fonts +{:.1} ms",
+            startup_ms(self.process_start)
+        );
         if let Some(error) = backend_error {
             app.toast_error(error);
         }
@@ -423,7 +519,15 @@ impl NativeApp {
         self.app = Some(app);
         self.started = Instant::now();
         self.last_frame = Instant::now();
-        info!("window created");
+        info!("window created (+{:.1} ms)", startup_ms(self.process_start));
+        // A hidden window does not get the platform paint message that normally
+        // drives the first redraw, so present the first frame explicitly here and
+        // only then let `redraw` reveal the window (see
+        // HIDE_WINDOW_UNTIL_FIRST_FRAME). If the first present fails, `redraw`
+        // still reveals the window, so the failure is visible and retried.
+        if !self.window_shown {
+            self.redraw(event_loop);
+        }
         Ok(())
     }
 
@@ -450,9 +554,42 @@ impl NativeApp {
         );
 
         app.tick();
+        // The titlebar draws a restore glyph while the window is maximized; the
+        // state field is owned by the UI model, so mirror the window's real
+        // state into it before the frame is composed (winit tracks it for us,
+        // and the UI cannot query the window).
+        app.state.window_maximized = window.is_maximized();
         let paint = app.frame(self.input.clone());
-        if let Err(error) = renderer.frame(&paint) {
-            error!("render failed: {error:#}");
+        match renderer.frame(&paint) {
+            Ok(()) => {
+                if !self.first_frame_logged {
+                    self.first_frame_logged = true;
+                    info!(
+                        "startup: first frame presented +{:.1} ms",
+                        startup_ms(self.process_start)
+                    );
+                }
+            }
+            Err(error) => error!("render failed: {error:#}"),
+        }
+        // Reveal the window with its first painted frame already in the
+        // swapchain (Windows path; see HIDE_WINDOW_UNTIL_FIRST_FRAME). Showing it
+        // even after a failed first present keeps a broken renderer diagnosable
+        // instead of leaving an invisible process running.
+        if !self.window_shown {
+            self.window_shown = true;
+            window.set_visible(true);
+            debug!(
+                "startup: window shown (painted) +{:.1} ms",
+                startup_ms(self.process_start)
+            );
+            // The window was created hidden and only shown now, so it may not be
+            // the OS foreground window. A user launch grants this process
+            // foreground rights; request activation (after the window is up and
+            // the timing line is out, so the request itself cannot delay the
+            // reveal) so it comes to the front instead of opening behind
+            // whatever had focus.
+            window.focus_window();
         }
         for command in app.take_window_commands() {
             run_window_command(window, event_loop, command);
@@ -468,10 +605,13 @@ impl NativeApp {
 
     /// Which window edge the pointer is over (for the undecorated resize border).
     fn edge_at(&self, window: &Window) -> Option<ResizeEdge> {
+        // No cursor position has been reported yet (the window just appeared and
+        // the mouse has not moved): there is no edge under the pointer.
+        let mouse = self.mouse_physical?;
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let x = self.mouse_physical.x / scale;
-        let y = self.mouse_physical.y / scale;
+        let x = mouse.x / scale;
+        let y = mouse.y / scale;
         let width = size.width as f64 / scale;
         let height = size.height as f64 / scale;
         let border = RESIZE_BORDER as f64;
@@ -517,6 +657,9 @@ impl ApplicationHandler for NativeApp {
         }
         match event {
             WindowEvent::CloseRequested => {
+                // Remember the live geometry one last time (the close may have
+                // arrived between a move/resize and its tracked event).
+                window_state::track(&window, &mut self.window_state);
                 window_state::save_on_exit(&self.window_state);
                 event_loop.exit();
             }
@@ -536,7 +679,7 @@ impl ApplicationHandler for NativeApp {
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse_physical = position;
+                self.mouse_physical = Some(position);
                 let scale = window.scale_factor();
                 self.input.mouse_pos = ((position.x / scale) as f32, (position.y / scale) as f32);
                 self.input.mouse_in_window = true;
@@ -551,7 +694,9 @@ impl ApplicationHandler for NativeApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 // The undecorated resize border wins over the UI underneath it.
-                if pressed {
+                // Only a left press starts a resize: right/middle clicks belong
+                // to the UI even near the edge (the old window behaved the same).
+                if pressed && button == MouseButton::Left {
                     if let Some(edge) = self.edge_at(&window) {
                         window.request_redraw();
                         if run_resize(&window, edge) {
@@ -611,7 +756,18 @@ impl ApplicationHandler for NativeApp {
                         modifiers,
                     });
                 }
-                if pressed && !event.repeat && !modifiers.ctrl && !modifiers.alt {
+                // `event.text` is what the OS keyboard layout produced, so it is
+                // also valid on OS key-repeat events: a held key must type
+                // repeatedly in a focused text field. A "pure" shortcut modifier
+                // suppresses text (Ctrl+C, Alt+F4, Cmd+Q must stay shortcuts and
+                // not type), but AltGr is reported as ctrl+alt on Windows, and
+                // treating that pair as a shortcut would make '@', '{', '€', …
+                // untypable on many layouts — so ctrl+alt still types. Control
+                // characters (e.g. Ctrl+letter on X11) are dropped separately.
+                let alt_graph = modifiers.ctrl && modifiers.alt;
+                let shortcut_modifier =
+                    !alt_graph && (modifiers.ctrl || modifiers.alt || modifiers.super_key);
+                if pressed && !shortcut_modifier {
                     if let Some(text) = &event.text {
                         for ch in text.chars() {
                             if !ch.is_control() {

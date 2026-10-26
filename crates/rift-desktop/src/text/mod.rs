@@ -224,6 +224,51 @@ fn load_font(bytes: &'static [u8]) -> Option<Font> {
     Font::from_bytes(bytes, FontSettings::default()).ok()
 }
 
+/// The six embedded faces, in the slot order [`Fonts`] expects.
+const FACE_SOURCES: [&[u8]; 6] = [
+    embedded::INTER_REGULAR,
+    embedded::INTER_MEDIUM,
+    embedded::INTER_SEMIBOLD,
+    embedded::INTER_BOLD,
+    embedded::ICONS_FILLED,
+    embedded::ICONS_OUTLINED,
+];
+
+/// Parse all embedded faces, concurrently.
+///
+/// `Font::from_bytes` walks the whole face (table directory, cmap, glyf, …):
+/// one Inter weight costs ~13 ms in a release build (~70 ms unoptimised), and
+/// the UI cannot draw its first frame until every face has parsed. The parses
+/// are independent and share nothing, so they run on scoped threads — the wall
+/// time becomes roughly the slowest single face rather than the sum, which is
+/// one of the larger startup costs this app has (see the `startup:` logs).
+///
+/// A thread that cannot be spawned is a non-event: that face (and only that
+/// face) is parsed inline instead, and a thread whose parse panics is treated
+/// as a failed face. Embedded fonts are build artefacts, so neither path is
+/// expected; both keep the "degrade, never panic at startup" contract.
+fn load_faces() -> [Option<Font>; 6] {
+    // `[const { None }; _]` avoids relying on `Font: Default`.
+    let mut faces: [Option<Font>; 6] = [const { None }; 6];
+    std::thread::scope(|scope| {
+        let mut pending = Vec::with_capacity(FACE_SOURCES.len());
+        for (index, bytes) in FACE_SOURCES.into_iter().enumerate() {
+            match std::thread::Builder::new()
+                .name(format!("rift-font-{index}"))
+                .spawn_scoped(scope, move || load_font(bytes))
+            {
+                Ok(handle) => pending.push((index, handle)),
+                // `&'static [u8]` is Copy, so the fallback still has the bytes.
+                Err(_) => faces[index] = load_font(bytes),
+            }
+        }
+        for (index, handle) in pending {
+            faces[index] = handle.join().unwrap_or(None);
+        }
+    });
+    faces
+}
+
 // ---------------------------------------------------------------------------
 // glyph cache
 // ---------------------------------------------------------------------------
@@ -284,14 +329,13 @@ impl Fonts {
     /// assets; that is treated as a missing face (logged, not fatal). See
     /// [`load_font`] for the fallback behaviour.
     pub fn new() -> Self {
-        let faces = [
-            load_font(embedded::INTER_REGULAR),
-            load_font(embedded::INTER_MEDIUM),
-            load_font(embedded::INTER_SEMIBOLD),
-            load_font(embedded::INTER_BOLD),
-            load_font(embedded::ICONS_FILLED),
-            load_font(embedded::ICONS_OUTLINED),
-        ];
+        let startup = std::time::Instant::now();
+        let faces = load_faces();
+        tracing::debug!(
+            "startup: font faces parsed {:.1} ms ({} of 6)",
+            startup.elapsed().as_secs_f64() * 1000.0,
+            faces.iter().filter(|face| face.is_some()).count()
+        );
         if faces.iter().any(Option::is_none) {
             tracing::warn!(
                 "one or more embedded fonts failed to parse; text/icon rendering is degraded"
@@ -455,9 +499,24 @@ impl Fonts {
         }
     }
 
+    /// Advance width of one character in logical px (without letter spacing).
+    ///
+    /// This is the single-character metric [`Fonts::line_width`] accumulates.
+    /// It is exposed so callers that need the width of many *prefixes* of a
+    /// string (the text input's caret hit-testing) can accumulate them in one
+    /// pass instead of re-measuring every prefix, which was quadratic.
+    pub fn advance(&mut self, ch: char, style: &TextStyle) -> f32 {
+        let face = self.face_for(style);
+        let px = self.physical_px(style);
+        self.char_advance(face, ch, px)
+    }
+
     /// The logical line pitch this style lays out with.
     pub fn line_height(&self, style: &TextStyle) -> f32 {
-        if style.line_height > 0.0 {
+        // `line_height > 0.0` is the "font default" sentinel; a NaN/negative/
+        // infinite value is treated as the sentinel too so a bad style cannot
+        // poison the block height (and therefore glyph positions) with NaN/inf.
+        if style.line_height.is_finite() && style.line_height > 0.0 {
             style.line_height
         } else {
             self.line_metrics(style).line_height
@@ -469,17 +528,24 @@ impl Fonts {
     pub fn line_width(&mut self, text: &str, style: &TextStyle) -> f32 {
         let face = self.face_for(style);
         let px = self.physical_px(style);
+        // Non-finite tracking would turn every measured width into NaN; ignore
+        // it rather than propagating NaN into layout.
+        let spacing = if style.letter_spacing.is_finite() {
+            style.letter_spacing
+        } else {
+            0.0
+        };
         let mut w = 0.0;
         let mut n = 0usize;
         for ch in text.chars() {
             if ch == '\n' || ch == '\r' {
                 continue;
             }
-            w += self.char_advance(face, ch, px) + style.letter_spacing;
+            w += self.char_advance(face, ch, px) + spacing;
             n += 1;
         }
         if n > 0 {
-            w -= style.letter_spacing;
+            w -= spacing;
         }
         w.max(0.0)
     }
@@ -534,15 +600,27 @@ impl Fonts {
         let face = self.face_for(style);
         let px = self.physical_px(style);
         let lm = self.line_metrics(style);
-        let line_height = if style.line_height > 0.0 {
+        let explicit_line_height = style.line_height.is_finite() && style.line_height > 0.0;
+        let line_height = if explicit_line_height {
             style.line_height
         } else {
             lm.line_height
         };
+        // Non-finite tracking would displace every glyph by NaN; ignore it.
+        let spacing = if style.letter_spacing.is_finite() {
+            style.letter_spacing
+        } else {
+            0.0
+        };
         // CSS half-leading inside the explicit line box (see REF_* ratios).
-        let baseline = if style.line_height > 0.0 {
-            let ascent = REF_ASCENT_RATIO * style.size_px;
-            let descent = REF_DESCENT_RATIO * style.size_px;
+        let baseline = if explicit_line_height {
+            let size_px = if style.size_px.is_finite() {
+                style.size_px
+            } else {
+                0.0
+            };
+            let ascent = REF_ASCENT_RATIO * size_px;
+            let descent = REF_DESCENT_RATIO * size_px;
             (line_height - (ascent + descent)) * 0.5 + ascent
         } else {
             lm.ascent
@@ -567,13 +645,13 @@ impl Fonts {
                 }
                 let glyph = self.glyph_index(face, ch);
                 if glyph == 0 {
-                    pen += self.char_advance(face, ch, px) + style.letter_spacing;
+                    pen += self.char_advance(face, ch, px) + spacing;
                     continue;
                 }
                 let Some(m) = self.glyph_metrics(face, glyph, px) else {
                     // No font face loaded at all: keep advances consistent
                     // without emitting glyphs.
-                    pen += self.char_advance(face, ch, px) + style.letter_spacing;
+                    pen += self.char_advance(face, ch, px) + spacing;
                     continue;
                 };
                 if m.w > 0.0 && m.h > 0.0 {
@@ -589,10 +667,10 @@ impl Fonts {
                         });
                     }
                 }
-                pen += m.advance / self.scale + style.letter_spacing;
+                pen += m.advance / self.scale + spacing;
             }
             if pen > 0.0 {
-                pen -= style.letter_spacing;
+                pen -= spacing;
             }
             max_w = max_w.max(pen);
         }
@@ -657,7 +735,11 @@ impl Fonts {
         out.clear();
         let face = self.face_for(style);
         let px = self.physical_px(style);
-        let spacing = style.letter_spacing;
+        let spacing = if style.letter_spacing.is_finite() {
+            style.letter_spacing
+        } else {
+            0.0
+        };
 
         // Split into paragraphs at hard newlines; an empty paragraph is a blank
         // line, which keeps the block height right for trailing newlines.

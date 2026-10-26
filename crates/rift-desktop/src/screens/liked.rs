@@ -34,7 +34,11 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         );
         return;
     }
-    let tracks = state.library.liked.clone();
+    // Move the liked list out of `State` for the frame: the header and the row
+    // painters need `&mut State` (cover requests), so borrowing the list straight
+    // from `state.library` would conflict, and cloning every track per frame
+    // would allocate on the hot path. It goes back before returning.
+    let tracks = std::mem::take(&mut state.library.liked);
     y = pages::collection_head(
         ui,
         state,
@@ -50,6 +54,8 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
     );
     let opts = track_list::TrackListOpts {
         source: Some("liked"),
+        // Every row of this list is liked; no liked index needed.
+        all_liked: true,
         id: "liked-list",
         ..track_list::TrackListOpts::default()
     };
@@ -61,6 +67,7 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         &tracks,
         &opts,
     );
+    state.library.liked = tracks;
 }
 
 #[cfg(test)]
@@ -96,5 +103,51 @@ mod tests {
         state.library.liked = vec![track(); 3];
         let h = height(&mut ui, &state, 766.0);
         assert_eq!(h, 26.0 + 17.0 + 69.0 + 3.0 * 54.0);
+    }
+
+    /// The Liked view paints filled hearts and leaves the library untouched: the
+    /// list is moved out of `State` for the frame and restored.
+    #[test]
+    fn view_restores_the_liked_list_and_paints_filled_hearts() {
+        let mut ui = Ui::new();
+        let viewport = Rect::new(0.0, 0.0, 1160.0, 740.0);
+        let input = crate::ui::InputState {
+            viewport,
+            mouse_pos: (0.0, 0.0),
+            mouse_in_window: true,
+            time: 1.0,
+            ..Default::default()
+        };
+        ui.begin_frame(input, viewport);
+        let mut state = State {
+            library: rift_types::Library {
+                liked: vec![track(); 2],
+                ..rift_types::Library::default()
+            },
+            ..State::default()
+        };
+        let mut actions = Vec::new();
+        view(
+            &mut ui,
+            &mut state,
+            &mut actions,
+            Rect::new(359.0, 66.0, 767.0, 600.0),
+        );
+        let paint = ui.end_frame();
+        assert_eq!(state.library.liked.len(), 2, "liked list restored");
+        assert!(actions.is_empty());
+        let accent = crate::theme::Theme::default().accent;
+        let filled_hearts = paint
+            .layers
+            .iter()
+            .flat_map(|layer| layer.prims.iter())
+            .filter(|prim| {
+                matches!(prim, crate::gfx::paint::Prim::Image { tint, .. } if *tint == accent)
+            })
+            .count();
+        assert!(
+            filled_hearts >= 2,
+            "each liked row paints the filled accent heart (got {filled_hearts})"
+        );
     }
 }

@@ -1,11 +1,13 @@
 //! The 54 px track row primitive: cover / title+artist (per-credit links) /
 //! centred album / download slot / duration / heart + kebab, plus the small
-//! download spinner.
+//! download spinner and the determinate download progress bar.
 
 use crate::state::{DownloadStatus, State};
-use crate::text::Weight;
+use crate::text::{TextStyle, Weight};
+use crate::theme::Theme;
 use crate::ui::{Color, Icon, Id, Rect, Response, Sense, Ui};
 
+use super::buttons::paint_icon_button;
 use super::cover::cover_tile;
 use super::mix;
 use super::{
@@ -15,6 +17,11 @@ use super::{
 
 #[cfg(test)]
 mod tests;
+
+/// Height of the determinate download bar under the meta block.
+const DOWNLOAD_BAR_H: f32 = 3.0;
+/// Gap between the artist line's bottom and the download bar.
+const DOWNLOAD_BAR_GAP: f32 = 3.0;
 
 // ---------------------------------------------------------------------------
 // track rows
@@ -34,6 +41,11 @@ pub struct TrackRowOpts {
     /// Show the per-row offline download slot.
     pub show_download: bool,
     pub download: DownloadStatus,
+    /// Known byte-level progress of this track's in-flight download, in
+    /// `0.0..=1.0`. `None` means unknown (the track is queued behind the one
+    /// actively transferring): the row then only shows the indeterminate spinner
+    /// in the download slot.
+    pub download_progress: Option<f32>,
     /// Show the like button at the right end.
     pub show_like: bool,
     /// Force-reveal the hover controls (the reference screenshot's hovered row).
@@ -49,6 +61,7 @@ impl Default for TrackRowOpts {
             show_album: true,
             show_download: true,
             download: DownloadStatus::None,
+            download_progress: None,
             show_like: true,
             reveal: false,
         }
@@ -129,9 +142,9 @@ pub fn track_row(
     );
     let album_style = style_lh(12.0, Weight::Regular, theme.text_dim, TROW_ARTIST_LINE);
     let artist_style = style_lh(12.0, Weight::Regular, theme.text_dim, TROW_ARTIST_LINE);
-    let album_text = track.album.clone().unwrap_or_default();
+    let album_text = track.album.as_deref().unwrap_or("");
     let album_w = if opts.show_album && !album_text.is_empty() {
-        ui.text_width(&album_text, &album_style).min(340.0)
+        ui.text_width(album_text, &album_style).min(340.0)
     } else {
         0.0
     };
@@ -148,45 +161,24 @@ pub fn track_row(
     let meta_y = row_rect.y + (row_h - meta_h) * 0.5;
     let meta_rect = Rect::new(meta_x, meta_y, flex_each, meta_h);
 
+    // ---- determinate download bar geometry ----
+    // A 3 px bar under the meta block: the meta block ends at row_top + 43.5 and
+    // the row bottom is 54, so y 46.5..49.5 is clear of the artist line and of
+    // the bottom edge. Width is the meta column, never the full row.
+    let download_bar = Rect::new(
+        meta_rect.x,
+        meta_rect.y + meta_h + DOWNLOAD_BAR_GAP,
+        meta_rect.w,
+        DOWNLOAD_BAR_H,
+    );
+
     // ---- artist line: per-credit links (old `artist_links`) ----
     // Every credit with an id is its own click target; separators and the plain
     // fallback are inert. Geometry is measured now so the hit rects can be
     // interacted before the row itself (nested controls win the press).
     let artist_line_y = meta_rect.y + TROW_TITLE_LINE;
     let artist_line = Rect::new(meta_rect.x, artist_line_y, meta_rect.w, TROW_ARTIST_LINE);
-    let mut artist_runs: Vec<ArtistRun<'_>> = Vec::new();
-    let mut artist_x = artist_line.x;
-    if track.artists.is_empty() {
-        let w = ui.text_width(&track.artist, &artist_style);
-        artist_runs.push(ArtistRun {
-            text: track.artist.as_str(),
-            id: None,
-            credit: None,
-            rect: Rect::new(artist_x, artist_line_y, w, TROW_ARTIST_LINE),
-        });
-    } else {
-        for (credit, artist) in track.artists.iter().enumerate() {
-            if credit > 0 {
-                let sep = ", ";
-                let w = ui.text_width(sep, &artist_style);
-                artist_runs.push(ArtistRun {
-                    text: sep,
-                    id: None,
-                    credit: None,
-                    rect: Rect::new(artist_x, artist_line_y, w, TROW_ARTIST_LINE),
-                });
-                artist_x += w;
-            }
-            let w = ui.text_width(&artist.name, &artist_style);
-            artist_runs.push(ArtistRun {
-                text: artist.name.as_str(),
-                id: artist.id.as_deref(),
-                credit: Some(credit),
-                rect: Rect::new(artist_x, artist_line_y, w, TROW_ARTIST_LINE),
-            });
-            artist_x += w;
-        }
-    }
+    let artist_runs = layout_artist_runs(ui, track, &artist_style, artist_line);
 
     let album_x = meta_rect.right() + TROW_GAP;
     let album_rect = Rect::new(album_x, row_rect.y, album_w, row_h);
@@ -216,11 +208,12 @@ pub fn track_row(
 
     // Download slot states: the downloaded check and the failed retry are always
     // visible; the idle download button only appears on row hover (old CSS:
-    // `.trow:hover .trow-dl .ibtn { opacity: 1 }`).
+    // `.trow:hover .trow-dl .ibtn { opacity: 1 }`). Offline, un-downloaded rows
+    // show an empty slot (ui-spec §7.1.3).
     let dl_visible = match opts.download {
         DownloadStatus::Downloaded | DownloadStatus::Failed => opts.show_download,
         DownloadStatus::Downloading => false,
-        DownloadStatus::None => opts.show_download && reveal,
+        DownloadStatus::None => opts.show_download && reveal && !opts.unavailable,
     };
     let dl_resp = if dl_visible {
         ui.interact(dl_ibtn, id.with(("dl", index)), Sense::CLICK)
@@ -242,7 +235,7 @@ pub fn track_row(
     // Artist credits are the first linkable run(s) of the artist line. They are
     // interacted here, before the row, so clicking a name never plays the track
     // (old `.link` buttons stopped propagation; this Ui latches the press).
-    let mut artist_hits: Vec<ArtistHit> = Vec::new();
+    let mut artist_hits: Vec<ArtistHit> = Vec::with_capacity(track.artists.len());
     for run in &artist_runs {
         let (Some(_), Some(credit)) = (run.id, run.credit) else {
             continue;
@@ -252,8 +245,7 @@ pub fn track_row(
             continue;
         }
         let hit = Rect::new(run.rect.x, run.rect.y, visible_w, run.rect.h);
-        let mut resp = ui.interact(hit, id.with(("artist", index, credit)), Sense::CLICK);
-        resp.clicked |= ui.keyboard_activated() && resp.focused;
+        let resp = ui.interact(hit, id.with(("artist", index, credit)), Sense::CLICK);
         if resp.hovered {
             ui.set_cursor(crate::ui::CursorShape::Pointer);
         }
@@ -280,7 +272,7 @@ pub fn track_row(
     }
 
     let texture = state.request_cover(&track.cover);
-    cover_tile(ui, state, cover_rect, texture, 4.0);
+    cover_tile(ui, cover_rect, texture, 4.0);
 
     let title_color = if opts.playing {
         theme.accent
@@ -297,19 +289,174 @@ pub fn track_row(
         &track.title,
         &style_lh(13.0, title_weight, title_color, TROW_TITLE_LINE),
     );
-    // Artist line, clipped to its column exactly like `.trow-artist {
-    // overflow: hidden }`: long credit lists must not bleed into the album
-    // column. Focus rings are painted after the clip so they stay visible.
+    paint_artist_line(
+        ui,
+        meta_rect,
+        artist_line,
+        &artist_runs,
+        &artist_hits,
+        &theme,
+        &artist_style,
+    );
+
+    // The download-slot spinner means "in flight"; the bar means "how far". It
+    // appears only when the backend reported a byte fraction (a track whose
+    // fraction is unknown — queued behind the active one — keeps the spinner
+    // alone) and only on rows that show the download affordance at all.
+    let download_fraction = match (opts.show_download, opts.download, opts.download_progress) {
+        (true, DownloadStatus::Downloading, Some(fraction)) => Some(fraction),
+        _ => None,
+    };
+    if let Some(fraction) = download_fraction {
+        ui.progress(download_bar, fraction, theme.accent);
+    }
+
+    // Album link (dim, brighter + underlined on hover — `.link:hover`).
+    if album_w > 0.0 {
+        let color = mix(theme.text_dim, theme.text, album_resp.hover_t);
+        ui.text_centered(album_rect, album_text, &album_style.with_color(color));
+        if album_resp.hover_t > 0.5 {
+            let w = ui.text_width(album_text, &album_style).min(album_rect.w);
+            let x = album_rect.x + (album_rect.w - w) * 0.5;
+            ui.hline(x, album_rect.y + row_h * 0.5 + 8.0, w, 1.0, color);
+        }
+        if album_resp.focus_visible {
+            ui.focus_ring(album_rect, 4.0);
+        }
+    }
+
+    if opts.show_download {
+        paint_download_slot(
+            ui,
+            dl_ibtn,
+            opts.download,
+            reveal,
+            opts.unavailable,
+            &dl_resp,
+            &theme,
+        );
+    }
+
+    let dur = track
+        .duration
+        .map_or_else(String::new, |secs| crate::state::fmt_time(secs as f64));
+    ui.text_right(
+        dur_rect,
+        &dur,
+        &style_lh(12.0, Weight::Regular, theme.text_dim, TROW_ARTIST_LINE),
+    );
+
+    if opts.show_like {
+        let (icon, base) = if opts.liked {
+            (Icon::HeartFilled, theme.accent)
+        } else {
+            (Icon::Heart, theme.text_dim)
+        };
+        paint_icon_button(ui, like_rect, icon, 16.0, base, &heart_resp);
+    }
+    if reveal {
+        paint_icon_button(
+            ui,
+            kebab_rect,
+            Icon::MoreVert,
+            15.0,
+            theme.text_dim,
+            &kebab_resp,
+        );
+    }
+
+    if opts.unavailable {
+        // Grey the whole row out (the old `.trow.unavailable { opacity: .4 }`;
+        // the paint contract has no group opacity, so wash it with the bg color).
+        ui.fill(row_rect, theme.bg.with_alpha(153));
+    }
+    if row_resp.focus_visible {
+        ui.focus_ring_inset(row_rect, theme.radius_md);
+    }
+
+    TrackRowResponse {
+        played: row_resp.clicked && !opts.unavailable,
+        like: heart_resp.clicked,
+        menu: kebab_resp.clicked || row_resp.secondary_clicked,
+        album: album_resp.clicked,
+        artist: artist_hits
+            .iter()
+            .find(|hit| hit.clicked)
+            .map(|hit| hit.credit),
+        download: dl_resp.clicked
+            && matches!(opts.download, DownloadStatus::None | DownloadStatus::Failed),
+        remove_download: dl_resp.clicked && opts.download == DownloadStatus::Downloaded,
+        rect: row_rect,
+        kebab_rect,
+        hovered: row_resp.hovered,
+    }
+}
+
+/// Lay out the artist line runs (per-credit links, `", "` separators or the
+/// plain fallback artist string) relative to `artist_line`.
+fn layout_artist_runs<'a>(
+    ui: &mut Ui,
+    track: &'a rift_types::Track,
+    artist_style: &TextStyle,
+    artist_line: Rect,
+) -> Vec<ArtistRun<'a>> {
+    let mut runs: Vec<ArtistRun<'a>> = Vec::with_capacity(track.artists.len() * 2 + 1);
+    let mut x = artist_line.x;
+    if track.artists.is_empty() {
+        let w = ui.text_width(&track.artist, artist_style);
+        runs.push(ArtistRun {
+            text: track.artist.as_str(),
+            id: None,
+            credit: None,
+            rect: Rect::new(x, artist_line.y, w, artist_line.h),
+        });
+        return runs;
+    }
+    for (credit, artist) in track.artists.iter().enumerate() {
+        if credit > 0 {
+            let sep = ", ";
+            let w = ui.text_width(sep, artist_style);
+            runs.push(ArtistRun {
+                text: sep,
+                id: None,
+                credit: None,
+                rect: Rect::new(x, artist_line.y, w, artist_line.h),
+            });
+            x += w;
+        }
+        let w = ui.text_width(&artist.name, artist_style);
+        runs.push(ArtistRun {
+            text: artist.name.as_str(),
+            id: artist.id.as_deref(),
+            credit: Some(credit),
+            rect: Rect::new(x, artist_line.y, w, artist_line.h),
+        });
+        x += w;
+    }
+    runs
+}
+
+/// Paint the artist line (clipped to its column exactly like `.trow-artist {
+/// overflow: hidden }`: long credit lists must not bleed into the album column)
+/// and its focus rings. Rings are painted after the clip so they stay visible.
+fn paint_artist_line(
+    ui: &mut Ui,
+    meta_rect: Rect,
+    artist_line: Rect,
+    runs: &[ArtistRun<'_>],
+    hits: &[ArtistHit],
+    theme: &Theme,
+    artist_style: &TextStyle,
+) {
     ui.with_clip(artist_line, |ui| {
-        for run in &artist_runs {
+        for run in runs {
             if run.rect.x >= meta_rect.right() {
                 break;
             }
-            let hover_t = artist_hits
+            let hover_t = hits
                 .iter()
                 .find(|hit| Some(hit.credit) == run.credit)
-                .map(|hit| hit.hover_t)
-                .unwrap_or(0.0);
+                .map_or(0.0, |hit| hit.hover_t);
             let color = if run.id.is_some() {
                 mix(theme.text_dim, theme.text, hover_t)
             } else {
@@ -333,178 +480,40 @@ pub fn track_row(
             }
         }
     });
-    for run in &artist_runs {
+    for run in runs {
         let Some(credit) = run.credit else { continue };
-        let Some(hit) = artist_hits.iter().find(|hit| hit.credit == credit) else {
+        let Some(hit) = hits.iter().find(|hit| hit.credit == credit) else {
             continue;
         };
         if hit.focus_visible && run.rect.x < meta_rect.right() {
             ui.focus_ring(run.rect, 3.0);
         }
     }
-
-    // Album link (dim, brighter + underlined on hover — `.link:hover`).
-    if album_w > 0.0 {
-        let color = mix(theme.text_dim, theme.text, album_resp.hover_t);
-        ui.text_centered(album_rect, &album_text, &album_style.with_color(color));
-        if album_resp.hover_t > 0.5 {
-            let w = ui.text_width(&album_text, &album_style).min(album_rect.w);
-            let x = album_rect.x + (album_rect.w - w) * 0.5;
-            ui.hline(x, album_rect.y + row_h * 0.5 + 8.0, w, 1.0, color);
-        }
-        if album_resp.focus_visible {
-            ui.focus_ring(album_rect, 4.0);
-        }
-    }
-
-    // Download slot.
-    if opts.show_download {
-        match opts.download {
-            DownloadStatus::Downloaded => {
-                paint_icon_button(
-                    ui,
-                    IconPaint {
-                        rect: dl_ibtn,
-                        icon: Icon::CheckCircle,
-                        icon_size: 15.0,
-                        color: theme.accent,
-                        hover_t: dl_resp.hover_t,
-                        focus_visible: dl_resp.focus_visible,
-                    },
-                );
-            }
-            DownloadStatus::Downloading => spinner(ui, dl_ibtn.center_v(), 14.0, theme.text_dim),
-            DownloadStatus::Failed => {
-                paint_icon_button(
-                    ui,
-                    IconPaint {
-                        rect: dl_ibtn,
-                        icon: Icon::Warning,
-                        icon_size: 15.0,
-                        color: theme.danger,
-                        hover_t: if dl_resp.hovered { 1.0 } else { 0.0 },
-                        focus_visible: dl_resp.focus_visible,
-                    },
-                );
-            }
-            DownloadStatus::None => {
-                if reveal {
-                    paint_icon_button(
-                        ui,
-                        IconPaint {
-                            rect: dl_ibtn,
-                            icon: Icon::Download,
-                            icon_size: 15.0,
-                            color: theme.text_dim,
-                            hover_t: dl_resp.hover_t,
-                            focus_visible: dl_resp.focus_visible,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    let dur = track
-        .duration
-        .map(|secs| crate::state::fmt_time(secs as f64))
-        .unwrap_or_default();
-    ui.text_right(
-        dur_rect,
-        &dur,
-        &style_lh(12.0, Weight::Regular, theme.text_dim, TROW_ARTIST_LINE),
-    );
-
-    if opts.show_like {
-        let (icon, base) = if opts.liked {
-            (Icon::HeartFilled, theme.accent)
-        } else {
-            (Icon::Heart, theme.text_dim)
-        };
-        paint_icon_button(
-            ui,
-            IconPaint {
-                rect: like_rect,
-                icon,
-                icon_size: 16.0,
-                color: base,
-                hover_t: heart_resp.hover_t,
-                focus_visible: heart_resp.focus_visible,
-            },
-        );
-    }
-    if reveal {
-        paint_icon_button(
-            ui,
-            IconPaint {
-                rect: kebab_rect,
-                icon: Icon::MoreVert,
-                icon_size: 15.0,
-                color: theme.text_dim,
-                hover_t: kebab_resp.hover_t,
-                focus_visible: kebab_resp.focus_visible,
-            },
-        );
-    }
-
-    if opts.unavailable {
-        // Grey the whole row out (the old `.trow.unavailable { opacity: .4 }`;
-        // the paint contract has no group opacity, so wash it with the bg color).
-        ui.fill(row_rect, theme.bg.with_alpha(153));
-    }
-    if row_resp.focus_visible {
-        ui.focus_ring(row_rect, theme.radius_md);
-    }
-
-    TrackRowResponse {
-        played: row_resp.clicked && !opts.unavailable,
-        like: heart_resp.clicked,
-        menu: kebab_resp.clicked || row_resp.secondary_clicked,
-        album: album_resp.clicked,
-        artist: artist_hits
-            .iter()
-            .find(|hit| hit.clicked)
-            .map(|hit| hit.credit),
-        download: dl_resp.clicked
-            && matches!(opts.download, DownloadStatus::None | DownloadStatus::Failed),
-        remove_download: dl_resp.clicked && opts.download == DownloadStatus::Downloaded,
-        rect: row_rect,
-        kebab_rect,
-        hovered: row_resp.hovered,
-    }
 }
 
-/// Appearance of an `.ibtn` painted from an *already interacted* response (the
-/// interaction must happen before the row's own, see [`track_row`]).
-struct IconPaint {
+/// Paint the per-row offline download slot from its already-interacted response.
+fn paint_download_slot(
+    ui: &mut Ui,
     rect: Rect,
-    icon: Icon,
-    icon_size: f32,
-    color: Color,
-    hover_t: f32,
-    focus_visible: bool,
-}
-
-/// Paint an `.ibtn`-style icon button from an *already interacted* response.
-fn paint_icon_button(ui: &mut Ui, paint: IconPaint) {
-    let theme = ui.theme().clone();
-    if paint.hover_t > 0.0 {
-        ui.rounded_rect(
-            paint.rect,
-            theme
-                .bg_hover
-                .with_alpha((paint.hover_t * 255.0).round() as u8),
-            theme.radius_sm,
-        );
-    }
-    ui.icon(
-        paint.rect,
-        paint.icon,
-        mix(paint.color, theme.text, paint.hover_t),
-        paint.icon_size,
-    );
-    if paint.focus_visible {
-        ui.focus_ring(paint.rect, theme.radius_sm);
+    status: DownloadStatus,
+    reveal: bool,
+    unavailable: bool,
+    resp: &Response,
+    theme: &Theme,
+) {
+    match status {
+        DownloadStatus::Downloaded => {
+            paint_icon_button(ui, rect, Icon::CheckCircle, 15.0, theme.accent, resp);
+        }
+        DownloadStatus::Downloading => spinner(ui, rect.center_v(), 14.0, theme.text_dim),
+        DownloadStatus::Failed => {
+            paint_icon_button(ui, rect, Icon::Warning, 15.0, theme.danger, resp);
+        }
+        DownloadStatus::None => {
+            if reveal && !unavailable {
+                paint_icon_button(ui, rect, Icon::Download, 15.0, theme.text_dim, resp);
+            }
+        }
     }
 }
 

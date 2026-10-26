@@ -330,17 +330,33 @@ impl RiftBackend {
     /// drain. Construction does **not** block on the network and does not depend
     /// on a window existing (pass [`BackendConfig::default()`] for the headless /
     /// preview degraded path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the data directory cannot be resolved or
+    /// created ([`BackendError::DataDir`] / [`BackendError::CreateDataDir`]), or
+    /// when a required component cannot be initialized
+    /// ([`BackendError::Init`]: the `YouTube` Music client, the HTTP client — in
+    /// practice a `TLS` backend that cannot be loaded — or the backend runtime).
+    /// A missing network or audio device is not an error: those degrade later
+    /// with an `Error` event.
     pub fn new(config: BackendConfig) -> Result<(Self, BackendEvents), BackendError> {
+        // Startup diagnostics: every `startup:` log below is measured from here,
+        // so the launch timeline can be read off the debug log.
+        let startup = std::time::Instant::now();
+        let elapsed_ms = || startup.elapsed().as_secs_f64() * 1000.0;
         let data_dir = resolve_data_dir(&config)?;
         std::fs::create_dir_all(&data_dir).map_err(|source| BackendError::CreateDataDir {
             path: data_dir.clone(),
             source,
         })?;
         info!("data dir: {}", data_dir.display());
+        debug!("startup: data directory +{:.1} ms", elapsed_ms());
 
         let yt = rift_ytmusic::Client::new().map_err(|e| {
             BackendError::Init(format!("could not create the YouTube Music client: {e:#}"))
         })?;
+        debug!("startup: ytmusic client +{:.1} ms", elapsed_ms());
 
         // One durable writer for both user-data files: every library/settings save
         // is queued here and written on this thread, so a command on the UI thread
@@ -348,20 +364,15 @@ impl RiftBackend {
         let durable = Arc::new(DurableWriter::spawn());
 
         let library = Arc::new(Mutex::new(LibraryStore::load(&data_dir, &durable)));
+        debug!("startup: library load +{:.1} ms", elapsed_ms());
         let downloads = Arc::new(Downloads::load(data_dir.join("downloads")));
+        debug!("startup: downloads scan +{:.1} ms", elapsed_ms());
         let settings = SettingsStore::load(&data_dir, &durable);
         let volume = settings.data.volume;
         let discord_rpc = settings.data.discord_rpc;
         let crossfade = f64::from(settings.data.crossfade);
-        // Apply the persisted custom yt-dlp location (if any) before any fetch.
-        crate::fetch::set_ytdlp_override(
-            settings
-                .data
-                .yt_dlp_path
-                .clone()
-                .map(std::path::PathBuf::from),
-        );
         info!("restored volume {volume}");
+        debug!("startup: settings load +{:.1} ms", elapsed_ms());
         let settings = Arc::new(Mutex::new(settings));
 
         // One bus for every consumer: command wrappers, the audio pump, download
@@ -370,6 +381,7 @@ impl RiftBackend {
 
         let (audio_events_tx, audio_events_rx) = tokio::sync::mpsc::unbounded_channel();
         let audio_tx = audio::spawn(audio_events_tx);
+        debug!("startup: audio thread spawn +{:.1} ms", elapsed_ms());
         // Apply the persisted volume to the fresh audio thread.
         let _ = audio_tx.send(AudioCmd::Volume(volume));
 
@@ -394,17 +406,18 @@ impl RiftBackend {
                 core.shuffle_history = core.current.into_iter().collect();
             }
         }
+        debug!("startup: playback snapshot +{:.1} ms", elapsed_ms());
 
         let player = Arc::new(PlayerShared {
             core: Mutex::new(core),
             audio: audio_tx,
             yt,
             // Every request this client makes is small and latency-bound
-            // (update checks, the release-asset download, yt-dlp probing), so it
-            // needs a ceiling: reqwest's default is *no* timeout, and a stalled
-            // socket would otherwise wedge a command forever — including a
-            // download worker holding a `Downloads::begin` claim that is then
-            // never released.
+            // (metadata/player JSON, update checks, image URLs), so it needs a
+            // ceiling: reqwest's default is *no* timeout, and a stalled socket
+            // would otherwise wedge a command forever — including a download
+            // worker holding a `Downloads::begin` claim that is then never
+            // released. Audio downloads use their own client in `stream`.
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(30))
@@ -418,13 +431,16 @@ impl RiftBackend {
             persist: Persister::spawn(),
             last_session: Mutex::new(None),
         });
+        debug!("startup: http client (TLS) +{:.1} ms", elapsed_ms());
 
         // The media thread needs to call back into the player when the OS sends a
         // media key. It holds only a `Weak` reference, filled in after the shared
         // state exists (it never fires before the app has started playback).
         let media_slot: Arc<OnceLock<Weak<BackendInner>>> = Arc::new(OnceLock::new());
         let media = media::spawn(config.media_hwnd, media_slot.clone());
+        debug!("startup: media thread spawn +{:.1} ms", elapsed_ms());
         let discord = discord::spawn(discord_rpc);
+        debug!("startup: discord thread spawn +{:.1} ms", elapsed_ms());
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -432,6 +448,7 @@ impl RiftBackend {
             .enable_all()
             .build()
             .map_err(|e| BackendError::Init(format!("could not start the backend runtime: {e}")))?;
+        debug!("startup: tokio runtime +{:.1} ms", elapsed_ms());
 
         let inner = Arc::new(BackendInner {
             player,
@@ -466,6 +483,7 @@ impl RiftBackend {
                 info!("metadata repair: filled library rows from the restored playback queue");
             }
         }
+        debug!("startup: library metadata merge +{:.1} ms", elapsed_ms());
 
         // The audio thread is the progress ticker: it forwards position updates
         // several times a second, and this pump turns them into `Progress`
@@ -485,7 +503,7 @@ impl RiftBackend {
             repair_incomplete_library_metadata(repair_state).await;
         });
 
-        info!("backend started");
+        info!("backend started (+{:.1} ms)", elapsed_ms());
         Ok((
             Self {
                 runtime,

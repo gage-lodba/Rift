@@ -61,10 +61,16 @@ pub fn height(_ui: &mut Ui, state: &State, _width: f32, id: &str) -> f32 {
 
 /// Draw the playlist view at `area`.
 pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rect, id: &str) {
-    let Some(playlist) = state.playlist(id).cloned() else {
+    let Some(index) = state
+        .library
+        .playlists
+        .iter()
+        .position(|playlist| playlist.id == id)
+    else {
         pages::empty(ui, area.x, area.y, area.w, "Playlist not found.");
         return;
     };
+    let name = state.library.playlists[index].name.clone();
     let is_renaming = state.renaming.as_ref().is_some_and(|(rid, _)| rid == id);
 
     let mut y = if is_renaming {
@@ -114,11 +120,11 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         let h2_y = area.y + (HEAD_H - pages::H2_LINE) * 0.5;
         ui.text(
             Rect::new(area.x, h2_y, area.w - 40.0, pages::H2_LINE),
-            &playlist.name,
+            &name,
             &crate::screens::cards::style_lh(17.0, Weight::Bold, theme.text, pages::H2_LINE),
         );
         let title_w = ui.text_width(
-            &playlist.name,
+            &name,
             &crate::screens::cards::style(17.0, Weight::Bold, theme.text),
         );
         let kebab_rect = Rect::new(
@@ -129,10 +135,10 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         );
         let kebab = menu::kebab(ui, kebab_rect, Id::from_str("playlist/header-kebab"));
         if kebab.clicked {
-            let entries = header_menu_entries(&playlist.id, &playlist.name);
+            let entries = header_menu_entries(id, &name);
             menu::open(
                 ui,
-                Id::from_str("playlist/header-menu").with(&playlist.id),
+                Id::from_str("playlist/header-menu").with(id),
                 kebab_rect,
                 entries,
             );
@@ -140,7 +146,13 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         area.y + head_height(false)
     };
 
-    if playlist.tracks.is_empty() {
+    // Move the track list out of `State` for the frame: the header and rows need
+    // `&mut State` (cover requests), so borrowing it from `state.library` would
+    // conflict, and cloning every track per frame would allocate on the hot path.
+    // It goes back before returning (also on the empty early return below).
+    let tracks = std::mem::take(&mut state.library.playlists[index].tracks);
+    if tracks.is_empty() {
+        state.library.playlists[index].tracks = tracks;
         pages::empty(
             ui,
             area.x,
@@ -150,8 +162,7 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         );
         return;
     }
-    let tracks = playlist.tracks;
-    let source = format!("playlist:{}", playlist.id);
+    let source = format!("playlist:{id}");
     let sources = Some(source.as_str());
     y = pages::collection_head(
         ui,
@@ -163,12 +174,12 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
             w: area.w,
             tracks: &tracks,
             source: sources,
-            id_key: &format!("playlist:{}", playlist.id),
+            id_key: &source,
         },
     );
     let opts = track_list::TrackListOpts {
         source: sources,
-        playlist_id: Some(&playlist.id),
+        playlist_id: Some(id),
         id: "playlist-list",
         ..track_list::TrackListOpts::default()
     };
@@ -180,6 +191,7 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         &tracks,
         &opts,
     );
+    state.library.playlists[index].tracks = tracks;
 }
 
 #[cfg(test)]

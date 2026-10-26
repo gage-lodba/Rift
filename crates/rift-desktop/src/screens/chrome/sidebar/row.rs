@@ -5,7 +5,6 @@ use crate::screens::{cards, menu};
 use crate::state::Action;
 use crate::text::Weight;
 use crate::ui::{Icon, Id, Rect, Response, Sense, Ui};
-
 // ---------------------------------------------------------------------------
 // measured decomposition (ui-spec.md §6)
 // ---------------------------------------------------------------------------
@@ -37,11 +36,23 @@ pub(super) fn sidebar_pinned_rows(rect: Rect) -> (f32, f32, f32, f32) {
     (import_y, file_y, settings_y, divider_y)
 }
 
-/// Stable id of a sidebar row (matches [`side_row`]'s id derivation, so inline
-/// editors can tell "focus is still on the row that opened me" from "focus
-/// moved elsewhere, close").
+/// Stable id of a nav sidebar row (matches [`side_row`]'s caller-side id
+/// derivation, so inline editors can tell "focus is still on the row that
+/// opened me" from "focus moved elsewhere, close").
 pub(super) fn side_row_id(label: &str, active: bool) -> Id {
     Id::from_str("sidebar/row").with((label, active))
+}
+
+/// Stable id of a playlist row and of its kebab menu: derived from the
+/// playlist's id, not its name (two playlists may share a name, and a rename
+/// must not move the row's hover/focus/drag state to another row).
+pub(super) fn playlist_row_id(id: &str) -> Id {
+    Id::from_str("sidebar/playlist-row").with(id)
+}
+
+/// The context-menu id of a playlist row (`menu::open`/`is_open` key).
+pub(super) fn playlist_menu_id(row_id: Id) -> Id {
+    row_id.with("menu")
 }
 
 /// One sidebar row. Returns the interaction; the caller handles navigation
@@ -51,7 +62,7 @@ pub(super) fn side_row_id(label: &str, active: bool) -> Id {
 /// painting a glyph, which the now-playing rows use for the equalizer so the
 /// two indicators never overlap (the equalizer *replaces* the row's icon).
 ///
-/// `draggable` selects the interaction sense: playlist rows use [`Sense::DRAG`]
+/// `behavior` selects the interaction sense: playlist rows use [`Sense::DRAG`]
 /// so the sidebar can reorder them (the old UI's shared `use_reorder` hook);
 /// every other row keeps a plain click.
 ///
@@ -99,8 +110,10 @@ impl RowBehavior {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // immediate-mode widget: explicit layout args are the API
 pub(super) fn side_row(
     ui: &mut Ui,
+    row_id: Id,
     rect: Rect,
     icon: Option<Icon>,
     label: &str,
@@ -109,29 +122,37 @@ pub(super) fn side_row(
     behavior: RowBehavior,
 ) -> SideRow {
     let theme = ui.theme().clone();
-    let id = side_row_id(label, active);
     // Measurements first: the kebab must be interacted *before* the row so its
     // press latches first (the first hovered widget to see the press wins, like
-    // the old DOM's nested buttons stopping propagation).
-    let count_w = count
-        .map(|c| {
-            ui.text_width(
-                &c.to_string(),
-                &cards::style(11.0, Weight::Regular, theme.text_dim),
-            )
-        })
-        .unwrap_or(0.0);
+    // the old DOM's nested buttons stopping propagation). The count is rendered
+    // into one buffer reused by the paint below (one allocation per row instead
+    // of two).
+    let mut count_buf = String::with_capacity(8);
+    let count_w = count.map_or(0.0, |c| {
+        count_buf.clear();
+        let _ = std::fmt::write(&mut count_buf, format_args!("{c}"));
+        ui.text_width(
+            &count_buf,
+            &cards::style(11.0, Weight::Regular, theme.text_dim),
+        )
+    });
     let kebab = Rect::new(
         rect.right() - 10.0 - 22.0,
         rect.y + (rect.h - 22.0) * 0.5,
         22.0,
         22.0,
     );
+    // Count ↔ kebab swap (the old CSS hides one to show the other). The kebab is
+    // also shown while the row has keyboard focus or its menu is open, so it is
+    // reachable without a pointer (ui-spec §6.2).
     let hovering = ui.hovered(rect);
-    let kebab_resp = if count.is_some() && hovering {
+    let focused = ui.focused_id() == Some(row_id);
+    let menu_open = menu::open_id() == Some(playlist_menu_id(row_id));
+    let show_kebab = count.is_some() && (hovering || focused || menu_open);
+    let kebab_resp = if show_kebab {
         Some(ui.interact(
             kebab,
-            id.with("kebab"),
+            row_id.with("kebab"),
             if behavior.interactive {
                 Sense::CLICK
             } else {
@@ -150,7 +171,7 @@ pub(super) fn side_row(
     } else {
         Sense::CLICK
     };
-    let response = ui.interact(rect, id, row_sense);
+    let response = ui.interact(rect, row_id, row_sense);
 
     let t = response.hover_t;
     let bg = if active {
@@ -185,13 +206,12 @@ pub(super) fn side_row(
         &cards::style_lh(14.0, Weight::Medium, text_color, 19.0),
     );
 
-    // Count ↔ kebab swap on hover (the old CSS hides one to show the other).
     let mut kebab_clicked = false;
     match count {
-        Some(n) if !hovering => {
+        Some(_) if !show_kebab => {
             ui.text_right(
                 Rect::new(rect.right() - 10.0 - count_w, rect.y, count_w, rect.h),
-                &n.to_string(),
+                &count_buf,
                 &cards::style_lh(11.0, Weight::Regular, theme.text_dim, 15.0),
             );
         }
@@ -220,13 +240,13 @@ pub(super) fn side_row(
         None => {}
     }
     if response.focus_visible {
-        ui.focus_ring(rect, theme.radius_md);
+        ui.focus_ring_inset(rect, theme.radius_md);
     }
     SideRow {
         drag_started: response.drag_started,
         response,
         kebab_clicked,
-        secondary_clicked: kebab_resp.map(|r| r.secondary_clicked).unwrap_or(false)
+        secondary_clicked: kebab_resp.is_some_and(|response| response.secondary_clicked)
             || response.secondary_clicked,
         kebab_rect: kebab,
         icon_rect,

@@ -8,17 +8,14 @@
 //! 13 dim description (wrapped); right column: the control.
 //!
 //! Rows in order: Discord Rich Presence (switch), Crossfade (switch + 1..12 s
-//! slider when on), Streaming engine / yt-dlp (status badge + path, download
-//! action when missing, custom path input + Save, "Check again"), Updates
-//! (status line, "Check now" / "Download update", notification switch).
+//! slider when on), Updates (status line, "Check now" / "Download update",
+//! notification switch).
 
 mod layout;
-mod state;
 #[cfg(test)]
 mod tests;
 mod updates;
 mod view;
-mod ytdlp;
 
 pub use layout::{
     height, row_heights, BTN_H, DESC_GAP, LABEL_H, ROW_GAP, ROW_MAX_W, ROW_PAD_X, ROW_PAD_Y,

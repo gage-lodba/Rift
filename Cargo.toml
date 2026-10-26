@@ -1,9 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/rift-types", "crates/rift-ytmusic", "crates/rift", "crates/rift-desktop"]
+members = [
+    "crates/rift-types",
+    "crates/rift-discord",
+    "crates/rift-ytmusic",
+    "crates/rift",
+    "crates/rift-desktop",
+]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Gage Lodba"]
@@ -23,8 +29,20 @@ repository = "https://github.com/gage-lodba/Rift"
 rust-version = "1.88"
 
 [workspace.dependencies]
+# Dependency versions shared by more than one member crate live here, so those
+# members cannot silently drift to different major versions of the same crate
+# (two majors of one crate in one binary means duplicated types, an extra TLS
+# stack, or a second `rand` generation — see `.github/scripts/check-duplicate-deps.sh`).
+# Only the *version floor* is shared: each member still lists exactly the
+# features it uses, and Cargo unions feature sets across the graph, so adding a
+# feature in one crate cannot surprise another.
+anyhow = "1.0.102"
+reqwest = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = "1.52.3"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
 
 # Shared lint policy. Members opt in with `[lints] workspace = true`.
 #
@@ -33,17 +51,36 @@ serde_json = "1"
 # already treats warnings as errors, this documents the intent).
 #
 # The clippy lints here are the "would be a bug" class rather than style:
-# every `unsafe` block needs a `// SAFETY:` note, and debug/todo leftovers must
-# not ship.
+# every `unsafe` block needs a `// SAFETY:` note, debug/todo leftovers must not
+# ship, a `Duration`/`Instant` subtraction must be checked (it panics in debug
+# builds near process start), a suspicious operator grouping is usually a typo,
+# and a giant stack frame/array is a stack-overflow waiting to happen. All of
+# these were either already clean or made clean by the review that added them,
+# so the gate holds the line instead of documenting a wish.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+# Allow-by-default rustc lints worth stating: they are pure hygiene (explicit
+# `'_` in paths, no unused or single-use lifetimes, no casts like `x as u64`
+# where `x` is already `u64`) and the workspace is currently clean of them.
+elided_lifetimes_in_paths = "warn"
+unused_lifetimes = "warn"
+trivial_numeric_casts = "warn"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+unchecked_duration_subtraction = "warn"
+suspicious_operation_groupings = "warn"
+large_stack_arrays = "warn"
+large_stack_frames = "warn"
+# The four library crates (`rift`, `rift-types`, `rift-ytmusic`, `rift-discord`)
+# document their public `Result` contracts with `# Errors` sections; the app
+# crate opts out in its crate roots because its public surface is internal to the
+# binary.
+missing_errors_doc = "warn"
 
 [profile.release]
 lto = true
@@ -60,3 +97,25 @@ strip = "symbols"
 # silently fatal to every open window ("abort" would skip the unwinding path
 # entirely, so both of those properties are lost). The size cost of unwinding is
 # negligible next to LTO + symbol stripping.
+
+# Development builds are the slow path for `cargo run`/IDE launches: the
+# unstripped debug executable is ~42 MB, and on Windows the loader plus
+# real-time AV scanning of that file costs several hundred milliseconds before
+# `main` even starts (measured: ~650 ms pre-`main` vs ~30 ms for the stripped
+# release exe). Line tables keep file/line information for backtraces and
+# debugger step-through while dropping full DWARF, which shrinks the file and
+# the link time without changing codegen.
+#
+# The two packages on the startup critical path get a small optimisation bump
+# without rebuilding every dependency at a higher opt level: `fontdue` parses
+# the six embedded faces (the largest CPU-only startup cost) and `rift-desktop`
+# lays out and rasterises the first frame. Both are a small extra compile cost
+# for a much shorter dev-mode launch; `cargo test` also runs faster with them.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package.fontdue]
+opt-level = 3
+
+[profile.dev.package.rift-desktop]
+opt-level = 1

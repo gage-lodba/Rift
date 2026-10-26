@@ -891,3 +891,16 @@ fn focus_loss_clears_the_active_latch_so_the_next_click_works() {
         "the first post-refocus press must not be swallowed by the old latch"
     );
 }
+
+#[test]
+fn single_line_text_with_a_newline_still_ellipsizes_at_the_first_line() {
+    // `ui.text` is the single-line label path: a hard newline must not draw the
+    // second line. With the wide rect the first line fits, so the result is the
+    // first line plus the ellipsis ("first…" = 6 glyphs), never "second".
+    let mut ui = Ui::new();
+    let (_, paint) = frame(&mut ui, input_at(0.0), |ui| {
+        let style = body_style(ui);
+        ui.text(Rect::new(0.0, 0.0, 300.0, 20.0), "first\nsecond", &style);
+    });
+    assert_eq!(prims(&paint), 6, "first line + ellipsis glyphs");
+}

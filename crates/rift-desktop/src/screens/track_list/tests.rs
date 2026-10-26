@@ -3,7 +3,7 @@
 //! context-menu entry order.
 
 use super::*;
-use rift_types::{DownloadState, Library, PlaybackState, Playlist};
+use rift_types::{DownloadState, Library, PlaybackState, Playlist, Track};
 
 use crate::screens::{cards, menu};
 use crate::state::{Action, State};
@@ -562,4 +562,108 @@ fn artist_credit_click_navigates_to_the_profile() {
 fn list_height_is_54_per_row() {
     assert_eq!(list_height(0), 0.0);
     assert_eq!(list_height(5), 270.0);
+}
+
+// ---------------------------------------------------------------------------
+// determinate download progress bar plumbing
+// ---------------------------------------------------------------------------
+
+/// Every solid `Prim::Rect` in the frame as `(rect, color, radius)`.
+fn solid_prims(paint: &crate::gfx::paint::PaintList) -> Vec<(Rect, Color, f32)> {
+    use crate::gfx::paint::Prim;
+    paint
+        .layers
+        .iter()
+        .flat_map(|layer| layer.prims.iter())
+        .filter_map(|prim| match prim {
+            Prim::Rect {
+                rect,
+                color,
+                radius,
+                ..
+            } => Some((*rect, *color, *radius)),
+            Prim::Image { .. } => None,
+        })
+        .collect()
+}
+
+/// The 3 px determinate download-bar prims of a paint list.
+fn bar_prims(paint: &crate::gfx::paint::PaintList) -> Vec<(Rect, Color, f32)> {
+    solid_prims(paint)
+        .into_iter()
+        .filter(|(rect, ..)| (rect.h - 3.0).abs() < 0.01)
+        .collect()
+}
+
+/// One static (unhovered) frame of the list under test.
+fn list_paint(
+    ui: &mut Ui,
+    state: &mut State,
+    tracks: &[Track],
+    rect: Rect,
+    id: &str,
+) -> crate::gfx::paint::PaintList {
+    let opts = TrackListOpts {
+        id,
+        ..TrackListOpts::default()
+    };
+    let viewport = Rect::new(0.0, 0.0, 1000.0, 300.0);
+    let input = crate::ui::InputState {
+        viewport,
+        time: 0.0,
+        ..crate::ui::InputState::default()
+    };
+    let mut actions = Vec::new();
+    ui.begin_frame(input, viewport);
+    track_list(ui, state, &mut actions, rect, tracks, &opts);
+    let _ = actions;
+    ui.end_frame()
+}
+
+/// `DownloadState.progress` must reach the row: a downloading track paints the
+/// determinate bar when the map has its permille entry, and only the spinner
+/// when it does not (queued behind the active track).
+#[test]
+fn downloading_row_gets_the_determinate_bar_from_state_progress() {
+    let mut ui = Ui::new();
+    let mut state = rich_state();
+    state.downloads.downloading.insert("rt".into());
+    let tracks = vec![rich_track()];
+    let rect = Rect::new(100.0, 100.0, 766.0, 54.0);
+    let theme = ui.theme().clone();
+
+    // No entry in the map: unknown fraction, so no bar (spinner only).
+    let paint = list_paint(&mut ui, &mut state, &tracks, rect, "dl-bar-list");
+    assert!(
+        bar_prims(&paint).is_empty(),
+        "unknown fraction must not paint a bar"
+    );
+
+    // The whole `DownloadState` snapshot arrives in the `Downloads` event; the
+    // list must map its progress entry into the row opts.
+    state.downloads.progress.insert("rt".into(), 500);
+    let paint = list_paint(&mut ui, &mut state, &tracks, rect, "dl-bar-list");
+    let bars = bar_prims(&paint);
+    assert_eq!(bars.len(), 2, "track + fill prims expected, got {bars:?}");
+    let (track_bar, track_color, _) = bars[0];
+    let (fill_bar, fill_color, _) = bars[1];
+
+    // Geometry from ui-spec §7.1.3: under the meta block, i.e. x = cover end +
+    // gap, y = row + 46.5, 3 px tall, meta-column width.
+    let artist_line_bottom = (cards::TROW_TITLE_LINE + cards::TROW_ARTIST_LINE)
+        + (cards::TROW_HEIGHT - (cards::TROW_TITLE_LINE + cards::TROW_ARTIST_LINE)) * 0.5;
+    let expected_x = cards::TROW_PAD_X + cards::TROW_COVER + cards::TROW_GAP;
+    assert!(
+        (track_bar.x - (rect.x + expected_x)).abs() < 0.01,
+        "{track_bar:?}"
+    );
+    assert!(
+        (track_bar.y - (rect.y + artist_line_bottom + 3.0)).abs() < 0.01,
+        "{track_bar:?}"
+    );
+    assert_eq!(track_bar.h, 3.0);
+    assert!(track_bar.w > 0.0 && track_bar.right() < rect.right());
+    assert_eq!(track_color, theme.bg_hover);
+    assert!((fill_bar.w - track_bar.w * 0.5).abs() < 0.01);
+    assert_eq!(fill_color, theme.accent);
 }

@@ -17,20 +17,22 @@ impl BackendHandle {
     /// arrives as [`BackendEvent`](crate::BackendEvent)s.
     #[must_use]
     pub fn bootstrap(&self) -> Bootstrap {
-        let core = self.inner.player.core.lock_safe();
-        let lib = self.inner.library.lock_safe();
-        // Read all settings under a single lock: two `lock_safe()` calls in the
-        // same struct literal would both stay alive until the literal is built
-        // and deadlock on the non-reentrant mutex.
-        let (discord_rpc, crossfade, yt_dlp_path, update_notifications) = {
+        // Read the settings first, under their own guard: the launcher snapshot
+        // takes the player and library locks too, and nesting three unrelated
+        // mutexes is a lock-order promise nothing here needs. All fields are
+        // read in one tuple because two `lock_safe()` calls in the same struct
+        // literal would both stay alive until the literal is built and deadlock
+        // on the non-reentrant mutex.
+        let (discord_rpc, crossfade, update_notifications) = {
             let s = self.inner.settings.lock_safe();
             (
                 s.data.discord_rpc,
                 s.data.crossfade,
-                s.data.yt_dlp_path.clone(),
                 s.data.update_notifications,
             )
         };
+        let core = self.inner.player.core.lock_safe();
+        let lib = self.inner.library.lock_safe();
         Bootstrap {
             library: lib.data.clone(),
             queue: snapshot(&core),
@@ -38,7 +40,6 @@ impl BackendHandle {
             volume: core.volume,
             discord_rpc,
             crossfade,
-            yt_dlp_path,
             update_notifications,
             track: core.current.and_then(|i| core.queue.get(i).cloned()),
             progress: Progress {

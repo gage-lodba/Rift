@@ -624,3 +624,32 @@ fn stress_10k_prims_many_clips_and_atlas_growth() {
     );
     renderer.shutdown();
 }
+
+/// resizing a headless renderer must reallocate the offscreen image, not just
+/// update the bookkeeping size: before the fix the readback buffer used the new
+/// dimensions while the render target was still the old one.
+#[test]
+fn headless_resize_reallocates_the_offscreen_target() {
+    let Some(mut renderer) = headless_or_skip(64, 32) else {
+        return;
+    };
+    let clear = Color::hex(0x33_66_99);
+    let paint = PaintList::new(clear);
+    // Warm up at the initial size, then resize to a different pixel count.
+    renderer.render_offscreen(&paint).expect("initial render");
+    renderer.resize((80, 60));
+    assert_eq!(renderer.window_size(), (80, 60));
+    let rgba = renderer
+        .render_offscreen(&paint)
+        .expect("render after resize");
+    assert_eq!(rgba.len(), 80 * 60 * 4, "readback uses the new size");
+    // A corner pixel only exists in the reallocated image; the old target
+    // would have left it at the zero-initialised buffer value.
+    assert_near(
+        pixel(&rgba, 80, 79, 59),
+        [0x33, 0x66, 0x99, 0xFF],
+        3,
+        "clear colour after resize",
+    );
+    renderer.shutdown();
+}

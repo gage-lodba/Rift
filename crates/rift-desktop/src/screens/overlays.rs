@@ -26,11 +26,9 @@
 
 use crate::gfx::paint::Color;
 use crate::screens::cards;
-use crate::state::{Action, State, Toast};
+use crate::state::{Action, State};
 use crate::text::Weight;
 use crate::ui::{Icon, Id, Rect, Ui};
-
-use cards::mix;
 
 // ---------------------------------------------------------------------------
 // toast geometry (ui-spec.md §6.5)
@@ -144,14 +142,15 @@ pub fn banner_origin(viewport: Rect, size: (f32, f32)) -> Rect {
 /// Draw every window-anchored overlay for this frame. See the module note about
 /// calling this early in the frame.
 pub fn overlays(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, viewport: Rect) {
-    toast(ui, state, actions, viewport);
+    toast(ui, state, viewport);
     update_banner(ui, state, actions, viewport);
 }
 
 /// The toast (ui-spec.md §6.5): bottom-left card, one at a time, auto-expired by
 /// `App::tick`. The old CSS has a single toast component and only the *error*
 /// palette (informational notices are red-tinted too); we keep that one style.
-pub fn toast(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, viewport: Rect) {
+/// It has no actions (no close button, ui-spec §6.5).
+pub fn toast(ui: &mut Ui, state: &mut State, viewport: Rect) {
     let Some(toast) = state.toast.as_ref() else {
         return;
     };
@@ -185,8 +184,6 @@ pub fn toast(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, viewport
         let style = cards::style_lh(13.0, Weight::Regular, text, TOAST_LINE);
         ui.text_wrapped(inner, &message, &style);
     });
-    let _ = actions;
-    let _ = Toast::LIFETIME;
 }
 
 /// The launch-time update banner (ui-spec.md §6.6): bottom-right card with the
@@ -196,10 +193,8 @@ pub fn update_banner(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, 
         return;
     };
     let theme = ui.theme().clone();
-    let current = status.current.clone();
-    let latest = status.latest.clone().unwrap_or_default();
-    let url = status.url.clone();
-    let _ = current;
+    let latest = status.latest.as_deref().unwrap_or_default();
+    let url = status.url.as_deref();
     let text = format!("Rift v{latest} is available.");
 
     let text_style = cards::style_lh(13.0, Weight::Regular, theme.text, BANNER_LINE);
@@ -232,8 +227,8 @@ pub fn update_banner(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, 
         )
         .clicked
         {
-            if let Some(url) = url.clone() {
-                actions.push(Action::OpenUrl(url));
+            if let Some(url) = url {
+                actions.push(Action::OpenUrl(url.to_string()));
             }
         }
         x += download_w + BANNER_GAP;
@@ -264,7 +259,7 @@ pub fn update_banner(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, 
             Id::from_str("overlay/update/dismiss"),
             Icon::Close,
             16.0,
-            mix(theme.text_dim, theme.text, 0.0),
+            theme.text_dim,
         )
         .clicked
         {

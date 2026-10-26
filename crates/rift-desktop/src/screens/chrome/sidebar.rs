@@ -17,10 +17,14 @@ mod tests;
 
 use self::editors::{eq_bars, import_playlist_input, new_playlist_input};
 use self::row::{
-    playlist_menu_entries, side_row, sidebar_pinned_rows, RowBehavior, DIVIDER_MARGIN,
-    FILE_TO_DIVIDER, IMPORT_TO_FILE, SETTINGS_FROM_BOTTOM, SIDE_ITEM_GAP, SIDE_ITEM_H, SIDE_PAD,
-    SIDE_PAD_V,
+    playlist_menu_entries, playlist_menu_id, playlist_row_id, side_row, side_row_id,
+    sidebar_pinned_rows, RowBehavior, SIDE_ITEM_GAP, SIDE_ITEM_H, SIDE_PAD, SIDE_PAD_V,
 };
+
+/// Stable id of the playlist scroll container.
+const PLAYLIST_SCROLL_ID: &str = "sidebar/playlists";
+/// Extra space below the last playlist row/new-playlist row in the scroll area.
+const PLAYLIST_LIST_PAD_BOTTOM: f32 = 4.0;
 
 /// Row pitch of the playlist list (38 px row + 3 px gap).
 const PLAYLIST_PITCH: f32 = SIDE_ITEM_H + SIDE_ITEM_GAP;
@@ -127,6 +131,14 @@ pub(super) fn drag_visual_index(i: usize, from: usize, over: usize) -> usize {
     }
 }
 
+/// Slot under `pointer_y` for a scroll content top of `content_top`.
+fn slot_at(pointer_y: f32, content_top: f32, count: usize) -> Option<usize> {
+    (count > 0).then(|| {
+        (((pointer_y - content_top) / PLAYLIST_PITCH).round() as isize)
+            .clamp(0, count.saturating_sub(1) as isize) as usize
+    })
+}
+
 /// The left navigation: Home/Liked nav, the playlist list, import actions and
 /// Settings, with the drag-resize handle on its right edge.
 pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: Rect) {
@@ -181,6 +193,7 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     let home_active = state.view == View::Home;
     if side_row(
         ui,
+        side_row_id("Home", home_active),
         Rect::new(x, y, w, SIDE_ITEM_H),
         Some(Icon::Home),
         "Home",
@@ -205,6 +218,7 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     let liked_playing = state.playing_source() == Some("liked");
     let liked = side_row(
         ui,
+        side_row_id("Liked Songs", liked_active),
         Rect::new(x, y, w, SIDE_ITEM_H),
         if liked_playing {
             None
@@ -237,18 +251,20 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     );
     y += 13.0 + 6.0;
 
-    // Scrollable playlist region, clipped between here and the pinned bottom.
-    let pinned_import_y = rect.bottom()
-        - SETTINGS_FROM_BOTTOM
-        - DIVIDER_MARGIN * 2.0
-        - 1.0
-        - FILE_TO_DIVIDER
-        - IMPORT_TO_FILE
-        - SIDE_ITEM_H;
-    let region = Rect::new(x, y, w, (pinned_import_y - 8.0 - y).max(0.0));
-    let playlists = state.sidebar_playlists();
+    // Pinned bottom block geometry: the playlist scroll region ends 8 px above
+    // the pinned "Import playlist" row (`ui-spec.md` §6.2: the nav area is
+    // `flex: 1`, the pinned block never scrolls).
+    let (import_y, file_y, settings_y, divider_y) = sidebar_pinned_rows(rect);
+    let region = Rect::new(x, y, w, (import_y - 8.0 - y).max(0.0));
+
+    // Move the playlist list out of `State` for the frame: the row painters and
+    // the header below need `&mut State` (cover requests, editor drafts), so
+    // borrowing straight from `state.library` would conflict — and cloning the
+    // list (with every track) on every frame would allocate on the hot path.
+    // The list goes back before the pinned rows draw.
+    let playlists = std::mem::take(&mut state.library.playlists);
     let playlist_count = playlists.len();
-    let playlist_ids: Vec<String> = playlists.iter().map(|(id, _, _)| id.clone()).collect();
+
     // Window focus loss: the release edge for a held drag will never arrive, so
     // cancel it without committing (task-50). The frame is marked handled so the
     // stale click cannot navigate; `Ui::begin_frame` has already dropped its
@@ -276,9 +292,17 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
         let mut hold = hold.borrow_mut();
         if let Some(held) = hold.as_ref() {
             let expired = ui.time() > held.until;
-            let caught_up = held.ids == playlist_ids;
+            let caught_up = held.ids.len() == playlist_count
+                && held
+                    .ids
+                    .iter()
+                    .zip(playlists.iter())
+                    .all(|(held_id, playlist)| held_id == &playlist.id);
             let incompatible = held.ids.len() != playlist_count
-                || held.ids.iter().any(|id| !playlist_ids.contains(id));
+                || held
+                    .ids
+                    .iter()
+                    .any(|held_id| !playlists.iter().any(|playlist| &playlist.id == held_id));
             if expired || caught_up || incompatible {
                 *hold = None;
             }
@@ -292,13 +316,15 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     // preview (dragged row at the target slot, rows between slide one slot);
     // while the committed-order hold is active the target is the held order's
     // index for the row's id; otherwise the row's real index.
+    //
+    // The scroll offset is read before the container runs (it is one frame old;
+    // a wheel tick during a held drag is a non-gesture). The drag commit below
+    // recomputes the slot against the container's actual content top.
+    let scroll_id = Id::from_str(PLAYLIST_SCROLL_ID);
+    let content_top = region.y - ui.scroll_offset(scroll_id);
     let drag_from = PLAYLIST_DRAG_FROM.with(|from| from.get());
-    let drag_over = drag_from.and_then(|_| {
-        (playlist_count > 0).then(|| {
-            (((ui.input().mouse_pos.1 - region.y) / PLAYLIST_PITCH).round() as isize)
-                .clamp(0, playlist_count.saturating_sub(1) as isize) as usize
-        })
-    });
+    let drag_over =
+        drag_from.and_then(|_| slot_at(ui.input().mouse_pos.1, content_top, playlist_count));
     let target_slot = |i: usize, id: &str| -> f32 {
         if let Some(from) = drag_from {
             drag_visual_index(i, from, drag_over.unwrap_or(from)) as f32
@@ -313,13 +339,13 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     let dt = ui.input().delta_time;
     let mut slot_x: Vec<f32> = Vec::with_capacity(playlist_count);
     let mut slot_target: Vec<f32> = Vec::with_capacity(playlist_count);
-    for (i, id) in playlist_ids.iter().enumerate() {
-        let target = target_slot(i, id);
+    for (i, playlist) in playlists.iter().enumerate() {
+        let target = target_slot(i, &playlist.id);
         slot_target.push(target);
         // New rows appear settled at their target; existing rows glide.
         let x = SLOT_SPRINGS.with(|springs| {
             let mut springs = springs.borrow_mut();
-            match springs.get_mut(id) {
+            match springs.get_mut(playlist.id.as_str()) {
                 Some(spring) => {
                     let (x, v) = spring_slot(spring.x, spring.v, target, dt);
                     spring.x = x;
@@ -327,7 +353,7 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
                     x
                 }
                 None => {
-                    springs.insert(id.clone(), SlotSpring { x: target, v: 0.0 });
+                    springs.insert(playlist.id.clone(), SlotSpring { x: target, v: 0.0 });
                     target
                 }
             }
@@ -338,7 +364,7 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     SLOT_SPRINGS.with(|springs| {
         springs
             .borrow_mut()
-            .retain(|id, _| playlist_ids.iter().any(|current| current == id));
+            .retain(|id, _| playlists.iter().any(|playlist| &playlist.id == id));
     });
 
     // After a drop/Alt move the rows glide to their new slots for ~0.3 s. While
@@ -359,15 +385,25 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
         order.retain(|i| *i != from);
         order.push(from);
     }
-    let new_row_y = region.y + playlist_count as f32 * PLAYLIST_PITCH;
-    ui.with_clip(region, |ui| {
+    let content_h = (playlist_count as f32 + 1.0) * PLAYLIST_PITCH + PLAYLIST_LIST_PAD_BOTTOM;
+    ui.scroll_area(scroll_id, region, content_h, |ui, content| {
+        let content_top = content.y;
         for i in order {
-            let (id, name, count) = &playlists[i];
-            // Animated position (fractional row slots); ids stay bound to the
-            // row's identity, so hover/kebab/drag all follow the moving row.
-            let row = Rect::new(x, region.y + slot_x[i] * PLAYLIST_PITCH, w, SIDE_ITEM_H);
-            let active = matches!(&state.view, View::Playlist(v) if v == id);
-            let playing = state.playing_source() == Some(format!("playlist:{id}").as_str());
+            // Cull rows outside the scroll viewport: painting every playlist of a
+            // large library would be wasted work (the container clips them anyway).
+            let row_y = content_top + slot_x[i] * PLAYLIST_PITCH;
+            if row_y + SIDE_ITEM_H < region.top() || row_y > region.bottom() {
+                continue;
+            }
+            let playlist = &playlists[i];
+            let row = Rect::new(x, row_y, w, SIDE_ITEM_H);
+            let row_id = playlist_row_id(&playlist.id);
+            let active = matches!(&state.view, View::Playlist(v) if v == &playlist.id);
+            // Compare the queue tag without formatting a `String` per row/frame.
+            let playing = state
+                .playing_source()
+                .and_then(|source| source.strip_prefix("playlist:"))
+                == Some(playlist.id.as_str());
             // Playing rows show the equalizer *instead of* the music-note glyph.
             let lead = if playing { None } else { Some(Icon::MusicNote) };
             let behavior = if interactive {
@@ -375,7 +411,16 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
             } else {
                 RowBehavior::SETTLING
             };
-            let resp = side_row(ui, row, lead, name, active, Some(*count), behavior);
+            let resp = side_row(
+                ui,
+                row_id,
+                row,
+                lead,
+                &playlist.name,
+                active,
+                Some(playlist.tracks.len()),
+                behavior,
+            );
             if resp.drag_started {
                 PLAYLIST_DRAG_FROM.with(|from| from.set(Some(i)));
                 // A fresh drag supersedes any in-flight committed order.
@@ -410,7 +455,11 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
                         from: i,
                         to: target,
                     });
-                    let expected = moved_order(&playlist_ids, i, target);
+                    let ids: Vec<String> = playlists
+                        .iter()
+                        .map(|playlist| playlist.id.clone())
+                        .collect();
+                    let expected = moved_order(&ids, i, target);
                     COMMITTED_ORDER.with(|hold| {
                         *hold.borrow_mut() = Some(CommittedOrder {
                             ids: expected,
@@ -421,44 +470,50 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
             }
             // Kebab / right-click → Rename · Export · Delete (old sidebar menu).
             // The kebab is interacted before the row, so it never starts a drag.
-            let menu_id = Id::from_str("sidebar/playlist-menu").with(id);
+            let menu_id = playlist_menu_id(row_id);
             if resp.kebab_clicked || resp.secondary_clicked {
                 if resp.kebab_clicked && ui.is_popup_open(menu_id) {
                     menu::close(ui);
                 } else {
                     let anchor = if resp.secondary_clicked {
-                        row
+                        // Right-click opens the menu at the pointer (ui-spec §6.2).
+                        let (px, py) = ui.input().mouse_pos;
+                        Rect::new(px, py, 0.0, 0.0)
                     } else {
                         resp.kebab_rect
                     };
-                    menu::open(ui, menu_id, anchor, playlist_menu_entries(id, name));
+                    menu::open(
+                        ui,
+                        menu_id,
+                        anchor,
+                        playlist_menu_entries(&playlist.id, &playlist.name),
+                    );
                 }
             } else if resp.response.clicked && !menu::is_open() {
                 // Deferred: a drag release in this frame must not navigate.
-                clicked_playlist = Some(id.clone());
+                clicked_playlist = Some(playlist.id.clone());
             }
         }
 
         // New playlist row / inline draft (static slot below the list).
-        match state.new_playlist.clone() {
-            Some(_) => {
+        let new_row_y = content_top + playlist_count as f32 * PLAYLIST_PITCH;
+        if new_row_y + SIDE_ITEM_H >= region.top() && new_row_y <= region.bottom() {
+            if state.new_playlist.is_some() {
                 new_playlist_input(ui, state, actions, Rect::new(x, new_row_y, w, SIDE_ITEM_H));
-            }
-            None => {
-                if side_row(
-                    ui,
-                    Rect::new(x, new_row_y, w, SIDE_ITEM_H),
-                    Some(Icon::Add),
-                    "New playlist",
-                    false,
-                    None,
-                    RowBehavior::NAV,
-                )
-                .response
-                .clicked
-                {
-                    actions.push(Action::BeginNewPlaylist);
-                }
+            } else if side_row(
+                ui,
+                side_row_id("New playlist", false),
+                Rect::new(x, new_row_y, w, SIDE_ITEM_H),
+                Some(Icon::Add),
+                "New playlist",
+                false,
+                None,
+                RowBehavior::NAV,
+            )
+            .response
+            .clicked
+            {
+                actions.push(Action::BeginNewPlaylist);
             }
         }
 
@@ -468,30 +523,35 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
         // slot formula is the same one driving the live preview, and the
         // expected order is held afterwards so nothing snaps back.
         if let Some(from) = PLAYLIST_DRAG_FROM.with(|from| from.get()) {
-            let target = (((ui.input().mouse_pos.1 - region.y) / PLAYLIST_PITCH).round() as isize)
-                .clamp(0, playlist_count.saturating_sub(1) as isize)
-                as usize;
             if ui.input().mouse_left_down {
                 ui.set_cursor(CursorShape::Grabbing);
             }
             if ui.input().mouse_left_released {
-                if target != from {
-                    actions.push(Action::MovePlaylist { from, to: target });
-                    let expected = moved_order(&playlist_ids, from, target);
-                    COMMITTED_ORDER.with(|hold| {
-                        *hold.borrow_mut() = Some(CommittedOrder {
-                            ids: expected,
-                            until: ui.time() + 2.0,
+                if let Some(target) = slot_at(ui.input().mouse_pos.1, content_top, playlist_count) {
+                    if target != from {
+                        actions.push(Action::MovePlaylist { from, to: target });
+                        let ids: Vec<String> = playlists
+                            .iter()
+                            .map(|playlist| playlist.id.clone())
+                            .collect();
+                        let expected = moved_order(&ids, from, target);
+                        COMMITTED_ORDER.with(|hold| {
+                            *hold.borrow_mut() = Some(CommittedOrder {
+                                ids: expected,
+                                until: ui.time() + 2.0,
+                            });
                         });
-                    });
-                    // Only a real move swallows the click; a release back in
-                    // the origin slot still navigates.
-                    nav_suppressed = true;
+                        // Only a real move swallows the click; a release back in
+                        // the origin slot still navigates.
+                        nav_suppressed = true;
+                    }
                 }
                 PLAYLIST_DRAG_FROM.with(|drag| drag.set(None));
             }
         }
     });
+    state.library.playlists = playlists;
+
     // Plain clicks still navigate. Only a committed move, a drag that started
     // this frame or a focus-loss cancel swallows the frame's click.
     if let Some(id) = clicked_playlist {
@@ -501,33 +561,28 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     }
 
     // ---- pinned bottom block ----
-    let (import_y, file_y, settings_y, divider_y) = sidebar_pinned_rows(rect);
-
     // Import playlist: a link/ID paste box replaces the row while it is open
     // (`.side-new-row` in the old CSS), exactly like "New playlist".
-    match state.import_playlist.clone() {
-        Some(_) => {
-            import_playlist_input(ui, state, actions, Rect::new(x, import_y, w, SIDE_ITEM_H));
-        }
-        None => {
-            if side_row(
-                ui,
-                Rect::new(x, import_y, w, SIDE_ITEM_H),
-                Some(Icon::Download),
-                "Import playlist",
-                false,
-                None,
-                RowBehavior::NAV,
-            )
-            .response
-            .clicked
-            {
-                state.import_playlist = Some(String::new());
-            }
-        }
+    if state.import_playlist.is_some() {
+        import_playlist_input(ui, state, actions, Rect::new(x, import_y, w, SIDE_ITEM_H));
+    } else if side_row(
+        ui,
+        side_row_id("Import playlist", false),
+        Rect::new(x, import_y, w, SIDE_ITEM_H),
+        Some(Icon::Download),
+        "Import playlist",
+        false,
+        None,
+        RowBehavior::NAV,
+    )
+    .response
+    .clicked
+    {
+        state.import_playlist = Some(String::new());
     }
     if side_row(
         ui,
+        side_row_id("Import from file", false),
         Rect::new(x, file_y, w, SIDE_ITEM_H),
         Some(Icon::Album),
         "Import from file",
@@ -550,6 +605,7 @@ pub fn sidebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect: 
     let settings_active = state.view == View::Settings;
     if side_row(
         ui,
+        side_row_id("Settings", settings_active),
         Rect::new(x, settings_y, w, SIDE_ITEM_H),
         Some(Icon::Settings),
         "Settings",

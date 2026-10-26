@@ -1,5 +1,5 @@
 //! JSON-persisted app settings: playback volume, Discord Rich Presence,
-//! crossfade overlap, the yt-dlp binary path, and update notifications.
+//! crossfade overlap, and update notifications.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,10 +19,6 @@ pub struct Settings {
     /// Crossfade overlap between tracks, in seconds. 0 disables it (hard cut).
     #[serde(default)]
     pub crossfade: f32,
-    /// Custom path to the yt-dlp binary. When set, it takes priority over
-    /// PATH/common-location detection. `None` means auto-detect.
-    #[serde(default)]
-    pub yt_dlp_path: Option<String>,
     /// Whether to check for a newer release on launch and notify the user.
     #[serde(default = "default_true")]
     pub update_notifications: bool,
@@ -35,8 +31,24 @@ fn default_true() -> bool {
 /// Largest crossfade overlap the UI offers and the backend accepts.
 pub const MAX_CROSSFADE: f32 = 12.0;
 
+/// Clamp a numeric setting into `0.0..=max`, mapping NaN to the low end.
+///
+/// `f32::clamp` propagates NaN, and a NaN would be written to `settings.json` as
+/// JSON `null` (that is how `serde_json` represents non-finite floats), which
+/// cannot be read back as a number: the next launch would fail to parse the
+/// whole file, move it aside as `settings.json.bad` and silently reset every
+/// other setting too. NaN is meaningless for both numeric settings, so the low
+/// end — muted volume, crossfade disabled — is the safe, non-destructive answer.
+fn clamp_setting(value: f32, max: f32) -> f32 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(0.0, max)
+    }
+}
+
 /// Whether the app was launched in preview mode (a dev build with
-/// `RIFT_PREVIEW=1)`: the UI renders placeholder data and settings run as
+/// `RIFT_PREVIEW=1`): the UI renders placeholder data and settings run as
 /// in-memory defaults that are never written to disk. Always false in
 /// release builds so the mode can't ship.
 pub fn preview_mode() -> bool {
@@ -49,7 +61,6 @@ impl Default for Settings {
             volume: 1.0,
             discord_rpc: true,
             crossfade: 0.0,
-            yt_dlp_path: None,
             update_notifications: true,
         }
     }
@@ -83,8 +94,8 @@ impl SettingsStore {
         let mut data: Settings = crate::util::load_json(&path);
         // A hand-edited settings.json can carry out-of-range values; clamp here
         // so the volume slider and crossfade logic see sane bounds every launch.
-        data.volume = data.volume.clamp(0.0, 1.0);
-        data.crossfade = data.crossfade.clamp(0.0, MAX_CROSSFADE);
+        data.volume = clamp_setting(data.volume, 1.0);
+        data.crossfade = clamp_setting(data.crossfade, MAX_CROSSFADE);
         Self {
             path,
             data,
@@ -110,7 +121,7 @@ impl SettingsStore {
     }
 
     pub fn set_volume(&mut self, volume: f32) {
-        self.data.volume = volume.clamp(0.0, 1.0);
+        self.data.volume = clamp_setting(volume, 1.0);
         self.save();
     }
 
@@ -121,19 +132,13 @@ impl SettingsStore {
 
     /// Persist the crossfade overlap, returning the clamped value actually stored.
     pub fn set_crossfade(&mut self, secs: f32) -> f32 {
-        self.data.crossfade = secs.clamp(0.0, MAX_CROSSFADE);
+        self.data.crossfade = clamp_setting(secs, MAX_CROSSFADE);
         self.save();
         self.data.crossfade
     }
 
     pub fn set_update_notifications(&mut self, on: bool) {
         self.data.update_notifications = on;
-        self.save();
-    }
-
-    pub fn set_yt_dlp_path(&mut self, path: Option<String>) {
-        // Treat blank/whitespace-only input as "unset" (auto-detect).
-        self.data.yt_dlp_path = path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
         self.save();
     }
 }
@@ -208,5 +213,59 @@ mod tests {
         );
         assert!((restored.crossfade - 3.5).abs() < 1e-6);
         assert!(!restored.discord_rpc, "the last toggle must win");
+    }
+
+    /// A NaN volume/crossfade must be sanitized, not stored: `serde_json` would
+    /// write it as `null`, which fails to deserialize as a number on the next
+    /// launch — the whole settings file is then moved aside and every setting
+    /// resets. Reachable through the public `save_volume`/`set_crossfade` API.
+    #[test]
+    fn a_nan_setting_cannot_poison_the_settings_file() {
+        let dir = TempDir::new("settings-nan");
+        let (mut store, writer) = temp_store(&dir);
+
+        store.set_volume(f32::NAN);
+        assert_eq!(store.data.volume, 0.0, "NaN volume mutes");
+        assert_eq!(store.set_crossfade(f32::NAN), 0.0, "NaN crossfade disables");
+
+        assert!(writer.flush(), "the sanitized values must reach disk");
+        let restored = SettingsStore::load(dir.path(), &writer).data;
+        assert_eq!(restored.volume, 0.0);
+        assert_eq!(restored.crossfade, 0.0);
+        assert!(
+            !dir.join("settings.json.bad").exists(),
+            "a valid file must not be moved aside as corrupt"
+        );
+    }
+
+    /// Phase 5 removed the external downloader, and with it the persisted
+    /// binary-path setting. An old install's `settings.json` still carries that
+    /// key: `Settings` is `#[serde(default)]` and does not deny unknown fields,
+    /// so the key must simply be ignored — the load must not fail, be treated as
+    /// corruption, or reset the settings that still exist.
+    #[test]
+    fn a_legacy_settings_file_with_a_removed_yt_dlp_path_still_loads() {
+        let dir = TempDir::new("settings-legacy");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{
+                "volume": 0.5,
+                "discord_rpc": false,
+                "crossfade": 2.5,
+                "yt_dlp_path": "C:\\tools\\yt-dlp.exe",
+                "update_notifications": false
+            }"#,
+        )
+        .unwrap();
+
+        let s = temp_store(&dir).0.data;
+        assert!((s.volume - 0.5).abs() < 1e-6, "got {}", s.volume);
+        assert!(!s.discord_rpc);
+        assert!((s.crossfade - 2.5).abs() < 1e-6, "got {}", s.crossfade);
+        assert!(!s.update_notifications);
+        assert!(
+            !dir.join("settings.json.bad").exists(),
+            "an unknown legacy key must not make the file look corrupt"
+        );
     }
 }

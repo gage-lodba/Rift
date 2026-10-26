@@ -60,8 +60,7 @@ impl DownloadHeadState {
 
     pub fn icon(&self) -> Icon {
         match self {
-            DownloadHeadState::Download => Icon::Download,
-            DownloadHeadState::Downloading { .. } => Icon::Download,
+            DownloadHeadState::Download | DownloadHeadState::Downloading { .. } => Icon::Download,
             DownloadHeadState::Downloaded { .. } => Icon::CheckCircle,
         }
     }
@@ -101,9 +100,8 @@ pub fn download_head_state(
 /// Whether this collection is the collection currently loaded in the player, so
 /// the Play pill can toggle instead of restarting it (old `is_current`).
 pub fn is_current_collection(state: &State, source: Option<&str>) -> bool {
-    let source = match source {
-        Some(s) => s,
-        None => return false,
+    let Some(source) = source else {
+        return false;
     };
     source == state.queue.source.as_deref().unwrap_or("")
         && matches!(
@@ -219,15 +217,18 @@ pub fn head_actions(
     }
 
     // ---- Download button ----
-    let ids: Vec<String> = head.tracks.iter().map(|t| t.id.clone()).collect();
-    let total = ids.len();
-    let done = ids
+    // Count against the existing id sets; the id list is only built when the
+    // button is actually pressed (it used to clone every track id per frame).
+    let total = head.tracks.len();
+    let done = head
+        .tracks
         .iter()
-        .filter(|id| state.downloads.downloaded.contains(*id))
+        .filter(|track| state.downloads.downloaded.contains(&track.id))
         .count();
-    let active = ids
+    let active = head
+        .tracks
         .iter()
-        .filter(|id| state.downloads.downloading.contains(*id))
+        .filter(|track| state.downloads.downloading.contains(&track.id))
         .count();
     let pinned = blocked_by_other_playlist(state, head.tracks, head.source);
     let dl_state = download_head_state(total, done, active, pinned);
@@ -252,8 +253,16 @@ pub fn head_actions(
         );
         if resp.clicked {
             match dl_state {
-                DownloadHeadState::Download => actions.push(Action::DownloadTracks(ids)),
-                DownloadHeadState::Downloaded { .. } => actions.push(Action::RemoveDownloads(ids)),
+                DownloadHeadState::Download => {
+                    actions.push(Action::DownloadTracks(
+                        head.tracks.iter().map(|track| track.id.clone()).collect(),
+                    ));
+                }
+                DownloadHeadState::Downloaded { .. } => {
+                    actions.push(Action::RemoveDownloads(
+                        head.tracks.iter().map(|track| track.id.clone()).collect(),
+                    ));
+                }
                 DownloadHeadState::Downloading { .. } => {}
             }
         }
@@ -290,7 +299,9 @@ fn paint_disabled_head_button(
         } else {
             Weight::SemiBold
         },
-        if accent { theme.accent } else { theme.text },
+        // `.head-btn:disabled` dims the text (ui-spec §2.4); the accent state
+        // keeps its accent text so "Downloaded" still reads as downloaded.
+        if accent { theme.accent } else { theme.text_dim },
     );
     let text_w = ui.text_width(label, &st);
     let inner_w = 16.0 + 7.0 + text_w;

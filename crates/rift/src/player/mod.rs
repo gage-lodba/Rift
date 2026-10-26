@@ -1,8 +1,8 @@
 //! Queue management and track playback orchestration.
 //!
-//! Tracks are resolved to audio via yt-dlp, downloaded fully into memory (a
-//! typical m4a is 3–5 MB) and handed to the audio thread. A generation counter
-//! guards against races when the user skips while a download is still in
+//! Tracks are resolved to audio natively and downloaded fully into memory (a
+//! typical m4a is 3–5 MB) before being handed to the audio thread. A generation
+//! counter guards against races when the user skips while a download is still in
 //! flight.
 //!
 //! Everything here is crate-internal: the public surface is the command methods

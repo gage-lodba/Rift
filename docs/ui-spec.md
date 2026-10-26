@@ -143,8 +143,8 @@ clip):
 | — searchbox focus | border + 1 px ring `#c4a0ff` | | `:focus-within` |
 | — drag-row (sidebar/queue reorder) | bg `#151518`, shadow `0 4px 14px rgba(0,0,0,.45)`, opacity .92 | | while dragging |
 | — sidebar resize handle hover | `rgba(139,61,240,0.35)` 5 px | | |
-| — ytdlp found | text `#4ade80`, bg `rgba(74,222,128,.12)` | | |
-| — ytdlp missing | text `#f87171`, bg `rgba(248,113,113,.12)` | | |
+| — badge success | text `#4ade80`, bg `rgba(74,222,128,.12)` | | Settings "Up to date" |
+| — badge danger | text `#f87171`, bg `rgba(248,113,113,.12)` | | Settings "Update available" |
 | — window close hover | bg `#e81123`, glyph `#fff` | | |
 
 ### 2.2 Radii
@@ -153,10 +153,10 @@ clip):
 |---|---|---|
 | radius_sm | **5** | `.ibtn` icon buttons, `.np-cover` |
 | radius_sm2 | **4** | `.trow-cover`, `.qrow-cover` (40/34 px covers) |
-| radius_md | **6** | searchbox, sidebar rows, tabs? (999), track rows, menu items, cover tiles `.card-cover`, `.rename-input`, `.side-new-input`, `.ytdlp-input`, playlist `.menu...`, focus ring default |
+| radius_md | **6** | searchbox, sidebar rows, tabs? (999), track rows, menu items, cover tiles `.card-cover`, `.rename-input`, `.side-new-input`, playlist `.menu...`, focus ring default |
 | radius_lg | **8** | `.card` (hover bg), menus, album-art, toast, settings rows, `.btn-secondary`/`.btn-primary` |
 | radius_xl | **10** | update banner, settings rows (also 10) |
-| radius_pill | **999** | play-all / head-btn pills, tabs, switches, ytdlp badges, artist avatar circle |
+| radius_pill | **999** | play-all / head-btn pills, tabs, switches, status badges, artist avatar circle |
 | cover round | 50% | artist card cover + artist page avatar |
 
 ### 2.3 Spacing scale (`ui/styles.css` uses raw px; these names are for code)
@@ -286,7 +286,7 @@ weight 800 with Bold; visual difference at 17 px/30 px is negligible.
 | buttons (play-all/head-btn) | 14 | 700/600 | 19 | | |
 | settings label | 15 | 600 | 20 | text | |
 | settings desc | 13 | 400 | 17 | dim | |
-| ytdlp badge | 12 | 600 | 16 | | |
+| status badge | 12 | 600 | 16 | | |
 | update banner / toast | 13 | 400 | 17 | | |
 | logo wordmark | 17 | 800 | 22 | gradient (fallback accent) | letter-spacing 2 |
 | menu item | 13 | 400 | 17 | text | |
@@ -745,7 +745,7 @@ Row internals (measured, content width 766):
 | meta | 421..641.5 | flex:1 | title 13/500 line 17 at y=row+10.5 (ink 401..413); artist 12 dim line 16 below (ink 415..426), with per-artist clickable links |
 | album | 653.5..722.5 | shrink-to-fit, text centered, max 340 | 12 dim; single line ellipsized; clickable link when album id known (`.link`) |
 | spacer | 734.5..955 | flex:1 | empty |
-| download slot | 967..995 | 28 wide fixed | offline state: downloaded → `check_circle` 15 accent (button to remove, or plain icon when pinned); downloading → 14 px spinner; failed → `warning` 15 danger; online idle → `download` 15 dim, **opacity 0 until row hover**; offline+not downloaded → empty |
+| download slot | 967..995 | 28 wide fixed | offline state: downloaded → `check_circle` 15 accent (button to remove, or plain icon when pinned); downloading → 14 px spinner (in flight) **plus** a determinate progress bar under the meta block when a native byte fraction is known; failed → `warning` 15 danger; online idle → `download` 15 dim, **opacity 0 until row hover**; offline+not downloaded → empty |
 | duration | 1007..1047 | 40 wide, right aligned | 12 dim `m:ss` (empty when unknown) |
 | actions | 1059..1115 | like ibtn 28 + kebab ibtn 28 | like heart always visible (filled accent when liked, outline dim when not); kebab `more_vert` 15 hidden until row hover/menu open |
 
@@ -753,6 +753,19 @@ Flex formula: `meta_w = spacer_w = (inner_w - 40 - album_w - 28 - 40 - 56 -
 6*12) / 2`, inner_w = content_w - 20. The album column is the album text's own
 width (shrink-to-fit, text-align center, ellipsized at 340 max). Rows are 54
 tall when the meta text fits; texts never wrap (single line, ellipsis).
+
+**Download progress bar (new, native streaming).** While a row is
+`downloading` *and* the backend has reported a byte fraction for it
+(`DownloadState.progress`, permille, only for the actively transferring track),
+a determinate bar is painted under the meta block: `x` = meta x, width = meta
+column width, `y` = row_top + 46.5 (artist line bottom + 3), height **3**,
+radius 1.5, `theme.bg_hover` track + `theme.accent` fill (`Ui::progress`). It
+sits inside the meta column and in the ~4.5 px gap above the row's bottom edge,
+so the 54 px row height, row pitch and virtualization are unchanged. When the
+fraction is absent — the track is queued behind the one actively transferring —
+no bar is drawn and the download slot keeps the 14 px indeterminate spinner
+(spinner = in flight, bar = how far). The native downloader is the only progress
+source; there is no fallback backend.
 
 States: `.playing` → row bg `#151518` and title accent + weight 600; `.unavailable`
 (offline && !downloaded) → row opacity .4, cursor default, click inert;
@@ -864,37 +877,18 @@ Rows, in order:
    `.crossfade-control` (margin-top 10, flex gap 10): slider 160×4 (min 1,
    max 12, step 1; default when toggled on = 6 s) + value label 13 dim
    tabular-nums min-width 28 (`"6s"`). Turning off emits crossfade = 0.
-3. **Streaming engine (yt-dlp)** — desc: "Rift uses yt-dlp to fetch audio.
-   It's auto-detected from your PATH and common install locations; set a custom
-   path below if it lives elsewhere."
-   * status line (probe on mount; `None` → 13 dim "Checking…"):
-     found → green badge "✓ Found" (`#4ade80` on `rgba(74,222,128,.12)`,
-     padding 2×8, radius pill, 12/600) + version 13 dim + `<code>` path
-     (12 dim, bg `#0e0e10`, border 1 `#232328`, radius 6, padding 1×6,
-     word-break all);
-     missing → red badge "✗ Not found" (`#f87171` on `rgba(248,113,113,.12)`)
-     + detail text: "Not found on your PATH or in common install locations."
-     or "Found a file at {path} but it didn't run."
-     lines: flex wrap, gap 8, margin-top 10.
-   * if missing: `.ytdlp-actions` (flex gap 10, margin-top 10):
-     primary button "Download yt-dlp" (accent; disabled while downloading →
-     label "Downloading…") + hint 12 dim "Fetches the latest build into Rift's
-     data folder."
-   * always: `.ytdlp-custom` (flex gap 8, margin-top 10): text input (flex 1,
-     max-width 360, bg `#0e0e10`, border `#232328`, radius 6, padding 7×10,
-     13 px, placeholder "Custom yt-dlp path (leave blank to auto-detect)",
-     focus border accent) + secondary button **"Save"** (re-probes; blank
-     clears the override).
-   * right column: secondary button **"Check again"**.
-4. **Updates** — desc: "Check GitHub for a newer version of Rift on launch and
+3. **Updates** — desc: "Check GitHub for a newer version of Rift on launch and
    notify you."
    * status line: `None` → "Checking…" dim; update available → red badge
      "Update available" + dim `"v{current} → v{latest}"`; up to date → green
      badge "✓ Up to date" + dim `"v{current}"`; failed (latest None) → dim
      "Rift v{current} — could not reach GitHub".
-   * `.ytdlp-actions`: secondary "Check now" + (when available) primary
+   * actions row: secondary "Check now" + (when available) primary
      "Download update" (opens release URL).
    * right column: update-notifications toggle.
+
+There is no streaming-engine row: Rift only uses its native downloader, so the
+settings screen has nothing to configure or probe for playback.
 
 ### 7.9 States inventory (every screen)
 
@@ -911,7 +905,7 @@ Rows, in order:
 | queue empty | all | queue panel not rendered |
 | queue collapsed | all except Settings | 45 px header only, caret -90° |
 | offline | rows/cards | `.unavailable` opacity .4 (un-downloaded track rows unplayable) |
-| downloading | track row dl slot | 14 px spinner (2 px border dim, top transparent, 0.7 s spin) |
+| downloading | track row dl slot + meta block | 14 px spinner (2 px border dim, top transparent, 0.7 s spin) as the in-flight indicator; when a native byte fraction is known, **also** the 3 px determinate accent bar under the meta block (§7.1.3). Queued behind the active track (no fraction) → spinner only, no bar |
 | downloaded | track row dl slot | `check_circle` accent 15 (row button remove; pinned = plain icon) |
 | download failed | track row dl slot | `warning` 15 danger, click retries |
 | downloaded collection | head-btn | "Downloaded" accent text/border; disabled when pinned by another playlist; click removes |
@@ -1068,7 +1062,6 @@ equivalent lives in `crates/rift-desktop/src/state.rs` (Lead + controller own it
 | `volume` | `f32` | bootstrap; slider (live) | player bar volume slider |
 | `discord_rpc` | `bool` | bootstrap; settings toggle | settings |
 | `crossfade` | `f32` | bootstrap; settings toggle/slider | settings |
-| `yt_dlp_path` | `Option<String>` | bootstrap; save path response | settings input draft (re-synced when it changes) |
 | `update_notifications` | `bool` | bootstrap; settings/banner silence | banner display gate, settings toggle |
 | `update_banner` | `Option<UpdateStatus>` | launch check result; dismiss/silence | update banner |
 | `update_status` | `Option<UpdateStatus>` | launch check, "Check now" | settings status line |
@@ -1080,7 +1073,7 @@ equivalent lives in `crates/rift-desktop/src/state.rs` (Lead + controller own it
 | `artist_page` | `Option<ArtistPage>` | `get_artist` on view enter (generation-guarded); cleared first | Artist view, ArtistSongs header |
 | `artist_songs` | `Option<(String, Vec<Track>)>` | `get_artist_songs` on demand, cached by artist id | ArtistSongs view |
 | `album_page` | `Option<AlbumPage>` | `get_album` on view enter | Album view |
-| `downloads` | `DownloadState` | bootstrap; `Downloads` event | rows' dl slot, head-btn state, pinned logic, menu labels |
+| `downloads` | `DownloadState` | bootstrap; `Downloads` event | rows' dl slot and determinate progress bar (`progress` permille map — the native downloader is its only source), head-btn state, pinned logic, menu labels |
 | `preview` | `bool` | bootstrap | shell swaps library/track/queue/progress (debug only) |
 | `online` | `bool` | bootstrap initial + network reachability events/probe | rows' `.unavailable` |
 | `renaming` | `Option<(playlist_id, draft)>` | kebab Rename; inline input; Enter/Escape/blur | Playlist view header |
@@ -1115,7 +1108,7 @@ downloads; keep the rules for behaviour parity but they can land after M5.
 | Sidebar/reorder drag position, hover-calm | `UiMemory` drag state; native pointer only |
 | Menu `open`/`submenu expanded` per trigger | `UiMemory.active_menu: Option<MenuId>` + expanded action index |
 | QueuePanel `collapsed` | `State.queue_collapsed` (per-session) |
-| Settings `ytdlp` probe/downloading/path draft/update check on mount | local cache in State or a per-view `SettingsState`; probe once on entering Settings and on "Check again" |
+| Settings update check on mount | cached `State.update_status`; run `check_update` once on entering Settings if it is not cached |
 | titlebar debounce token | State: `search_debounce: { text, deadline, generation }` driven by frame time |
 
 ### 10.4 Effects / subscriptions the controller must provide
@@ -1136,8 +1129,7 @@ loads):
    responses.
 5. PlayerBar: subscribe `PROGRESS` for live ticks (native: controller exposes
    progress events; State applies them).
-6. Settings mount: probe `check_ytdlp`; if no cached `update_status`, run
-   `check_update`.
+6. Settings mount: if no cached `update_status`, run `check_update`.
 7. Toast timers (auto-dismiss; a generation counter prevents an older timer
    from clearing a newer toast).
 
@@ -1173,7 +1165,6 @@ Backend commands (old names in parentheses):
 | DownloadTracks(tracks) / RemoveDownloads(ids) | `download_tracks` / `remove_downloads` |
 | SetDiscordRpc(b) / SetCrossfade(f32) | `set_discord_rpc` / `set_crossfade` |
 | SetUpdateNotifications(b) / CheckUpdate | `set_update_notifications` / `check_update` |
-| CheckYtDlp / SetYtDlpPath(s) / DownloadYtDlp | `check_ytdlp` / `set_yt_dlp_path` / `download_ytdlp` |
 | OpenUrl(url) | `open_url` |
 | LoadPage{kind,id} (artist/artist_songs/album) | `get_artist` / `get_artist_songs` / `get_album` |
 | Window(Minimize \| ToggleMaximize \| Close \| StartDrag \| StartResize(edge)) | former window commands |

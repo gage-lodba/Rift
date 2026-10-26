@@ -17,10 +17,6 @@
 //! The context menu lives in [`crate::screens::menu`]; this module only builds
 //! the track-row menu entries (and opens them from a row's kebab / right-click).
 
-use rift_types::Track;
-
-use crate::state::{DownloadStatus, State};
-
 mod header;
 mod list;
 mod menu;
@@ -35,7 +31,3 @@ pub use header::{
 };
 pub use list::{list_height, track_list, TrackListOpts};
 pub use menu::{open_track_menu, track_menu_entries};
-
-// A row's download status is also available through `State::download_status`;
-// keep the import used so the module documents the mapping.
-const _: fn(&State, &Track) -> DownloadStatus = State::download_status;

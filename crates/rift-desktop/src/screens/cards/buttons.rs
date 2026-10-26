@@ -33,6 +33,11 @@ pub struct ButtonStyle {
 
 /// A generic label button with hover/pressed feedback, painted by the caller's
 /// style. Returns the interaction result.
+///
+/// Disabled buttons are painted at the `.btn-primary:disabled` opacity (0.6,
+/// ui-spec §2.4) and do not react to the pointer; keyboard activation is already
+/// part of [`Ui::interact`] (focused + Enter/Space), so nothing extra is needed
+/// here.
 pub fn button(
     ui: &mut Ui,
     rect: Rect,
@@ -46,9 +51,21 @@ pub fn button(
         resp.hovered = false;
         resp.clicked = false;
     }
-    let t = resp.hover_t;
-    let fill = mix(style.colors.fill, style.colors.hover_fill, t);
-    let border_color = mix(style.colors.border, style.colors.hover_border, t);
+    let t = if enabled { resp.hover_t } else { 0.0 };
+    let mut fill = mix(style.colors.fill, style.colors.hover_fill, t);
+    let mut border_color = mix(style.colors.border, style.colors.hover_border, t);
+    let text_color = style.text.color;
+    let (fill, border_color, text_color) = if enabled {
+        (fill, border_color, text_color)
+    } else {
+        fill.a = (fill.a as f32 * 0.6).round() as u8;
+        border_color.a = (border_color.a as f32 * 0.6).round() as u8;
+        (
+            fill,
+            border_color,
+            text_color.with_alpha((text_color.a as f32 * 0.6).round() as u8),
+        )
+    };
     if style.border > 0.0 {
         ui.bordered_rect(rect, fill, style.radius, style.border, border_color);
     } else if fill.a > 0 {
@@ -58,11 +75,7 @@ pub fn button(
     ui.text_centered(
         rect.offset(0.0, pressed_offset),
         label,
-        &style.text.with_color(if enabled {
-            style.text.color
-        } else {
-            style.colors.text
-        }),
+        &style.text.with_color(text_color),
     );
     if resp.focus_visible {
         ui.focus_ring(rect, style.radius);
@@ -90,7 +103,7 @@ pub fn accent_button(
         border: Color::TRANSPARENT,
         hover_border: Color::TRANSPARENT,
     };
-    let mut resp = ui.interact(rect, id, Sense::CLICK);
+    let resp = ui.interact(rect, id, Sense::CLICK);
     let t = resp.hover_t;
     ui.rounded_rect(rect, mix(colors.fill, colors.hover_fill, t), radius);
     let st = style(font_size, weight, Color::WHITE);
@@ -105,7 +118,6 @@ pub fn accent_button(
     if resp.focus_visible {
         ui.focus_ring(rect, radius);
     }
-    resp.clicked |= ui.keyboard_activated() && resp.focused;
     resp
 }
 
@@ -130,7 +142,7 @@ pub fn secondary_pill(
         },
         hover_border: if accent { theme.accent } else { theme.text_dim },
     };
-    let mut resp = ui.interact(rect, id, Sense::CLICK);
+    let resp = ui.interact(rect, id, Sense::CLICK);
     let t = resp.hover_t;
     ui.bordered_rect(
         rect,
@@ -159,7 +171,6 @@ pub fn secondary_pill(
     if resp.focus_visible {
         ui.focus_ring(rect, 999.0);
     }
-    resp.clicked |= ui.keyboard_activated() && resp.focused;
     resp
 }
 
@@ -213,19 +224,20 @@ pub fn secondary_button(ui: &mut Ui, rect: Rect, id: Id, label: &str) -> Respons
     )
 }
 
-/// A 28×28 `.ibtn` icon button. Returns the interaction; `hover` paints the
-/// raised background (callers that reveal on hover can pass `false` and paint
-/// themselves).
-pub fn icon_button(
+/// Paint an `.ibtn`-style icon button from an *already-interacted* response.
+///
+/// Nested controls must be interacted before the row/card that contains them
+/// (the first hovered widget to see the press latches it), so screens that draw
+/// a revealed kebab/row button interact first and paint through this helper.
+pub fn paint_icon_button(
     ui: &mut Ui,
     rect: Rect,
-    id: Id,
     icon: Icon,
     icon_size: f32,
     color: Color,
-) -> Response {
+    resp: &Response,
+) {
     let theme = ui.theme().clone();
-    let resp = ui.interact(rect, id, Sense::CLICK);
     let t = resp.hover_t;
     let bg = if t > 0.0 {
         theme
@@ -242,6 +254,19 @@ pub fn icon_button(
     if resp.focus_visible {
         ui.focus_ring(rect, theme.radius_sm);
     }
+}
+
+/// A 28×28 `.ibtn` icon button: [`paint_icon_button`] plus its interaction.
+pub fn icon_button(
+    ui: &mut Ui,
+    rect: Rect,
+    id: Id,
+    icon: Icon,
+    icon_size: f32,
+    color: Color,
+) -> Response {
+    let resp = ui.interact(rect, id, Sense::CLICK);
+    paint_icon_button(ui, rect, icon, icon_size, color, &resp);
     resp
 }
 

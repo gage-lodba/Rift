@@ -24,4 +24,3 @@ mod playback;
 mod queue;
 mod search;
 mod updates;
-mod ytdlp;

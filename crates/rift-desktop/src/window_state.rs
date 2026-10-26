@@ -214,17 +214,98 @@ impl WindowState {
 /// Intended for `main.rs` right after the window is created. Best-effort: winit
 /// request failures are not surfaced (they are platform quirks, and the default
 /// geometry is already in place).
+///
+/// A remembered position that no longer overlaps any monitor (the display it was
+/// on was unplugged, the layout changed, or the file was hand-edited) is not
+/// restored: the window is centred on the current monitor instead, because an
+/// off-screen window cannot be reached with the mouse. The saved size and
+/// maximized flag still apply.
 pub fn restore(window: &Window, state: &WindowState) {
     let (width, height) = state.size();
     // A request, not a guarantee: the compositor may adjust it (and some
     // platforms reject it before the window is mapped). The default geometry is
     // already in place, so the result is deliberately ignored.
     let _ = window.request_inner_size(LogicalSize::new(width as f64, height as f64));
-    let (x, y) = state.position();
-    window.set_outer_position(LogicalPosition::new(x as f64, y as f64));
+    if let Some((x, y)) = restored_position(window, state) {
+        window.set_outer_position(LogicalPosition::new(x, y));
+    }
     if state.maximized {
         window.set_maximized(true);
     }
+}
+
+/// Smallest overlap, in physical pixels, between the window and a monitor that
+/// counts as "the remembered position is still reachable".
+///
+/// A position that puts only a few pixels of the window on screen is as unusable
+/// as one that is completely off it, so the check requires a grab-sized strip of
+/// the window to be visible.
+const MIN_VISIBLE_EXTENT: f64 = 48.0;
+
+/// The position [`restore`] should use, in logical pixels.
+///
+/// `Some` keeps the remembered position when it is still reachable (or when the
+/// platform exposes no monitor information to judge it against); `None` means no
+/// fallback monitor could be found either, so the caller should leave the window
+/// where the OS put it.
+fn restored_position(window: &Window, state: &WindowState) -> Option<(f64, f64)> {
+    let saved = (f64::from(state.x), f64::from(state.y));
+    let scale = window.scale_factor();
+    // `set_outer_position(LogicalPosition)` multiplies by the window's current
+    // scale factor, so validate the physical rectangle it will actually produce.
+    let candidate = (
+        saved.0 * scale,
+        saved.1 * scale,
+        f64::from(state.width) * scale,
+        f64::from(state.height) * scale,
+    );
+    let monitors: Vec<(f64, f64, f64, f64)> = window
+        .available_monitors()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            (
+                f64::from(position.x),
+                f64::from(position.y),
+                f64::from(size.width),
+                f64::from(size.height),
+            )
+        })
+        .collect();
+    if monitors.is_empty() || rect_has_visible_area(candidate, &monitors) {
+        // No monitor list (headless/odd platform): trust the saved value rather
+        // than silently moving every window on that platform.
+        return Some(saved);
+    }
+    tracing::warn!(
+        "remembered window position ({}, {}) is not on any monitor; centring instead",
+        state.x,
+        state.y
+    );
+    let monitor = window
+        .current_monitor()
+        .or_else(|| window.primary_monitor())?;
+    let position = monitor.position();
+    let size = monitor.size();
+    let x = f64::from(position.x) + (f64::from(size.width) - candidate.2) / 2.0;
+    let y = f64::from(position.y) + (f64::from(size.height) - candidate.3) / 2.0;
+    Some((x / scale, y / scale))
+}
+
+/// Whether `window` (`x, y, width, height`, physical px) overlaps at least one
+/// monitor by a meaningful strip. Pure so the restore fallback is testable
+/// without creating a window.
+fn rect_has_visible_area(window: (f64, f64, f64, f64), monitors: &[(f64, f64, f64, f64)]) -> bool {
+    let (x, y, width, height) = window;
+    let needed_width = width.min(MIN_VISIBLE_EXTENT);
+    let needed_height = height.min(MIN_VISIBLE_EXTENT);
+    monitors
+        .iter()
+        .any(|&(monitor_x, monitor_y, monitor_w, monitor_h)| {
+            let overlap_width = (x + width).min(monitor_x + monitor_w) - x.max(monitor_x);
+            let overlap_height = (y + height).min(monitor_y + monitor_h) - y.max(monitor_y);
+            overlap_width >= needed_width && overlap_height >= needed_height
+        })
 }
 
 /// Update `state` from the live window: size, position and maximized flag.
@@ -601,6 +682,50 @@ mod tests {
         std::fs::create_dir(dir.path().join(FILE_NAME)).expect("seed blocking directory");
         state().save(dir.path());
         assert!(dir.path().join(FILE_NAME).is_dir(), "target untouched");
+    }
+
+    /// A window fully inside a monitor — including a negative-coordinate monitor
+    /// to the left of the primary one — is reachable and its position is kept.
+    #[test]
+    fn a_remembered_position_inside_a_monitor_is_reachable() {
+        let monitors = vec![(0.0, 0.0, 1920.0, 1080.0), (1920.0, 0.0, 2560.0, 1440.0)];
+        assert!(rect_has_visible_area(
+            (100.0, 100.0, 1160.0, 740.0),
+            &monitors
+        ));
+        assert!(rect_has_visible_area(
+            (2000.0, 50.0, 1160.0, 740.0),
+            &monitors
+        ));
+        assert!(rect_has_visible_area(
+            (-1500.0, 0.0, 1160.0, 740.0),
+            &[(-1920.0, 0.0, 1920.0, 1080.0)],
+        ));
+    }
+
+    /// A remembered position on a monitor that no longer exists is not
+    /// reachable: restoring it would leave the window unreachable off-screen.
+    #[test]
+    fn a_remembered_position_off_screen_is_not_reachable() {
+        let monitors = vec![(0.0, 0.0, 1920.0, 1080.0)];
+        assert!(!rect_has_visible_area(
+            (5000.0, 0.0, 1160.0, 740.0),
+            &monitors
+        ));
+        assert!(!rect_has_visible_area(
+            (0.0, -2000.0, 1160.0, 740.0),
+            &monitors
+        ));
+        // 20 px of overlap is less than the grab-sized strip.
+        assert!(!rect_has_visible_area(
+            (-1140.0, 100.0, 1160.0, 740.0),
+            &monitors
+        ));
+        // Just enough overlap is accepted.
+        assert!(rect_has_visible_area(
+            (-1100.0, 100.0, 1160.0, 740.0),
+            &monitors
+        ));
     }
 
     #[test]

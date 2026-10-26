@@ -68,8 +68,18 @@ pub fn instance_name() -> String {
 #[cfg(unix)]
 fn lock_path() -> Option<std::path::PathBuf> {
     default_data_dir()
-        .or_else(|| Some(std::env::temp_dir()))
         .map(|dir| dir.join(".single-instance.lock"))
+        .or_else(|| {
+            // No resolvable per-user data directory (HOME/XDG_DATA_HOME unset):
+            // fall back to the temp directory. The file name must carry the app
+            // identifier so it cannot collide with another application's lock in
+            // a shared temp directory.
+            tracing::warn!(
+                "no data directory could be resolved; using the temp directory \
+                 for the single-instance lock"
+            );
+            Some(std::env::temp_dir().join(format!("{APP_IDENTIFIER}-single-instance.lock")))
+        })
 }
 
 /// RAII holder of the single-instance lock.
@@ -101,6 +111,7 @@ pub fn acquire() -> Option<SingleInstance> {
 /// This briefly acquires and releases the lock when nothing else holds it, so it
 /// is only suitable for logging/diagnostics — the startup path must call
 /// [`acquire`] and hold the result.
+#[must_use]
 pub fn is_already_running() -> bool {
     match SingleInstance::acquire() {
         Some(instance) => {
@@ -168,6 +179,15 @@ mod platform {
             // (or closed below) exactly once.
             let handle = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
             if handle.is_null() {
+                // The last-error value is read immediately after the failed call,
+                // before any other API could overwrite it.
+                // SAFETY: no arguments; reads the last-error value set by the
+                // failed `CreateMutexW` call above.
+                let error = unsafe { GetLastError() };
+                tracing::warn!(
+                    "could not create the single-instance mutex (Win32 error {error}); \
+                     refusing to start a second writer"
+                );
                 return None;
             }
             // SAFETY: no arguments; reads the last-error value set by the
@@ -241,6 +261,17 @@ mod platform {
             if locked {
                 Some(Self { _file: file })
             } else {
+                // `WouldBlock` is the expected "another instance holds the lock".
+                // Any other error (e.g. a lock file owned by another user in a
+                // shared temp directory) is still treated as busy — starting two
+                // writers would be worse — but it deserves a diagnostic.
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    tracing::warn!(
+                        "could not lock {}: {error}; treating the instance guard as held",
+                        lock_path.display()
+                    );
+                }
                 None
             }
         }

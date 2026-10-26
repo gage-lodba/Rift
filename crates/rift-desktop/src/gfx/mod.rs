@@ -72,8 +72,8 @@ use vulkano::{
     pipeline::PipelineBindPoint,
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass},
     swapchain::{
-        acquire_next_image, ColorSpace, Surface, Swapchain, SwapchainCreateInfo,
-        SwapchainPresentInfo,
+        acquire_next_image, ColorSpace, CompositeAlpha, PresentMode, Surface, SurfaceCapabilities,
+        Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::{self, GpuFuture},
     Validated, VulkanError,
@@ -234,28 +234,64 @@ enum Target {
 
 impl Renderer {
     /// Create a renderer that presents to `window`'s surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no Vulkan instance/device with graphics and
+    /// presentation support for the window is available, or when creating the
+    /// surface, swapchain, pipeline or any per-frame resource fails.
     pub fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
         let scale_factor = window.scale_factor() as f32;
 
+        let startup = std::time::Instant::now();
         let ctx = GfxContext::for_window(&*window)
             .context("initialising the Vulkan renderer for the window")?;
+        tracing::debug!(
+            "startup: Vulkan instance/device {:.1} ms",
+            startup.elapsed().as_secs_f64() * 1000.0
+        );
+        let stage = std::time::Instant::now();
         let surface = Surface::from_window(ctx.instance.clone(), window.clone())
             .context("creating a Vulkan surface for the window")?;
         let format = pick_surface_format(&ctx, &surface)?;
         let pipeline = create_pipeline(&ctx.device, format)?;
-        let (swapchain, framebuffers) = create_swapchain_surface(
+        tracing::debug!(
+            "startup: Vulkan surface/format/pipeline {:.1} ms",
+            stage.elapsed().as_secs_f64() * 1000.0
+        );
+        let stage = std::time::Instant::now();
+        let (swapchain, framebuffers, extent) = create_swapchain_surface(
             &ctx,
             &surface,
             [width, height],
             format,
             &pipeline.render_pass,
         )?;
+        tracing::debug!(
+            "startup: Vulkan swapchain {:.1} ms",
+            stage.elapsed().as_secs_f64() * 1000.0
+        );
+        // The swapchain extent is authoritative: the surface may have clamped it
+        // (fixed-size surface such as Wayland, or a driver min/max bound), and
+        // the viewport uniform must match the images that are actually drawn to.
+        let width = extent[0];
+        let height = extent[1];
+        let stage = std::time::Instant::now();
         let textures = TextureManager::new(&ctx, pipeline.texture_set_layout.clone())?;
+        tracing::debug!(
+            "startup: Vulkan texture manager {:.1} ms",
+            stage.elapsed().as_secs_f64() * 1000.0
+        );
+        let stage = std::time::Instant::now();
         let uniforms = create_uniform_ring(&ctx, &pipeline)?;
         let vertex_buffers = create_vertex_ring(&ctx, INITIAL_VERTEX_CAPACITY)?;
+        tracing::debug!(
+            "startup: Vulkan ring buffers {:.1} ms",
+            stage.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(Self {
             ctx,
@@ -286,6 +322,12 @@ impl Renderer {
 
     /// Create a renderer that draws into an offscreen image instead of a
     /// window; used by `--screenshot` and tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no Vulkan device with a graphics queue is
+    /// available, or when creating the device, pipeline or offscreen target
+    /// fails.
     pub fn new_headless(width: u32, height: u32, scale_factor: f32) -> Result<Self> {
         let width = width.max(1);
         let height = height.max(1);
@@ -295,7 +337,13 @@ impl Renderer {
             1.0
         };
 
+        let startup = std::time::Instant::now();
         let ctx = GfxContext::headless().context("initialising the headless Vulkan renderer")?;
+        tracing::debug!(
+            "startup: headless Vulkan instance/device {:.1} ms",
+            startup.elapsed().as_secs_f64() * 1000.0
+        );
+        let stage = std::time::Instant::now();
         let format = Format::R8G8B8A8_SRGB;
         let pipeline = create_pipeline(&ctx.device, format)?;
         let (image, framebuffer) =
@@ -303,6 +351,10 @@ impl Renderer {
         let textures = TextureManager::new(&ctx, pipeline.texture_set_layout.clone())?;
         let uniforms = create_uniform_ring(&ctx, &pipeline)?;
         let vertex_buffers = create_vertex_ring(&ctx, INITIAL_VERTEX_CAPACITY)?;
+        tracing::debug!(
+            "startup: headless pipeline/target/resources {:.1} ms",
+            stage.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(Self {
             ctx,
@@ -339,14 +391,17 @@ impl Renderer {
         )
     }
 
+    /// Physical pixels per logical pixel, as last reported by the window (or the
+    /// value passed to [`Renderer::new_headless`]).
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
     }
 
-    /// Recreate the swapchain/framebuffers for a new physical size. The actual
-    /// recreation happens at the start of the next [`Renderer::frame`], which is
-    /// where errors can be reported cleanly (and where the event loop is not
-    /// mid-dispatch).
+    /// Resize the output target. For a window this recreates the swapchain;
+    /// for a headless renderer it recreates the offscreen image. Either way the
+    /// actual recreation happens lazily at the start of the next frame render,
+    /// which is where errors can be reported cleanly (and where the event loop
+    /// is not mid-dispatch).
     pub fn resize(&mut self, physical: (u32, u32)) {
         let (width, height) = (physical.0.max(1), physical.1.max(1));
         if (width, height) == (self.width, self.height) && !self.recreate_swapchain {
@@ -354,12 +409,17 @@ impl Renderer {
         }
         self.width = width;
         self.height = height;
-        if matches!(self.target, Target::Window { .. }) {
-            self.recreate_swapchain = true;
-        }
+        self.recreate_swapchain = true;
     }
 
     /// Upload any textures the paint list created, draw it, present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a texture upload, command-buffer recording or
+    /// submission fails. Transient swapchain conditions (resize/`OutOfDate`)
+    /// are not errors: the swapchain is recreated and the frame retried
+    /// implicitly on the next call.
     pub fn frame(&mut self, paint: &PaintList) -> Result<()> {
         match self.target {
             Target::Window { .. } => self.frame_window(paint),
@@ -471,6 +531,7 @@ impl Renderer {
         let slot = self.prepare_slot(&batch)?;
 
         let Target::Window {
+            window,
             swapchain,
             framebuffers,
             ..
@@ -483,9 +544,25 @@ impl Renderer {
         let (image_index, suboptimal, acquire_future) =
             match acquire_next_image(swapchain.clone(), None).map_err(Validated::unwrap) {
                 Ok(result) => result,
+                // Both mean the swapchain no longer matches the surface: drop the
+                // frame and rebuild the swapchain on the next one. (A surface can
+                // be lost when a monitor/window changes in a way the driver
+                // reports rather than as OutOfDate.)
                 Err(VulkanError::OutOfDate) => {
                     self.recreate_swapchain = true;
                     return Ok(());
+                }
+                Err(VulkanError::SurfaceLost) => {
+                    tracing::warn!("swapchain surface lost; recreating it");
+                    self.recreate_swapchain = true;
+                    return Ok(());
+                }
+                // Not recoverable without recreating the device; report it instead
+                // of pretending the next frame will work.
+                Err(VulkanError::DeviceLost) => {
+                    return Err(anyhow!(
+                        "Vulkan device lost while acquiring a swapchain image"
+                    ));
                 }
                 Err(error) => return Err(anyhow!("acquiring a swapchain image: {error}")),
             };
@@ -516,6 +593,14 @@ impl Renderer {
             .build()
             .context("building the frame command buffer")?;
 
+        // winit 0.30's frame-pacing contract: notify the windowing system that
+        // a buffer is about to be submitted, immediately before present. On
+        // Wayland this schedules the frame callback that throttles
+        // `RedrawRequested` to the compositor's refresh (other platforms: this
+        // is a no-op), so the present rate stays in step with the compositor
+        // instead of stuttering.
+        window.pre_present_notify();
+
         let future = self
             .previous_frame_end
             .take()
@@ -537,6 +622,14 @@ impl Renderer {
                 tracing::debug!("present returned OutOfDate; recreating the swapchain");
                 self.previous_frame_end = None;
                 self.recreate_swapchain = true;
+            }
+            Err(VulkanError::SurfaceLost) => {
+                tracing::warn!("present returned SurfaceLost; recreating the swapchain");
+                self.previous_frame_end = None;
+                self.recreate_swapchain = true;
+            }
+            Err(VulkanError::DeviceLost) => {
+                return Err(anyhow!("Vulkan device lost while presenting a frame"));
             }
             Err(error) => return Err(anyhow!("presenting a frame: {error}")),
         }
@@ -568,7 +661,7 @@ impl Renderer {
     fn recreate_window_swapchain(&mut self) -> Result<()> {
         let Target::Window {
             window,
-            _surface: _,
+            _surface: surface,
             swapchain,
             framebuffers,
         } = &mut self.target
@@ -579,10 +672,19 @@ impl Renderer {
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
+        // Re-query the capabilities: moving between monitors (or the compositor
+        // itself) can change the fixed/current extent and the min/max bounds, and
+        // an out-of-range image extent fails swapchain creation.
+        let caps = self
+            .ctx
+            .physical_device
+            .surface_capabilities(surface, Default::default())
+            .context("querying surface capabilities while recreating the swapchain")?;
+        let extent = clamp_swapchain_extent(&caps, [size.width, size.height]);
 
         let (new_swapchain, new_images) = swapchain
             .recreate(SwapchainCreateInfo {
-                image_extent: [size.width, size.height],
+                image_extent: extent,
                 ..swapchain.create_info()
             })
             .context("recreating the swapchain after a resize")?;
@@ -598,12 +700,35 @@ impl Renderer {
             self.format = new_swapchain.image_format();
             self.pipeline = create_pipeline(&self.ctx.device, self.format)?;
             self.uniforms = create_uniform_ring(&self.ctx, &self.pipeline)?;
+            // The texture descriptor sets were allocated against the old
+            // pipeline's set layout; without reallocating them every texture
+            // bind below would be incompatible with the new pipeline layout.
+            self.textures
+                .rebuild_descriptor_sets(self.pipeline.texture_set_layout.clone())?;
         }
 
         *framebuffers = create_framebuffers(&self.pipeline.render_pass, &new_images)?;
         *swapchain = new_swapchain;
-        self.width = size.width;
-        self.height = size.height;
+        self.width = extent[0];
+        self.height = extent[1];
+        Ok(())
+    }
+
+    /// Reallocate the headless render target for the current
+    /// [`Renderer::width`]/[`Renderer::height`]. Called from the render path so
+    /// that a failed allocation is reported through `Result` (unlike
+    /// [`Renderer::resize`], which only records the new size).
+    fn recreate_offscreen_target(&mut self) -> Result<()> {
+        if !matches!(self.target, Target::Offscreen { .. }) {
+            return Ok(());
+        }
+        let (image, framebuffer) = create_offscreen_target(
+            &self.ctx,
+            &self.pipeline.render_pass,
+            [self.width, self.height],
+        )
+        .context("recreating the offscreen render target after a resize")?;
+        self.target = Target::Offscreen { image, framebuffer };
         Ok(())
     }
 
@@ -764,9 +889,22 @@ impl Renderer {
                         self.textures.descriptor_set(draw.texture),
                     )
                     .context("binding a texture descriptor set")?;
-                // SAFETY: the vertex buffer contains `frame.vertices.len()`
-                // vertices laid out as Vertex2D, and the draw range stays inside
-                // the buffer; the pipeline expects exactly that layout.
+                // SAFETY: the shader safety requirements are satisfied because
+                // everything is validated at binding/creation time and nothing
+                // is indexed dynamically:
+                // * the bound pipeline is our single quad pipeline, and the
+                //   vertex input state was built from that vertex shader's
+                //   reflection, so it matches `Vertex2D` exactly;
+                // * descriptor set 0 (viewport uniform) and set 1 (one combined
+                //   image sampler, non-arrayed) were bound above and are
+                //   compatible with the pipeline layout (vulkano validates
+                //   descriptor-set/layout compatibility on bind);
+                // * the vertex buffer bound above holds this frame's
+                //   `batch.vertices`, and the `first_vertex`/`vertex_count`
+                //   ranges come from that same batch, so every draw stays
+                //   inside its range;
+                // * the dynamic viewport and scissor are set before the draw,
+                //   and the shaders use no dynamic indexing or pointers.
                 unsafe {
                     builder.draw(draw.vertex_count, 1, draw.first_vertex, 0)?;
                 }
@@ -787,8 +925,12 @@ impl Renderer {
         if self.previous_frame_end.is_some() {
             self.wait_idle();
         }
-        if let Some(future) = self.previous_frame_end.as_mut() {
-            future.cleanup_finished();
+        if self.recreate_swapchain {
+            // A headless renderer has no swapchain; the flag means "the target
+            // size changed" and the offscreen image must be reallocated before
+            // it can be drawn into or read back at the new size.
+            self.recreate_swapchain = false;
+            self.recreate_offscreen_target()?;
         }
 
         self.textures.sync(paint)?;
@@ -870,6 +1012,12 @@ impl Drop for Renderer {
 }
 
 /// Render one frame offscreen to a PNG (used by `--screenshot` and tests).
+///
+/// # Errors
+///
+/// Returns an error when the headless Vulkan renderer cannot be created, when
+/// the paint list cannot be drawn/read back, or when the PNG cannot be written
+/// to `path`.
 pub fn screenshot(
     width: u32,
     height: u32,
@@ -950,7 +1098,23 @@ fn create_vertex_ring(ctx: &GfxContext, capacity: usize) -> Result<Vec<Subbuffer
                     ..Default::default()
                 },
                 AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    // These are the only vertex buffers and every frame rewrites
+                    // all of them from the CPU, so the streaming-friendly
+                    // host-visible write-combined memory is the right home for
+                    // them (the same memory type — and the same allocator block —
+                    // the uniform ring and texture staging already use).
+                    //
+                    // `PREFER_DEVICE` would put them in a device-local host-visible
+                    // type on GPUs that expose one (ReBAR). That type has no other
+                    // user at startup, so the allocator had to make a whole new
+                    // device memory block for it: one `vkAllocateMemory` of driver
+                    // latency (~16 ms on the reference machine) on the startup
+                    // path, for buffers whose content is re-uploaded every frame
+                    // anyway. A UI vertex stream of a few hundred KiB per frame
+                    // reads fine from system memory; the choice is measurable in
+                    // the `startup:` logs, and a 300-frame benchmark showed
+                    // identical frame times (4.07 ms avg, ~246 fps) either way.
+                    memory_type_filter: MemoryTypeFilter::PREFER_HOST
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
@@ -982,40 +1146,96 @@ fn create_framebuffers(
         .collect()
 }
 
+/// Clamp a requested swapchain extent into what the surface actually supports.
+///
+/// Vulkan requires `imageExtent` to lie within `minImageExtent..=maxImageExtent`,
+/// and a surface with a fixed `currentExtent` (some Wayland compositors report
+/// one) must be created at exactly that size — otherwise swapchain creation
+/// fails. Window sizes are passed through this before every creation and
+/// recreation.
+fn clamp_swapchain_extent(caps: &SurfaceCapabilities, requested: [u32; 2]) -> [u32; 2] {
+    if let Some(current) = caps.current_extent {
+        return [current[0].max(1), current[1].max(1)];
+    }
+    [
+        requested[0]
+            .clamp(caps.min_image_extent[0], caps.max_image_extent[0])
+            .max(1),
+        requested[1]
+            .clamp(caps.min_image_extent[1], caps.max_image_extent[1])
+            .max(1),
+    ]
+}
+
+/// How many swapchain images to request: one more than the driver's minimum
+/// (the usual Vulkan guidance — it gives the presentation engine a spare image
+/// so acquire/present do not stall the CPU), capped when the driver reports a
+/// maximum. The spec guarantees FIFO is supported with at least this many.
+fn swapchain_image_count(caps: &SurfaceCapabilities) -> u32 {
+    let wanted = caps.min_image_count.saturating_add(1).max(2);
+    let capped = caps.max_image_count.map_or(wanted, |max| wanted.min(max));
+    capped.max(caps.min_image_count)
+}
+
+/// Pick a composite alpha mode: `Opaque` when the surface supports it (cheapest
+/// for the compositor, and this window has no translucent areas), otherwise the
+/// first mode the driver offers.
+fn pick_composite_alpha(caps: &SurfaceCapabilities) -> Result<CompositeAlpha> {
+    let supported: Vec<CompositeAlpha> = caps.supported_composite_alpha.into_iter().collect();
+    supported
+        .iter()
+        .copied()
+        .find(|alpha| matches!(alpha, CompositeAlpha::Opaque))
+        .or_else(|| supported.first().copied())
+        .ok_or_else(|| anyhow!("the surface supports no composite alpha mode"))
+}
+
+/// A newly created swapchain: the swapchain, its framebuffers, and the extent
+/// actually used (the surface may have clamped the requested window size).
+type SurfaceSwapchain = (Arc<Swapchain>, Vec<Arc<Framebuffer>>, [u32; 2]);
+
 fn create_swapchain_surface(
     ctx: &GfxContext,
     surface: &Arc<Surface>,
     size: [u32; 2],
     format: Format,
     render_pass: &Arc<RenderPass>,
-) -> Result<(Arc<Swapchain>, Vec<Arc<Framebuffer>>)> {
+) -> Result<SurfaceSwapchain> {
     let caps = ctx
         .physical_device
         .surface_capabilities(surface, Default::default())
         .context("querying surface capabilities")?;
-    let composite_alpha = caps
-        .supported_composite_alpha
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("the surface supports no composite alpha mode"))?;
+    let composite_alpha = pick_composite_alpha(&caps)?;
+    let image_extent = clamp_swapchain_extent(&caps, size);
+    if image_extent != size {
+        tracing::debug!(
+            requested = ?size,
+            actual = ?image_extent,
+            "surface clamped the requested swapchain extent"
+        );
+    }
 
     let (swapchain, images) = Swapchain::new(
         ctx.device.clone(),
         surface.clone(),
         SwapchainCreateInfo {
-            // Some drivers report 1, but fullscreen needs at least 2.
-            min_image_count: caps.min_image_count.max(2),
+            min_image_count: swapchain_image_count(&caps),
             image_format: format,
-            image_extent: size,
+            image_extent,
             image_usage: ImageUsage::COLOR_ATTACHMENT,
             composite_alpha,
+            // Vsync present mode: a music player should not burn GPU time or
+            // tear to shave latency. FIFO is the one mode every surface is
+            // required to support, so this needs no present-mode query and is
+            // stable across drivers.
+            present_mode: PresentMode::Fifo,
             ..Default::default()
         },
     )
     .context("creating the swapchain")?;
 
     let framebuffers = create_framebuffers(render_pass, &images)?;
-    Ok((swapchain, framebuffers))
+    Ok((swapchain, framebuffers, image_extent))
 }
 
 fn create_offscreen_target(

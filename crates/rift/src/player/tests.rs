@@ -3,13 +3,17 @@
 use rift_types::{PlaybackState, QueueSnapshot, RepeatMode, Track};
 
 use super::nav::{
-    anchor_playing, cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor, toggle_shuffle,
+    anchor_playing, cancel_playback, cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor,
+    toggle_shuffle,
 };
-use super::playback::{byline, commit_crossfade, preseed_duration};
+use super::playback::{
+    byline, commit_crossfade, crossfade_hold, is_current_generation, preseed_duration,
+    should_arm_crossfade, CrossfadeHold,
+};
 use super::queue::{
     append_tracks, insert_next, move_in_queue, remove_from_queue, AddOutcome, RemoveOutcome,
 };
-use super::state::{session_changed, PlayerCore};
+use super::state::{load_snapshot, session_changed, PlayerCore};
 
 fn dummy_track(i: usize) -> Track {
     Track {
@@ -251,6 +255,34 @@ fn repeat_cycles_through_off_all_and_one() {
     assert_eq!(cycle_repeat(&mut core), RepeatMode::Off);
 }
 
+/// Stop is a cancellation: a fetch/decode still in flight belongs to the
+/// playback the user just stopped, and the generation bump is what makes the
+/// landing task discard itself. Without it, pressing Stop (e.g. the OS media
+/// key) while a track was `Loading` was followed by that track starting anyway.
+#[test]
+fn stopping_supersedes_an_in_flight_play_request() {
+    let mut core = queue_core(3, Some(0));
+    core.state = PlaybackState::Loading;
+    core.pending_next = Some(2);
+    core.crossfade_armed_for = Some(core.generation);
+    let generation = core.generation;
+
+    cancel_playback(&mut core);
+
+    assert_eq!(
+        core.generation,
+        generation + 1,
+        "work in flight for the stopped request is stale now"
+    );
+    assert_eq!(core.state, PlaybackState::Stopped);
+    assert_eq!(core.position, 0.0);
+    assert_eq!(core.pending_next, None, "the prefetched pick is dropped");
+    assert_eq!(
+        core.crossfade_armed_for, None,
+        "and a fresh track can arm a crossfade"
+    );
+}
+
 #[test]
 fn changing_repeat_mode_drops_a_prefetched_crossfade_pick() {
     let mut core = queue_core(3, Some(1));
@@ -287,6 +319,22 @@ fn queue_core(n: usize, current: Option<usize>) -> PlayerCore {
     PlayerCore {
         queue: (0..n).map(dummy_track).collect(),
         current,
+        ..PlayerCore::default()
+    }
+}
+
+/// A playing two-track queue with crossfade enabled and a known length: the
+/// state the position watcher sees just before it decides to arm. The position
+/// (`195.0` of `200.0`) puts the track inside the overlap window, the state a
+/// ready prefetch is committed from.
+fn crossfade_core() -> PlayerCore {
+    PlayerCore {
+        queue: (0..2).map(dummy_track).collect(),
+        current: Some(0),
+        state: PlaybackState::Playing,
+        position: 195.0,
+        duration: 200.0,
+        crossfade: 10.0,
         ..PlayerCore::default()
     }
 }
@@ -387,6 +435,12 @@ fn remove_current_plays_the_one_that_took_its_slot() {
         remove_from_queue(&mut core, 2),
         RemoveOutcome::PlayIndex(2)
     ));
+    assert_eq!(
+        core.current,
+        Some(2),
+        "`current` names the replacement before the caller's play_index runs, so \
+         a snapshot taken between the two locks cannot point past the queue"
+    );
 }
 
 #[test]
@@ -396,6 +450,11 @@ fn remove_current_at_end_clamps_to_new_last() {
         remove_from_queue(&mut core, 2),
         RemoveOutcome::PlayIndex(1)
     ));
+    assert_eq!(
+        core.current,
+        Some(1),
+        "`current` is clamped with the queue, never left out of range"
+    );
 }
 
 #[test]
@@ -483,6 +542,21 @@ fn insert_next_with_nothing_playing_starts_first() {
     let outcome = insert_next(&mut core, vec![dummy_track(4)]);
     assert!(matches!(outcome, AddOutcome::PlayIndex(0)));
     assert_eq!(ids(&core), vec!["4"]);
+}
+
+/// A `current` left over from the queue a concurrent `play_tracks` has just
+/// replaced must not make the insertion point exceed the queue: `Vec::splice`
+/// panics on an out-of-range start, so the point is clamped instead.
+#[test]
+fn insert_next_clamps_a_stale_current_instead_of_panicking() {
+    let mut core = queue_core(2, Some(5)); // stale index from a longer queue
+    let outcome = insert_next(&mut core, vec![dummy_track(9)]);
+    assert!(matches!(outcome, AddOutcome::EmitOnly));
+    assert_eq!(
+        ids(&core),
+        vec!["0", "1", "9"],
+        "appended at the end of the queue that actually exists"
+    );
 }
 
 #[test]
@@ -770,6 +844,37 @@ fn an_unchanged_snapshot_is_not_persisted_again() {
 
     // ...and the just-written snapshot is itself deduped.
     assert!(!session_changed(&mut last, &resourced));
+}
+
+/// Restoring the saved queue is best-effort: a missing file is the normal fresh
+/// start, and a corrupt one is ignored (logged, not a panic). A valid snapshot
+/// round-trips exactly, so the next launch restores tracks/modes/source.
+#[test]
+fn load_snapshot_tolerates_missing_corrupt_and_valid_files() {
+    use crate::util::testing::TempDir;
+
+    let dir = TempDir::new("player-snapshot-load");
+    let path = dir.join("playback.json");
+    assert!(
+        load_snapshot(&path).is_none(),
+        "a missing file is a fresh start"
+    );
+
+    std::fs::write(&path, b"{ this is not json").unwrap();
+    assert!(
+        load_snapshot(&path).is_none(),
+        "a corrupt file must not panic the launch path"
+    );
+
+    let snapshot = QueueSnapshot {
+        tracks: vec![dummy_track(1), dummy_track(2)],
+        current: Some(1),
+        shuffle: true,
+        repeat: RepeatMode::All,
+        source: Some("liked".into()),
+    };
+    crate::util::save_json(&path, &snapshot, "playback");
+    assert_eq!(load_snapshot(&path), Some(snapshot));
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,5 +1648,159 @@ fn a_toggle_off_mid_prefetch_draws_under_the_new_mode_not_the_stale_pick() {
         pick_next(&mut core, false),
         Some(1),
         "the next track follows the queue order of the mode now in force"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The crossfade window: arming, and exactly-once commit
+// ---------------------------------------------------------------------------
+//
+// The arming rule used to live inline in the position watcher and the commit
+// rule inside an async fetch task, where neither could be tested. They are pure
+// functions now (`should_arm_crossfade`, `crossfade_hold`), and these tests pin
+// the behaviour that used to be only implied by the comments.
+
+/// The crossfade arming rule: arm once, inside the overlap window, and re-arm
+/// only for a new track.
+#[test]
+fn crossfade_arms_once_inside_the_overlap_window() {
+    let mut core = crossfade_core();
+    // Outside the window an early tick must not draw the next track.
+    assert!(!should_arm_crossfade(&mut core, 100.0));
+    assert_eq!(core.crossfade_armed_for, None, "not armed yet");
+    // Inside the window it arms…
+    assert!(should_arm_crossfade(&mut core, 191.0));
+    assert_eq!(core.crossfade_armed_for, Some(core.generation));
+    // …and only once for this track.
+    assert!(!should_arm_crossfade(&mut core, 192.0));
+    // A new play request (generation) can arm again.
+    core.generation += 1;
+    assert!(should_arm_crossfade(&mut core, 195.0));
+}
+
+/// Every reason the watcher must *not* start a crossfade.
+#[test]
+fn crossfade_does_not_arm_when_it_cannot_apply() {
+    // Disabled.
+    let mut core = crossfade_core();
+    core.crossfade = 0.0;
+    assert!(!should_arm_crossfade(&mut core, 199.0));
+
+    // Only while actually playing.
+    for state in [
+        PlaybackState::Loading,
+        PlaybackState::Paused,
+        PlaybackState::Stopped,
+    ] {
+        let mut core = crossfade_core();
+        core.state = state;
+        assert!(
+            !should_arm_crossfade(&mut core, 199.0),
+            "must not arm while {state:?}"
+        );
+    }
+
+    // Repeat-one replays the track, it does not overlap it with another.
+    let mut core = crossfade_core();
+    core.repeat = RepeatMode::One;
+    assert!(!should_arm_crossfade(&mut core, 199.0));
+
+    // A prefetched target is already in flight: don't draw a second.
+    let mut core = crossfade_core();
+    core.pending_next = Some(1);
+    assert!(!should_arm_crossfade(&mut core, 199.0));
+
+    // An unknown or non-finite length cannot be judged.
+    let mut core = crossfade_core();
+    core.duration = 0.0;
+    assert!(!should_arm_crossfade(&mut core, 199.0));
+    let mut core = crossfade_core();
+    core.duration = f64::NAN;
+    assert!(!should_arm_crossfade(&mut core, 199.0));
+}
+
+/// A fetched target becomes current only while its prefetch is still the current
+/// one; anything that advanced playback in the meantime is stale and must be
+/// dropped (otherwise the crossfade commit would play a track twice or skip one).
+#[test]
+fn a_crossfade_commits_only_while_its_prefetch_is_current() {
+    let mut core = crossfade_core();
+    core.pending_next = Some(1);
+    let generation = core.generation;
+    assert_eq!(crossfade_hold(&core, generation, 1), CrossfadeHold::None);
+    // A skip (or a natural end) bumped the generation: stale.
+    assert_eq!(
+        crossfade_hold(&core, generation + 1, 1),
+        CrossfadeHold::Stale
+    );
+    // The pin names another track: stale.
+    assert_eq!(crossfade_hold(&core, generation, 0), CrossfadeHold::Stale);
+    // The pin was consumed: stale.
+    core.pending_next = None;
+    assert_eq!(crossfade_hold(&core, generation, 1), CrossfadeHold::Stale);
+}
+
+/// A ready target defers while playback is paused (committing would resume
+/// against the user's wish) or after a backward seek left the window; an unknown
+/// length is "cannot tell" and does not block the commit.
+#[test]
+fn a_crossfade_defers_while_paused_or_outside_the_overlap_window() {
+    let mut core = crossfade_core();
+    core.pending_next = Some(1);
+    let generation = core.generation;
+
+    for state in [
+        PlaybackState::Paused,
+        PlaybackState::Loading,
+        PlaybackState::Stopped,
+    ] {
+        core.state = state;
+        assert_eq!(
+            crossfade_hold(&core, generation, 1),
+            CrossfadeHold::Paused,
+            "must defer while {state:?}"
+        );
+    }
+
+    core.state = PlaybackState::Playing;
+    core.position = 50.0;
+    assert_eq!(
+        crossfade_hold(&core, generation, 1),
+        CrossfadeHold::LeftWindow
+    );
+
+    core.position = 195.0;
+    assert_eq!(crossfade_hold(&core, generation, 1), CrossfadeHold::None);
+    core.duration = 0.0;
+    assert_eq!(
+        crossfade_hold(&core, generation, 1),
+        CrossfadeHold::None,
+        "an unknown length must not block a commit"
+    );
+}
+
+/// The gate `announce_track` re-checks after every await before publishing
+/// now-playing state. A skip bumps the generation, so a credit/duration update
+/// that lands after it must not emit a stale `Track` event — the UI (and the OS
+/// media session) would otherwise show the track the user already skipped past
+/// as now playing. This is the rule the fix for that bug depends on.
+#[test]
+fn a_superseded_request_must_not_publish_now_playing() {
+    let mut core = queue_core(3, Some(0));
+    let request = core.generation;
+    assert!(
+        is_current_generation(&core, request),
+        "the playing request is current"
+    );
+
+    // The user skips while the track's credit enrichment is still in flight.
+    start_like(&mut core, 1);
+    assert!(
+        !is_current_generation(&core, request),
+        "the superseded announcement must not publish"
+    );
+    assert!(
+        is_current_generation(&core, core.generation),
+        "and the new request's own announcement still may"
     );
 }

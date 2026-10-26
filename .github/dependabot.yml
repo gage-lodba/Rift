@@ -24,7 +24,7 @@ version: 2
 
 updates:
   # Cargo workspace at the repository root (`Cargo.toml` with `members` under
-  # `crates/`). All four members are `publish = false`, so updates are for the
+  # `crates/`). All five members are `publish = false`, so updates are for the
   # application build, not for downstream consumers.
   - package-ecosystem: "cargo"
     directory: "/"

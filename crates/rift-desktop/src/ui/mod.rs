@@ -64,7 +64,6 @@ pub use crate::theme::Theme;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ops::Range;
 
 use crate::text::{Fonts, TextShape, TextStyle};
 
@@ -220,19 +219,11 @@ struct AnimState {
     seen: bool,
 }
 
+/// Reusable text-shaping buffer: keeps the glyph allocation alive between
+/// frames instead of reallocating it for every label.
+#[derive(Default)]
 struct FrameScratch {
     shape: TextShape,
-    #[allow(dead_code)]
-    ranges: Vec<Range<usize>>,
-}
-
-impl Default for FrameScratch {
-    fn default() -> Self {
-        Self {
-            shape: TextShape::new(),
-            ranges: Vec::with_capacity(8),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,10 +316,29 @@ impl Ui {
     }
 
     pub fn new_with_theme(theme: Theme) -> Self {
-        let mut fonts = Fonts::new();
+        Self::new_with_fonts_and_theme(theme, Fonts::new())
+    }
+
+    /// Build the context around font faces parsed by the caller.
+    ///
+    /// Parsing the six embedded faces is the only expensive part of creating a
+    /// [`Ui`], it is CPU-only, and it shares nothing with the renderer — so the
+    /// windowed startup path parses them on a worker thread while the main
+    /// thread is in Vulkan construction, then hands the result here (see
+    /// `main.rs`). Calls [`Fonts::prewarm_icons`] like the other constructors.
+    pub fn new_with_fonts(fonts: Fonts) -> Self {
+        Self::new_with_fonts_and_theme(Theme::default(), fonts)
+    }
+
+    fn new_with_fonts_and_theme(theme: Theme, mut fonts: Fonts) -> Self {
         // Icons are tiny and used on the first frame; warming them avoids a
         // visible first-frame hitch while the atlas is being filled.
+        let prewarm_started = std::time::Instant::now();
         fonts.prewarm_icons(&Icon::all_codepoints(), &[14.0, 16.0, 20.0, 24.0]);
+        tracing::debug!(
+            "startup: icon prewarm {:.1} ms",
+            prewarm_started.elapsed().as_secs_f64() * 1000.0
+        );
         Self {
             theme,
             fonts,
@@ -456,7 +466,6 @@ impl Ui {
     pub fn end_frame(&mut self) -> PaintList {
         if !self.frame_started {
             let mut paint = PaintList::new(self.theme.bg);
-            paint.clear = self.theme.bg;
             paint.created.append(&mut self.created_textures);
             paint.updated.append(&mut self.updated_textures);
             paint.dropped.append(&mut self.dropped_textures);
@@ -497,7 +506,6 @@ impl Ui {
 
         // ---- flatten paint ----
         let mut paint = PaintList::new(self.theme.bg);
-        paint.clear = self.theme.bg;
         push_grouped_layers(&mut paint, &self.prims);
         push_grouped_layers(&mut paint, &self.deferred);
         self.prims.clear();
@@ -1120,8 +1128,28 @@ impl Ui {
     }
 
     fn draw_ellipsized(&mut self, rect: Rect, text: &str, style: &TextStyle, align: Align) {
-        let displayed: Cow<'_, str> = self.fonts.ellipsize(text, style, rect.w);
-        self.draw_text_block(rect, displayed.as_ref(), style, None, align, VAlign::Center);
+        if rect.is_empty() {
+            return;
+        }
+        let has_newline = text.find('\n').is_some();
+        let mut shape = std::mem::take(&mut self.scratch.shape);
+        // Shape once first: most labels fit their rect, and the old ordering
+        // paid a separate measuring pass (`ellipsize` -> `line_width`) plus this
+        // shaping pass for every one of them. Only text that actually needs
+        // truncating goes through the measuring fallback. Text with a hard
+        // newline keeps the old path because `ellipsize` deliberately truncates
+        // at the first line.
+        if !has_newline {
+            self.fonts.shape_into(text, style, None, &mut shape);
+        }
+        if has_newline || shape.size.w > rect.w {
+            let displayed: Cow<'_, str> = self.fonts.ellipsize(text, style, rect.w);
+            self.fonts
+                .shape_into(displayed.as_ref(), style, None, &mut shape);
+        }
+        let origin = text_origin(rect, shape.size, align, VAlign::Center);
+        self.glyph_run(origin, &shape, style.color);
+        self.scratch.shape = shape;
     }
 
     fn draw_text_block(
@@ -1138,17 +1166,7 @@ impl Ui {
         }
         let mut shape = std::mem::take(&mut self.scratch.shape);
         self.fonts.shape_into(text, style, max_width, &mut shape);
-        let mut origin = Vec2::new(rect.x, rect.y);
-        match align {
-            Align::Left => {}
-            Align::Center => origin.x += (rect.w - shape.size.w) * 0.5,
-            Align::Right => origin.x += rect.w - shape.size.w,
-        }
-        match valign {
-            VAlign::Top => {}
-            VAlign::Center => origin.y += (rect.h - shape.size.h) * 0.5,
-            VAlign::Bottom => origin.y += rect.h - shape.size.h,
-        }
+        let origin = text_origin(rect, shape.size, align, valign);
         self.glyph_run(origin, &shape, style.color);
         self.scratch.shape = shape;
     }
@@ -1267,6 +1285,24 @@ impl Ui {
         );
         total
     }
+}
+
+/// Top-left origin that places a `size`-sized text block inside `rect` according
+/// to the requested alignments. Shared by the wrapped and single-line draw
+/// paths so they place text identically.
+fn text_origin(rect: Rect, size: Size, align: Align, valign: VAlign) -> Vec2 {
+    let mut origin = Vec2::new(rect.x, rect.y);
+    match align {
+        Align::Left => {}
+        Align::Center => origin.x += (rect.w - size.w) * 0.5,
+        Align::Right => origin.x += rect.w - size.w,
+    }
+    match valign {
+        VAlign::Top => {}
+        VAlign::Center => origin.y += (rect.h - size.h) * 0.5,
+        VAlign::Bottom => origin.y += rect.h - size.h,
+    }
+    origin
 }
 
 /// Append a group of clipped primitives to the paint list, starting a new layer

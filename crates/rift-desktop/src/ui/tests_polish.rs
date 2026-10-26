@@ -433,3 +433,126 @@ fn style_helpers_still_match_theme_tokens() {
     let w = ui.text_width("Rift", &style);
     assert!(w > 10.0);
 }
+
+// ---------------------------------------------------------------------------
+// state-independent auto ids (keyboard focus must survive a toggle)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stateful_widget_ids_are_stable_across_state_changes() {
+    let mut ui = Ui::new();
+    let switch_rect = Rect::new(10.0, 10.0, 44.0, 24.0);
+    let mut off = false;
+    let (switch_off_id, _) = frame(&mut ui, input_at(0.0), |ui| {
+        ui.switch(switch_rect, &mut off).response.id
+    });
+    let mut on = true;
+    let (switch_on_id, _) = frame(&mut ui, input_at(0.016), |ui| {
+        ui.switch(switch_rect, &mut on).response.id
+    });
+    assert_eq!(
+        switch_off_id, switch_on_id,
+        "a switch's id must not depend on its on/off value"
+    );
+
+    let button_rect = Rect::new(10.0, 40.0, 36.0, 36.0);
+    let (paused_id, _) = frame(&mut ui, input_at(0.032), |ui| {
+        ui.play_button(button_rect, false).id
+    });
+    let (playing_id, _) = frame(&mut ui, input_at(0.048), |ui| {
+        ui.play_button(button_rect, true).id
+    });
+    assert_eq!(
+        paused_id, playing_id,
+        "a play/pause button's id must not depend on the playing state"
+    );
+}
+
+#[test]
+fn switch_keeps_keyboard_focus_across_repeated_activations() {
+    let mut ui = Ui::new();
+    let rect = Rect::new(10.0, 10.0, 44.0, 24.0);
+    let mut on = false;
+    // Frame 1 registers the focus order; frame 2 Tabs onto the switch.
+    frame(&mut ui, input_at(0.0), |ui| {
+        ui.switch(rect, &mut on);
+    });
+    let mut i = input_at(0.016);
+    i.keys = vec![key_ev(Key::Tab, false)];
+    let (r, _) = frame(&mut ui, i, |ui| ui.switch(rect, &mut on));
+    assert!(r.response.focused, "switch should be focused after Tab");
+    assert!(!on);
+    // Frame 3: Space toggles it on and focus must be retained.
+    let mut i = input_at(0.032);
+    i.keys = vec![key_ev(Key::Space, false)];
+    let (r, _) = frame(&mut ui, i, |ui| ui.switch(rect, &mut on));
+    assert!(r.changed && on, "Space should toggle the switch on");
+    assert!(r.response.focused, "focus must survive the first toggle");
+    // Frame 4: Space toggles it back off — this used to be swallowed because
+    // the state-dependent id dropped focus after the first toggle.
+    let mut i = input_at(0.048);
+    i.keys = vec![key_ev(Key::Space, false)];
+    let (r, _) = frame(&mut ui, i, |ui| ui.switch(rect, &mut on));
+    assert!(r.changed && !on, "Space should toggle the switch off again");
+    assert!(
+        r.response.focused,
+        "focus must survive repeated activations"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// popup toggle keeps the documented keyboard contract
+// ---------------------------------------------------------------------------
+
+fn draw_toggled_menu(ui: &mut Ui, trigger: Id, menu_id: Id, anchor: Rect) -> Option<Response> {
+    ui.interact(anchor, trigger, Sense::CLICK);
+    ui.toggle_popup(menu_id);
+    ui.popup(
+        menu_id,
+        anchor,
+        Size::new(MENU_MIN_CONTENT_WIDTH, MENU_ITEM_HEIGHT),
+        PopupAlign::Right,
+        |ui, content| {
+            ui.menu_item(
+                Rect::new(content.x, content.y, content.w, MENU_ITEM_HEIGHT),
+                "Rename",
+                None,
+                None,
+                false,
+            )
+        },
+    )
+}
+
+#[test]
+fn toggle_popup_keeps_first_row_focus_and_returns_it_on_escape() {
+    let mut ui = Ui::new();
+    let trigger = Id::from_str("toggle-trigger");
+    let menu_id = Id::from_str("toggle-menu");
+    let anchor = Rect::new(10.0, 10.0, 28.0, 28.0);
+    ui.request_focus(trigger);
+
+    // Frame 1: the documented kebab pattern — toggle the menu open.
+    frame(&mut ui, input_at(0.0), |ui| {
+        draw_toggled_menu(ui, trigger, menu_id, anchor)
+    });
+    assert!(ui.is_popup_open(menu_id));
+    assert_eq!(
+        ui.focused_id(),
+        Some(menu_id.with("Rename")),
+        "a menu opened with toggle_popup must focus its first row"
+    );
+
+    // Frame 2: Escape closes it and returns focus to the trigger.
+    let mut i = input_at(0.016);
+    i.keys = vec![key_ev(Key::Escape, false)];
+    frame(&mut ui, i, |ui| {
+        draw_toggled_menu(ui, trigger, menu_id, anchor)
+    });
+    assert!(!ui.is_popup_open(menu_id));
+    assert_eq!(
+        ui.focused_id(),
+        Some(trigger),
+        "Escape must hand focus back to the toggle's trigger"
+    );
+}

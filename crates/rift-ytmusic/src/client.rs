@@ -15,10 +15,79 @@ use crate::parse;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
+/// The largest innertube response body the client will buffer.
+///
+/// Real metadata pages are a few megabytes at most, so this is a deliberately
+/// generous ceiling; it exists because [`reqwest::Response`] has no ceiling of
+/// its own, and a broken (or hostile) endpoint could otherwise grow a buffer for
+/// as long as it keeps sending. Innertube JSON is read whole by design — the
+/// parsers walk a complete [`serde_json::Value`] — so "do not buffer it at all"
+/// is not an option here; bounding the buffer is.
+///
+/// Tests shrink the constant: the streaming bound can only be exercised
+/// end-to-end if a response is allowed to exceed it, and moving tens of
+/// megabytes per test through loopback would cost the suite more than the
+/// bound is worth. The shipped value is 32 MiB; only the constant is
+/// substituted under `cfg(test)`.
+#[cfg(not(test))]
+const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(test)]
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
+
+/// Longest excerpt of a non-JSON error body copied into an error message.
+const MAX_ERROR_EXCERPT_CHARS: usize = 200;
+
+/// Read a response body, refusing to buffer more than [`MAX_RESPONSE_BYTES`].
+///
+/// The ceiling is enforced by counting the bytes actually received, not by
+/// trusting `Content-Length`: a chunked or automatically decompressed response
+/// has no declared length (`Response::content_length` returns `None` for it),
+/// and the request timeout bounds how *long* a slow server may trickle, not how
+/// much it can make the client buffer. Callers still reject an oversized
+/// declared length before calling this, so that case never starts reading.
+async fn read_body(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let received = body.len() as u64 + chunk.len() as u64;
+        if received > MAX_RESPONSE_BYTES {
+            return Err(Error::ResponseTooLarge { size: received });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// The server-provided `error.message` from a parsed error body, if any.
+fn api_message(parsed: &Value) -> String {
+    parsed
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// A short, single-line excerpt of a non-JSON response body, for an error
+/// message. Collapses whitespace so an HTML error page cannot put newlines in a
+/// toast, and truncates on a character boundary.
+fn body_excerpt(body: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(body);
+    let flat = lossy.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = flat.chars();
+    let excerpt: String = chars.by_ref().take(MAX_ERROR_EXCERPT_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
 /// A `YouTube` Music innertube client.
 ///
-/// Cheap to clone: shares the HTTP client, cached client version, and
-/// visitor-data pool behind an `Arc`.
+/// Cheap to clone: clones share the HTTP connection pool. The scraped client
+/// version and the visitor-data pool are process-wide caches in the crate's
+/// private `context` and `identity` modules rather than per-client state, so every
+/// clone and every separate `Client` in the process sees the same session.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -31,6 +100,12 @@ struct Inner {
 impl Client {
     /// Build an anonymous client. Does no network I/O; the session bootstraps
     /// lazily on the first request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] only if the underlying [`reqwest::Client`] cannot
+    /// be constructed (for example a TLS backend that fails to initialize). No
+    /// request is made here, so there is no network error to report yet.
     pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
@@ -49,24 +124,54 @@ impl Client {
     }
 
     /// Search `YouTube` Music for audio tracks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] on a transport failure (DNS, TLS, timeout,
+    /// reset), [`Error::Api`] when innertube answers with a non-success status,
+    /// [`Error::Bootstrap`] when no anonymous visitor identity can be
+    /// established, [`Error::ResponseTooLarge`] for an oversized response, and
+    /// [`Error::Parse`] when the body is not JSON.
     pub async fn search_tracks(&self, query: &str) -> Result<Vec<Track>> {
         let resp = self.search_raw(SearchFilter::Tracks, query).await?;
         Ok(parse::tracks(&resp))
     }
 
     /// Search `YouTube` Music for artists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] on a transport failure, [`Error::Api`] when
+    /// innertube answers with a non-success status, [`Error::Bootstrap`] when no
+    /// anonymous visitor identity can be established, [`Error::ResponseTooLarge`]
+    /// for an oversized response, and [`Error::Parse`] when the body is not JSON.
     pub async fn search_artists(&self, query: &str) -> Result<Vec<ArtistSummary>> {
         let resp = self.search_raw(SearchFilter::Artists, query).await?;
         Ok(parse::artists(&resp))
     }
 
     /// Search `YouTube` Music for albums.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] on a transport failure, [`Error::Api`] when
+    /// innertube answers with a non-success status, [`Error::Bootstrap`] when no
+    /// anonymous visitor identity can be established, [`Error::ResponseTooLarge`]
+    /// for an oversized response, and [`Error::Parse`] when the body is not JSON.
     pub async fn search_albums(&self, query: &str) -> Result<Vec<AlbumSummary>> {
         let resp = self.search_raw(SearchFilter::Albums, query).await?;
         Ok(parse::albums(&resp))
     }
 
     /// Fetch a full album page (header + track list) by its browse id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] on a transport failure, [`Error::Api`] when
+    /// innertube answers with a non-success status, [`Error::Bootstrap`] when no
+    /// anonymous visitor identity can be established, [`Error::ResponseTooLarge`]
+    /// for an oversized response, and [`Error::Parse`] when the body is not JSON
+    /// or the page shape is not understood.
     pub async fn album(&self, browse_id: &str) -> Result<AlbumPage> {
         let resp = self.browse_raw(browse_id).await?;
         parse::album_page(&resp, browse_id)
@@ -74,6 +179,14 @@ impl Client {
     }
 
     /// Fetch a full artist page (header + top songs + albums) by its browse id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] on a transport failure, [`Error::Api`] when
+    /// innertube answers with a non-success status, [`Error::Bootstrap`] when no
+    /// anonymous visitor identity can be established, [`Error::ResponseTooLarge`]
+    /// for an oversized response, and [`Error::Parse`] when the body is not JSON
+    /// or the page shape is not understood.
     pub async fn artist(&self, browse_id: &str) -> Result<ArtistPage> {
         let resp = self.browse_raw(browse_id).await?;
         parse::artist_page(&resp, browse_id)
@@ -93,8 +206,28 @@ impl Client {
     /// of track-less pages from making the walk unbounded; a page that carried no
     /// items at all; and a token that comes back unchanged, which is the spin the
     /// old track-based guard was actually protecting against — a page with no
-    /// rows and a token that never advances.
+    /// rows and a token that never advances. A page whose token does not advance
+    /// still contributes the tracks it carried: the guard ends the walk, it does
+    /// not invalidate the content already parsed.
+    ///
+    /// `playlist_id` is a bare playlist id (`PL…`, `OLAK5uy_…`); a leading `VL`
+    /// browse prefix is accepted and stripped, so callers that copied a browse
+    /// id are not silently broken by a double prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] on a transport failure, [`Error::Api`] when
+    /// innertube answers with a non-success status, [`Error::Bootstrap`] when no
+    /// anonymous visitor identity can be established, [`Error::ResponseTooLarge`]
+    /// for an oversized response, and [`Error::Parse`] when a page body is not
+    /// JSON. A failure on the first page or on any continuation request fails the
+    /// whole call; only the `limit` and uninterrupted-token bounds return partial
+    /// results.
     pub async fn playlist(&self, playlist_id: &str, limit: usize) -> Result<Playlist> {
+        // Callers normally pass a bare id (the artist page strips the prefix
+        // itself), but a pasted browse id can carry it; the request needs
+        // exactly one `VL`.
+        let playlist_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
         let first = self.browse_raw(&format!("VL{playlist_id}")).await?;
         let page = parse::playlist_page(&first);
         let name = page.name.unwrap_or_default();
@@ -129,13 +262,17 @@ impl Client {
             if page.items_seen == 0 {
                 break;
             }
-            // ... but only while the token actually advances. Following a token
-            // that comes back unchanged would spin, and it is not the budget's
-            // job to notice that.
+            // Keep the rows *before* testing the token: a token that does not
+            // advance ends the walk, but the page that carried it was a real
+            // page and its tracks are not made invalid by the server repeating
+            // itself.
+            tracks.extend(page.tracks);
+            // ... but only continue while the token actually advances. Following
+            // a token that comes back unchanged would spin, and it is not the
+            // budget's job to notice that.
             if page.continuation.as_deref() == Some(token.as_str()) {
                 break;
             }
-            tracks.extend(page.tracks);
             continuation = page.continuation;
         }
         tracks.truncate(limit);
@@ -152,6 +289,14 @@ impl Client {
     /// `video_id` is passed through to the parser, which matches the byline to
     /// that exact queue entry — a substituted video must not contribute another
     /// song's artists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] on a transport failure, [`Error::Api`] when
+    /// innertube answers with a non-success status, [`Error::Bootstrap`] when no
+    /// anonymous visitor identity can be established, [`Error::ResponseTooLarge`]
+    /// for an oversized response, and [`Error::Parse`] when the body is not JSON
+    /// or the response does not carry the requested `video_id`.
     pub async fn track_credits(
         &self,
         video_id: &str,
@@ -194,10 +339,21 @@ impl Client {
 
     /// POST to an innertube endpoint, merging the session context into the body.
     ///
-    /// Retries once after a 403, rotating the visitor id — `YouTube` occasionally
-    /// rejects a stale or flagged visitor data.
+    /// Makes at most two attempts. A 403 is the visitor-data rejection the retry
+    /// exists for: the rejected id is evicted from the identity pool and the
+    /// request is retried once with the id the pool then hands out. Every other
+    /// status is final, so the retry is bounded by construction (one rotation,
+    /// not a loop).
+    ///
+    /// The 403 is handled before the body is parsed: `YouTube` has answered a
+    /// flagged visitor with an HTML block page as well as JSON, and "the body is
+    /// not JSON" must not turn the rotation path into a `Parse` error. For the
+    /// same reason a non-JSON body on any other non-success status is reported as
+    /// [`Error::Api`] with a short excerpt, not as a parse failure — the status is
+    /// what the caller can act on.
     async fn post(&self, endpoint: &str, extra: Value) -> Result<Value> {
-        for _ in 0..2 {
+        let mut rotated = false;
+        loop {
             let version = context::client_version(&self.inner.http, USER_AGENT).await;
             let vdata = identity::visitor_data(&self.inner.http, USER_AGENT).await?;
             let mut body = extra.clone();
@@ -225,32 +381,47 @@ impl Client {
                 .await?;
 
             let status = resp.status();
-            let text = resp.text().await?;
-            let parsed: Value = serde_json::from_str(&text)
-                .map_err(|e| Error::Parse(format!("response was not JSON: {e}")))?;
-
             if status == reqwest::StatusCode::FORBIDDEN {
+                // Evict exactly the id this response rejected. If the retried
+                // request is rejected too, evict that one as well and give up:
+                // one rotation is the whole retry budget.
                 identity::ban(&vdata);
+                if rotated {
+                    return Err(Error::Api {
+                        status: 403,
+                        message: "forbidden after rotating visitor data".to_owned(),
+                    });
+                }
+                rotated = true;
                 continue;
             }
+
+            // Reject an oversized *declared* body before reading anything. The
+            // actual received bytes are still counted while streaming, because
+            // a chunked or decompressed response declares no length at all.
+            if let Some(declared) = resp.content_length() {
+                if declared > MAX_RESPONSE_BYTES {
+                    return Err(Error::ResponseTooLarge { size: declared });
+                }
+            }
+            let raw = read_body(resp).await?;
+
             if !status.is_success() {
-                let message = parsed
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
+                let message = serde_json::from_slice::<Value>(&raw)
+                    .ok()
+                    .map(|parsed| api_message(&parsed))
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| body_excerpt(&raw));
                 return Err(Error::Api {
                     status: status.as_u16(),
                     message,
                 });
             }
+
+            let parsed: Value = serde_json::from_slice(&raw)
+                .map_err(|e| Error::Parse(format!("response was not JSON: {e}")))?;
             return Ok(parsed);
         }
-        Err(Error::Api {
-            status: 403,
-            message: "forbidden after rotating visitor data".to_owned(),
-        })
     }
 }
 
@@ -294,6 +465,16 @@ mod tests {
     /// without depending on the seeded visitor.
     const ALWAYS_429: &str = "__always_429__";
     const ALWAYS_403: &str = "__always_403__";
+    /// A 403 whose body is an HTML block page rather than the usual JSON error
+    /// object: the rotation retry must not depend on the body being JSON.
+    const ALWAYS_403_HTML: &str = "__always_403_html__";
+    /// A non-success status with a non-JSON body: an HTTP error, not a parse
+    /// failure.
+    const ALWAYS_500_HTML: &str = "__always_500_html__";
+    /// A response that declares a body larger than the client's ceiling.
+    const DECLARED_TOO_LARGE: &str = "__declared_too_large__";
+    /// A chunked response larger than the ceiling, which declares no length.
+    const CHUNKED_TOO_LARGE: &str = "__chunked_too_large__";
 
     #[derive(Clone)]
     struct Request {
@@ -337,6 +518,15 @@ mod tests {
         /// Extra headers, e.g. the `Set-Cookie` carrying visitor data.
         headers: Vec<(String, String)>,
         body: String,
+        /// Overrides the `Content-Length` the server advertises, so a response
+        /// can *declare* a body larger than it sends. Exercises the client's
+        /// early size rejection without moving tens of megabytes through
+        /// loopback.
+        declared_length: Option<u64>,
+        /// Send the body with `Transfer-Encoding: chunked` instead of a
+        /// `Content-Length`. A chunked response has no declared length, which is
+        /// what makes the client's streaming byte count the only bound.
+        chunked: bool,
     }
 
     impl Response {
@@ -345,6 +535,8 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 body: body.to_string(),
+                declared_length: None,
+                chunked: false,
             }
         }
         fn error(status: u16) -> Self {
@@ -352,6 +544,39 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body: json!({ "error": { "message": "rejected by the test server" } }).to_string(),
+                declared_length: None,
+                chunked: false,
+            }
+        }
+        /// A non-JSON body with an explicit status, as an HTML block page or
+        /// proxy error would be.
+        fn text(status: u16, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: body.into(),
+                declared_length: None,
+                chunked: false,
+            }
+        }
+        /// A chunked body: the client cannot learn its size from the headers.
+        fn chunked(body: impl Into<String>) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body: body.into(),
+                declared_length: None,
+                chunked: true,
+            }
+        }
+        /// A body that *declares* a length different from what it sends.
+        fn declared_length(body: impl Into<String>, declared: u64) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body: body.into(),
+                declared_length: Some(declared),
+                chunked: false,
             }
         }
     }
@@ -467,6 +692,8 @@ mod tests {
                 headers: Vec::new(),
                 body: json!({ "error": { "message": format!("no route for {route}") } })
                     .to_string(),
+                declared_length: None,
+                chunked: false,
             },
         };
 
@@ -477,16 +704,37 @@ mod tests {
             _ => "Error",
         };
         let mut head = format!(
-            "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            response.status,
-            response.body.len()
+            "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nConnection: close\r\n",
+            response.status
         );
+        if response.chunked {
+            head.push_str("Transfer-Encoding: chunked\r\n");
+        } else {
+            let length = response
+                .declared_length
+                .unwrap_or(response.body.len() as u64);
+            head.push_str("Content-Length: ");
+            head.push_str(&length.to_string());
+            head.push_str("\r\n");
+        }
         for (name, value) in &response.headers {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
         head.push_str("\r\n");
         stream.write_all(head.as_bytes())?;
-        stream.write_all(response.body.as_bytes())?;
+        if response.chunked {
+            // Write in chunks so the client has several streaming reads to count;
+            // one giant write would also work but would let a reader that only
+            // checks the first chunk look correct.
+            for chunk in response.body.as_bytes().chunks(8192) {
+                stream.write_all(format!("{:X}\r\n", chunk.len()).as_bytes())?;
+                stream.write_all(chunk)?;
+                stream.write_all(b"\r\n")?;
+            }
+            stream.write_all(b"0\r\n\r\n")?;
+        } else {
+            stream.write_all(response.body.as_bytes())?;
+        }
         stream.flush()
     }
 
@@ -658,6 +906,8 @@ mod tests {
                         } else {
                             home_html()
                         },
+                        declared_length: None,
+                        chunked: false,
                     }
                 }),
             );
@@ -667,6 +917,14 @@ mod tests {
                 Box::new(|req: &Request| match req.query() {
                     ALWAYS_429 => Response::error(429),
                     ALWAYS_403 => Response::error(403),
+                    ALWAYS_403_HTML => Response::text(403, "<html><body>Forbidden</body></html>"),
+                    ALWAYS_500_HTML => Response::text(500, "upstream failed: please retry later"),
+                    DECLARED_TOO_LARGE => {
+                        Response::declared_length("{}", MAX_RESPONSE_BYTES + 1)
+                    }
+                    CHUNKED_TOO_LARGE => Response::chunked(
+                        "x".repeat(usize::try_from(MAX_RESPONSE_BYTES).map_or(0, |cap| cap * 3)),
+                    ),
                     _ if req.header("x-goog-eom-visitor-id") == REJECTED_VISITOR => {
                         Response::error(403)
                     }
@@ -803,6 +1061,30 @@ mod tests {
                                 )
                             });
                         }
+                    }
+                    // A page whose continuation token never advances, but whose
+                    // rows are real audio: the walk has to stop *and* keep what
+                    // the page already carried. The route hands out one track on
+                    // each of its two pages, both under the same token, so a walk
+                    // that drops the second page's row fails
+                    // `playlist_keeps_the_tracks_of_a_page_whose_token_stops_advancing`.
+                    if let Some(tx) = id
+                        .strip_prefix("VL")
+                        .unwrap_or(id)
+                        .strip_prefix("PLtest_same_token_")
+                    {
+                        return Response::json(playlist_page(
+                            "Same Token",
+                            vec![track_row(&format!("s{tx}-1"), "First", "A")],
+                            Some("same-token"),
+                        ));
+                    }
+                    if token == "same-token" {
+                        return Response::json(playlist_page(
+                            "Same Token",
+                            vec![track_row("s-late", "Second", "A")],
+                            Some("same-token"),
+                        ));
                     }
                     // `playlist()` requests `VL<id>`, so the prefix is stripped
                     // before matching.
@@ -1298,5 +1580,177 @@ mod tests {
 
         let artist = c.artist("UCtest").await.expect("artist");
         assert_eq!(artist.name, "Test Artist");
+    }
+
+    /// A 403 is the visitor-rotation path whatever the body looks like.
+    ///
+    /// `YouTube` has answered a flagged visitor with an HTML block page instead of
+    /// the usual JSON error object. Parsing the body before looking at the status
+    /// turned that into a `Parse` error on the first attempt, so the documented
+    /// retry never ran; both attempts must be made, and the second 403 is the
+    /// give-up.
+    #[tokio::test]
+    async fn a_403_with_a_non_json_body_still_rotates_and_retries() {
+        let _gate = visitor_gate().await;
+        let fake = server();
+        let c = client();
+
+        let err = c
+            .search_tracks(ALWAYS_403_HTML)
+            .await
+            .expect_err("a permanent 403 must fail");
+        match err {
+            Error::Api { status, .. } => assert_eq!(status, 403),
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+
+        let attempts = logged(&fake.requests)
+            .iter()
+            .filter(|r| r.endpoint() == "search" && r.query() == ALWAYS_403_HTML)
+            .count();
+        assert_eq!(
+            attempts, 2,
+            "the rotation retry must not depend on the 403 body being JSON"
+        );
+    }
+
+    /// A non-JSON body on a non-success status is an HTTP-level refusal: keeping
+    /// the status and the server's own words is what the caller can act on, where
+    /// "could not parse" would hide both. It must not be retried (only a 403 is).
+    #[tokio::test]
+    async fn a_non_json_error_body_is_reported_as_an_api_error() {
+        let _gate = visitor_gate().await;
+        let fake = server();
+        let c = client();
+
+        let err = c
+            .search_tracks(ALWAYS_500_HTML)
+            .await
+            .expect_err("a 500 must fail");
+        match err {
+            Error::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert!(
+                    message.contains("upstream failed"),
+                    "the body excerpt should reach the caller: {message:?}"
+                );
+            }
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+
+        let attempts = logged(&fake.requests)
+            .iter()
+            .filter(|r| r.endpoint() == "search" && r.query() == ALWAYS_500_HTML)
+            .count();
+        assert_eq!(attempts, 1, "only a 403 is retried");
+    }
+
+    /// A body the server *declares* larger than the ceiling is rejected from the
+    /// header alone, before any of it is buffered.
+    #[tokio::test]
+    async fn a_declared_oversized_body_is_rejected_without_being_read() {
+        let _gate = visitor_gate().await;
+        let fake = server();
+        let c = client();
+
+        let err = c
+            .search_tracks(DECLARED_TOO_LARGE)
+            .await
+            .expect_err("an oversized body must fail");
+        match err {
+            Error::ResponseTooLarge { size } => {
+                assert_eq!(
+                    size,
+                    MAX_RESPONSE_BYTES + 1,
+                    "the declared size is reported"
+                );
+            }
+            other => panic!("expected Error::ResponseTooLarge, got {other:?}"),
+        }
+
+        let attempts = logged(&fake.requests)
+            .iter()
+            .filter(|r| r.endpoint() == "search" && r.query() == DECLARED_TOO_LARGE)
+            .count();
+        assert_eq!(attempts, 1);
+    }
+
+    /// The ceiling is also enforced by counting received bytes: a chunked body
+    /// declares no length at all, so the streaming count is the only bound. The
+    /// test body is larger than the (test-only) ceiling on purpose.
+    #[tokio::test]
+    async fn a_chunked_body_is_bounded_while_it_streams() {
+        let _gate = visitor_gate().await;
+        let fake = server();
+        let c = client();
+
+        let err = c
+            .search_tracks(CHUNKED_TOO_LARGE)
+            .await
+            .expect_err("an oversized chunked body must fail");
+        match err {
+            Error::ResponseTooLarge { size } => assert!(
+                size > MAX_RESPONSE_BYTES,
+                "the error must report the byte count that crossed the ceiling: {size}"
+            ),
+            other => panic!("expected Error::ResponseTooLarge, got {other:?}"),
+        }
+
+        let attempts = logged(&fake.requests)
+            .iter()
+            .filter(|r| r.endpoint() == "search" && r.query() == CHUNKED_TOO_LARGE)
+            .count();
+        assert_eq!(attempts, 1);
+    }
+
+    /// `playlist` takes a bare id but tolerates a `VL`-prefixed browse id: the
+    /// artist page strips the prefix itself, while a copied browse id can still
+    /// carry it, and a double prefix would silently send the wrong `browseId`.
+    #[tokio::test]
+    async fn playlist_accepts_a_vl_prefixed_id() {
+        let _gate = visitor_gate().await;
+        let c = client();
+        let tx = tx();
+
+        let playlist = c
+            .playlist(&format!("VLPLtest_pagination_{tx}"), 3)
+            .await
+            .expect("playlist");
+        let expected: Vec<String> = (1..=3).map(|n| format!("p{tx}-{n}")).collect();
+        assert_eq!(
+            playlist
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "a single VL prefix must reach the pagination route"
+        );
+    }
+
+    /// A page whose continuation token does not advance still carried real
+    /// tracks. The guard exists to stop the *walk*, not to discard content the
+    /// server already sent: the unchanged token must end the loop with the page's
+    /// rows kept, rather than dropping the last page.
+    #[tokio::test]
+    async fn playlist_keeps_the_tracks_of_a_page_whose_token_stops_advancing() {
+        let _gate = visitor_gate().await;
+        let c = client();
+        let tx = tx();
+
+        let playlist = c
+            .playlist(&format!("PLtest_same_token_{tx}"), 50)
+            .await
+            .expect("playlist");
+        let expected = [format!("s{tx}-1"), "s-late".to_owned()];
+        assert_eq!(
+            playlist
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the page that repeated the token still contributed its track"
+        );
     }
 }

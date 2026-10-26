@@ -11,7 +11,6 @@
 //! the handful of page-local colors (slider track, badges) live in this module
 //! as named constants so screens stay out of hex literals.
 
-use super::paint::{SCROLLBAR_THUMB, SCROLLBAR_THUMB_HOVER, SCROLLBAR_WIDTH};
 use super::{
     Align, Color, CursorShape, Icon, IconFont, Id, Padding, Rect, Response, Sense, Size, Ui, Vec2,
 };
@@ -57,11 +56,46 @@ fn auto_id_icon(icon: Icon, rect: Rect) -> Id {
     ))
 }
 
+/// Auto id for stateful widgets whose *value* must not be part of the id.
+///
+/// A switch id derived from its on/off label (or a play button's playing state)
+/// would change on every toggle. The widget that had keyboard focus would then
+/// no longer appear in the next frame's focus order and would silently lose
+/// focus after one activation — so Tab + Space could only ever toggle it once.
+/// Identity therefore comes from the scope string plus the (sub-pixel
+/// quantised) rect only.
+fn auto_id_stable(scope: &str, rect: Rect) -> Id {
+    Id::hash_of((
+        scope,
+        quant(rect.x),
+        quant(rect.y),
+        quant(rect.w),
+        quant(rect.h),
+    ))
+}
+
 fn quant(v: f32) -> i64 {
     (v * 2.0).round() as i64
 }
 
-/// Badge/pill text colors from `.ytdlp-badge` and friends.
+/// Normalise slider bounds so `f32::clamp` can never panic and every value
+/// derived from them stays finite.
+///
+/// `f32::clamp` panics when `min > max` and returns NaN when its input is NaN;
+/// a NaN value would then leak NaN vertices into the paint list (undefined GPU
+/// work). The bounds come from caller/state data (e.g. persisted settings), so
+/// they are sanitised here rather than trusted.
+fn slider_range(min: f32, max: f32) -> (f32, f32) {
+    let min = if min.is_finite() { min } else { 0.0 };
+    let max = if max.is_finite() { max } else { min };
+    if min <= max {
+        (min, max)
+    } else {
+        (max, min)
+    }
+}
+
+/// Badge/pill text colors for the shared status tones.
 pub const SUCCESS: Color = Color::hex(0x4ade80);
 pub const SUCCESS_BG: Color = Color::rgba(74, 222, 128, 31);
 pub const WARNING: Color = Color::hex(0xfbbf24);
@@ -379,7 +413,7 @@ impl Ui {
 
     /// The old UI's `.play-btn`: a filled circle with a dark play/pause glyph.
     pub fn play_button(&mut self, rect: Rect, playing: bool) -> Response {
-        let id = auto_id("play-button", if playing { "pause" } else { "play" }, rect);
+        let id = auto_id_stable("play-button", rect);
         let response = self.interact(rect, id, Sense::CLICK);
         let theme = self.theme().clone();
         let bg = if response.active {
@@ -491,13 +525,6 @@ impl IconButtonStyle {
     }
 }
 
-/// A tiny stable salt for auto ids when the same icon appears twice at the same
-/// rect in one frame (rare; distinct rects already disambiguate).
-#[allow(dead_code)]
-fn icon_id_salt(icon: Icon) -> u32 {
-    icon.codepoint() as u32
-}
-
 // ---------------------------------------------------------------------------
 // toggle / checkbox
 // ---------------------------------------------------------------------------
@@ -519,7 +546,8 @@ impl Ui {
 
     /// Switch with a `disabled` state: dimmed and non-interactive.
     pub fn switch_enabled(&mut self, rect: Rect, on: &mut bool, enabled: bool) -> CheckboxResponse {
-        let id = auto_id("switch", if *on { "on" } else { "off" }, rect);
+        // `on` is deliberately not part of the id (see `auto_id_stable`).
+        let id = auto_id_stable("switch", rect);
         let response = self.interact(rect, id, if enabled { Sense::CLICK } else { Sense::NONE });
         let theme = self.theme().clone();
         let mut changed = false;
@@ -676,12 +704,18 @@ impl Ui {
         let hit = rect.expand((style.thumb_radius - rect.h * 0.5).max(6.0));
         let response = self.interact(hit, id, Sense::DRAG);
         let mut changed = false;
+        // Defensive: an inverted/NaN range would panic in `f32::clamp` below.
+        let (min, max) = slider_range(min, max);
         let range = (max - min).max(f32::EPSILON);
         let r = style.thumb_radius;
         // The thumb stays inside the track at both extremes, so its centre
         // travels over `rect.w - 2r` (ui-spec §6.3: center = x + 8 + f*(w-16)).
         let usable = (rect.w - r * 2.0).max(1.0);
-        let mut v = value.clamp(min, max);
+        let mut v = if value.is_finite() {
+            value.clamp(min, max)
+        } else {
+            min
+        };
         if (response.active && self.input().mouse_left_down) || response.clicked {
             let mouse_x = self.input().mouse_pos.0;
             let t = ((mouse_x - rect.x - r) / usable).clamp(0.0, 1.0);
@@ -742,7 +776,12 @@ impl Ui {
         let id = auto_id("slider", "range", rect);
         let response = self.interact(rect, id, Sense::HOVER);
         let theme = self.theme().clone();
-        let t = ((*value - min) / (max - min).max(f32::EPSILON)).clamp(0.0, 1.0);
+        let (min, max) = slider_range(min, max);
+        let t = if value.is_finite() {
+            ((*value - min) / (max - min).max(f32::EPSILON)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let track_y = rect.y + (rect.h - style.track_height) * 0.5;
         let track = Rect::new(rect.x, track_y, rect.w, style.track_height);
         let r = style.thumb_radius;
@@ -771,7 +810,7 @@ impl Ui {
 // progress / spinner / equalizer / badges
 // ---------------------------------------------------------------------------
 
-/// Badge color scheme (`.ytdlp-badge` states plus generic pills).
+/// Badge color scheme (status tones plus generic pills).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeKind {
     Neutral,
@@ -787,7 +826,13 @@ impl Ui {
         let theme = self.theme().clone();
         let radius = rect.h * 0.5;
         self.rounded_rect(rect, theme.bg_hover, radius);
-        let f = fraction.clamp(0.0, 1.0);
+        // NaN (e.g. 0/0 from a track without a duration) would produce a NaN
+        // prim; treat it as "no progress".
+        let f = if fraction.is_finite() {
+            fraction.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         if f > 0.0 {
             self.rounded_rect(Rect::new(rect.x, rect.y, rect.w * f, rect.h), color, radius);
         }
@@ -955,7 +1000,3 @@ pub fn format_duration(total_secs: u32) -> String {
 pub fn format_position(secs: f64) -> String {
     format_duration(secs.max(0.0) as u32)
 }
-
-/// Unused re-exports kept for widget code that wants scrollbar colors directly.
-pub(crate) const _SCROLLBAR_COLORS: (Color, Color, f32) =
-    (SCROLLBAR_THUMB, SCROLLBAR_THUMB_HOVER, SCROLLBAR_WIDTH);

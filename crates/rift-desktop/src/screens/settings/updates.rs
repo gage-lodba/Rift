@@ -1,10 +1,16 @@
 //! The Updates row's status line (`Check now` / "Download update").
 
+use crate::screens::cards;
 use crate::state::State;
-use crate::ui::{BadgeKind, Rect, Ui};
+use crate::text::Weight;
+use crate::ui::{BadgeKind, Color, Rect, Ui};
 
 use super::layout::{BADGE_H, LINE_13};
-use super::ytdlp::badgew;
+
+/// Badge width: 12/600 label + 8 px horizontal padding each side.
+fn badge_w(ui: &mut Ui, label: &str) -> f32 {
+    ui.text_width(label, &cards::style(12.0, Weight::SemiBold, Color::WHITE)) + 16.0
+}
 
 /// Draw the update-check status line. Returns the y below it.
 pub(crate) fn draw_update_status(
@@ -27,7 +33,7 @@ pub(crate) fn draw_update_status(
         }
         Some(u) if u.update_available => {
             let label = "Update available";
-            let w = badgew(ui, label);
+            let w = badge_w(ui, label);
             ui.badge(Rect::new(x, y, w, BADGE_H), label, BadgeKind::Danger);
             let meta = format!("v{} → v{}", u.current, u.latest.clone().unwrap_or_default());
             ui.text(
@@ -39,7 +45,7 @@ pub(crate) fn draw_update_status(
         }
         Some(u) if u.latest.is_some() => {
             let label = "✓ Up to date";
-            let w = badgew(ui, label);
+            let w = badge_w(ui, label);
             ui.badge(Rect::new(x, y, w, BADGE_H), label, BadgeKind::Success);
             ui.text(
                 Rect::new(x + w + 8.0, y + (BADGE_H - LINE_13) * 0.5, 120.0, LINE_13),

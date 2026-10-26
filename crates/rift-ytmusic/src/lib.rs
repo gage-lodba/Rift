@@ -2,8 +2,9 @@
 //!
 //! Implements the anonymous (visitor-data) innertube flow for the `WEB_REMIX`
 //! client and the metadata endpoints Rift needs, returning [`rift_types`]
-//! models. Audio stream resolution is deliberately out of scope — Rift shells
-//! out to yt-dlp for that.
+//! models. The [`player`] module also resolves native audio streams through the
+//! JS-less `VISIONOS` player client, so playback does not depend on an external
+//! media process.
 
 // The innertube client is pure Rust + HTTP; no `unsafe` is needed here.
 #![forbid(unsafe_code)]
@@ -18,9 +19,12 @@ mod identity;
 mod params;
 mod parse;
 
+pub mod player;
+
 pub use client::Client;
 pub use error::{Error, Result};
 pub use params::SearchFilter;
+pub use player::AudioStream;
 
 /// Raw response parsers, exposed for fixture tests and offline tooling.
 #[doc(hidden)]

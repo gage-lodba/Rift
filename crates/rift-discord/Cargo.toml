@@ -1,0 +1,17 @@
+[package]
+name = "rift-discord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Rift's in-repo Discord Rich Presence IPC client (presence only; no OAuth, voice or chat RPC)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -8,8 +8,11 @@
 //! * [`GfxContext::headless`] — no surface/swapchain at all, for `--screenshot`.
 //!
 //! `RIFT_VK_VALIDATION=1` enables the Khronos validation layer (when installed)
-//! and routes its messages through `tracing`; without it, rendering must not
-//! produce validation errors. The layer is a debug aid, never a hard dependency.
+//! and routes its messages through `tracing`; debug builds enable it by default
+//! (`RIFT_VK_VALIDATION=0` opts out), because this renderer is hand-written and
+//! validation is the cheapest way to catch descriptor/synchronization mistakes.
+//! The layer is a debug aid, never a hard dependency: if it is not installed the
+//! renderer starts without it.
 
 use std::sync::Arc;
 
@@ -174,10 +177,14 @@ fn create_instance(
     };
 
     if validation_enabled() {
+        let explicitly_requested = std::env::var_os("RIFT_VK_VALIDATION").is_some();
         match install_validation(&library, &mut create_info) {
-            Ok(true) => tracing::info!("Vulkan validation layer enabled (RIFT_VK_VALIDATION)"),
-            Ok(false) => tracing::warn!(
+            Ok(true) => tracing::info!("Vulkan validation layer enabled"),
+            Ok(false) if explicitly_requested => tracing::warn!(
                 "RIFT_VK_VALIDATION is set but VK_LAYER_KHRONOS_validation is not installed"
+            ),
+            Ok(false) => tracing::debug!(
+                "Vulkan validation layer is not installed; the debug build continues without it"
             ),
             Err(error) => tracing::warn!("could not enable the Vulkan validation layer: {error}"),
         }
@@ -186,13 +193,18 @@ fn create_instance(
     Instance::new(library, create_info).context("creating the Vulkan instance")
 }
 
-/// Whether the caller asked for the Khronos validation layer
-/// (`RIFT_VK_VALIDATION=1`). Also used to escalate renderer diagnostics (e.g.
-/// unknown-texture fallbacks) from debug to warn.
+/// Whether the Khronos validation layer should be enabled.
+///
+/// Debug builds default to *on* (validation is a debug aid and this renderer is
+/// hand-written); `RIFT_VK_VALIDATION=0` silences it in debug, and `=1` forces
+/// it in a release build. The layer is optional either way — [`install_validation`]
+/// degrades gracefully when it is not installed. The same switch also escalates
+/// renderer diagnostics (e.g. unknown-texture fallbacks) from debug to warn.
 pub(crate) fn validation_enabled() -> bool {
-    std::env::var("RIFT_VK_VALIDATION")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var("RIFT_VK_VALIDATION") {
+        Ok(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+        Err(_) => cfg!(debug_assertions),
+    }
 }
 
 /// Adds the validation layer + a debug-utils messenger to `create_info`.
@@ -215,7 +227,11 @@ fn install_validation(
     create_info.enabled_layers.push(LAYER.to_owned());
     create_info.enabled_extensions.ext_debug_utils = true;
 
-    // SAFETY: the closure only logs and never calls into Vulkan.
+    // SAFETY: `DebugUtilsMessengerCallback::new` requires the closure to make
+    // no calls into the Vulkan API; the message data it receives is borrowed
+    // for the duration of the call only. The closure below only formats the
+    // provided message through `tracing`, holds no Vulkan handles and stores
+    // nothing beyond the call, so that requirement is met.
     let callback = unsafe {
         DebugUtilsMessengerCallback::new(|severity, message_type, data| {
             if severity.contains(DebugUtilsMessageSeverity::ERROR) {

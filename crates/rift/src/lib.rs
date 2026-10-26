@@ -9,7 +9,8 @@
 //! * offline downloads,
 //! * settings,
 //! * the `YouTube` Music innertube client ([`fetch`] + `rift-ytmusic`),
-//! * yt-dlp resolution / one-click install ([`fetch`]),
+//! * native audio streaming: direct-URL resolution and ranged HTTP downloads
+//!   ([`fetch`] and its `stream` module) — no external downloader binary,
 //! * OS media keys and now-playing metadata (MPRIS / SMTC / `MPNowPlayingInfo`),
 //! * Discord Rich Presence.
 //!
@@ -61,7 +62,7 @@
 //! the OS integration is unavailable.
 
 // The backend is a safe-Rust library: platform/FFI details live in the
-// dependencies (rodio, souvlaki, discord-rich-presence), not in this crate.
+// dependencies (rodio, souvlaki) or the in-repo `rift-discord` crate, not here.
 #![forbid(unsafe_code)]
 // This crate is consumed by the desktop app and documented as the contract in
 // `docs/backend-api.md`; a new public item must be documented.
@@ -79,7 +80,7 @@ mod media;
 mod paths;
 mod player;
 mod settings;
-pub mod sha256;
+mod stream;
 mod util;
 
 pub use backend::{BackendConfig, BackendError, BackendHandle, RiftBackend};

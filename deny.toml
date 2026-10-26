@@ -60,7 +60,7 @@ wildcards = "deny"
 # Path dependencies on sibling workspace crates are declared without a version
 # (they are first-party code, not registry crates), which the wildcard lint
 # would otherwise flag. This option is exactly for that case. It only applies
-# because the four members are marked `publish = false` (application crates,
+# because the five members are marked `publish = false` (application crates,
 # never published to crates.io — see each `crates/*/Cargo.toml`): for a
 # *publishable* crate cargo-deny rejects this option as inapplicable and the
 # wildcard lint still fails, which is the correct behaviour for a library.

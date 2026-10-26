@@ -352,6 +352,25 @@ Part 4 needs none of the jsinterp / PO-token / format machinery.
   + external JS runtime + sig/n + PO tokens, which churns multiple times/year.
   Keep yt-dlp as the audio backend.
 
+> **Addendum (2026-10-26)** — the "keep yt-dlp as the audio backend" verdict is
+> superseded for the *resolution* half. A Phase 0 spike found that the JS-less
+> `VISIONOS` innertube client (the one yt-dlp itself falls back to when no JS
+> runtime is installed) still returns direct, unencrypted audio URLs with no JS
+> runtime and no PO token, and that those URLs download quickly with ranged
+> GETs. Rift moved to native resolution/download, keeping yt-dlp only as an
+> automatic fallback for that transition (removed later the same day — see the
+> update below). The "do not build" advice above still applies to the
+> signature/PO-token machinery: the native path deliberately uses the JS-less
+> client rather than reimplementing the decipher stack. See
+> [`native-streaming.md`](native-streaming.md) for the validated request, the
+> clean-room policy and the phased removal plan.
+>
+> **Update (2026-10-26, later the same day):** the removal completed — the shipped
+> app resolves and downloads audio natively and no longer calls or bundles
+> yt-dlp. This document is retained as the research record behind that decision
+> (and as the client-churn reference for the native resolver's single-client
+> risk), not as a description of the shipped pipeline.
+
 ## Part 4 — reimplementation design & plan
 
 ### 4.1 The core scope decision
@@ -368,6 +387,8 @@ Part 4 needs none of the jsinterp / PO-token / format machinery.
 - **Do not build** stream resolution (signature deobfuscation + PO tokens).
   Keep yt-dlp as the audio backend. This is the churn-prone part that even
   rustypipe delegates (to `rustypipe-botguard`) and yt-dlp maintains full-time.
+  (See the §3.5 addendum: the shipped native path uses the JS-less client, not
+  a rebuilt decipher/PO-token stack, and yt-dlp remains the fallback.)
 - **Clean-room** (if we build): implement from the observable API contract in
   Part 1, not rustypipe source, to keep Rift Apache-2.0.
 

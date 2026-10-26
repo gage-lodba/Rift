@@ -170,7 +170,12 @@ pub fn panel(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Re
         area.w,
         (area.bottom() - header.bottom()).max(0.0),
     );
-    let tracks = state.queue.tracks.clone();
+    // Move the queue out of `State` for the frame: the row painters need
+    // `&mut State` for cover requests, so borrowing `state.queue.tracks`
+    // directly would conflict — and cloning the whole (possibly long) queue on
+    // every frame would allocate on the hot path. It goes back before the drag
+    // handling below (which only needs the count).
+    let tracks = std::mem::take(&mut state.queue.tracks);
     let current = state.queue.current;
     let count = track_count;
     let content_h = count as f32 * ROW_H + LIST_PAD_BOTTOM;
@@ -189,6 +194,12 @@ pub fn panel(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Re
             if row.y > list.bottom() + ROW_H {
                 break;
             }
+            // Rows scrolled above the viewport are clipped by the container; skip
+            // their widget work too (long queues would otherwise repaint the
+            // whole list every frame).
+            if row.bottom() < list.top() {
+                continue;
+            }
             let row_id = list_id.child(i as u64);
             let hovered = ui.hovered(row);
             let is_current = current == Some(i);
@@ -197,7 +208,7 @@ pub fn panel(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Re
             }
             let cover_rect = Rect::new(row.x + 8.0, row.y + 5.0, COVER, COVER);
             let texture = state.request_cover(&track.cover);
-            cards::cover_tile(ui, state, cover_rect, texture, 4.0);
+            cards::cover_tile(ui, cover_rect, texture, 4.0);
             let meta_x = cover_rect.right() + ROW_GAP;
             let meta_w = (row.right() - 8.0 - meta_x - IBTN - 8.0).max(0.0);
             let meta_y = row.y + (ROW_H - (17.0 + 16.0)) * 0.5;
@@ -252,6 +263,7 @@ pub fn panel(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Re
             // sidebar playlist list.
         }
     });
+    state.queue.tracks = tracks;
 
     // ---- drag-reorder ----
     let dragging = if drag_cancelled {

@@ -69,6 +69,15 @@ first object in the file. Sizes are clamped into `MIN_WIDTH..=MAX_DIMENSION` /
 minimum the layout needs; absurd sizes are capped), coordinates saturate into
 `i32`. A zero width/height is treated as unusable and yields `None`.
 
+`restore` also validates the remembered *position* against the monitors that
+exist now: if the saved window would not overlap any monitor by at least a
+grab-sized strip (48 physical px) — the display was unplugged, the arrangement
+changed, the file was hand-edited — the saved size and maximized flag still
+apply, but the window is centred on the current/primary monitor instead, because
+an off-screen window cannot be reached with the mouse. A warning is logged. (If
+the platform exposes no monitor list, the saved position is trusted rather than
+moving every window.)
+
 ### API
 
 ```rust
@@ -102,6 +111,7 @@ impl WindowState {
 }
 
 /// Apply saved geometry to a live window (inner size, outer position, maximize).
+/// A saved position that is no longer on any monitor is replaced by centring.
 pub fn restore(window: &winit::window::Window, state: &WindowState);
 /// Refresh `state` from the live window (call on Resized/Moved/ScaleFactorChanged/
 /// Maximized/Unmaximized). Keeps normal geometry while maximized/minimized.

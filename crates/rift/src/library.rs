@@ -55,7 +55,10 @@ fn fold_song_duplicates(tracks: Vec<Track>) -> (Vec<Track>, usize) {
                 "folding {} ({:?}) into {} ({:?})",
                 t.id, t.title, out[i].id, out[i].title
             );
-            out[i].fill_missing_from(&t);
+            // The surviving row absorbs what the folded row knew; whether that
+            // changed a field is irrelevant here because folding the row at all
+            // is what schedules the one-time save below.
+            let _ = out[i].fill_missing_from(&t);
         } else {
             if !t.id.is_empty() {
                 by_id.insert(t.id.clone(), out.len());
@@ -261,7 +264,9 @@ impl LibraryStore {
     fn insert_recent(&mut self, mut track: Track) {
         self.data.recently_played.retain(|stored| {
             if stored.same_song(&track) {
-                track.fill_missing_from(stored);
+                // A re-play moves the song to the front; whether the stored row
+                // could teach the played copy anything does not change that.
+                let _ = track.fill_missing_from(stored);
                 false
             } else {
                 true
@@ -438,9 +443,13 @@ impl LibraryStore {
         playlist
     }
 
+    /// Delete a playlist by id. Saves only when one was actually removed.
     pub fn delete_playlist(&mut self, id: &str) {
+        let before = self.data.playlists.len();
         self.data.playlists.retain(|p| p.id != id);
-        self.save();
+        if self.data.playlists.len() != before {
+            self.save();
+        }
     }
 
     pub fn rename_playlist(&mut self, id: &str, name: String) {
@@ -479,11 +488,14 @@ impl LibraryStore {
 
     /// Remove the row with this video id. Deliberately exact: the UI removes the
     /// row the user clicked, and a playlist that somehow held two ids for one
-    /// song should lose only that one.
+    /// song should lose only that one. Saves only when a row was removed.
     pub fn remove_from_playlist(&mut self, id: &str, track_id: &str) {
         if let Some(p) = self.data.playlists.iter_mut().find(|p| p.id == id) {
+            let before = p.tracks.len();
             p.tracks.retain(|t| t.id != track_id);
-            self.save();
+            if p.tracks.len() != before {
+                self.save();
+            }
         }
     }
 }

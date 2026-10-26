@@ -1,5 +1,10 @@
 //! Offline-download commands and the background download job, including the
 //! retry/backoff logic that keeps a fully-downloaded playlist offline.
+//!
+//! Transfers go through the native streaming downloader
+//! ([`crate::stream::fetch_to_path`]), which writes the caller's temporary
+//! `.part` file; the worker publishes it by rename and emits throttled progress
+//! snapshots (`docs/native-streaming.md` §3.2–3.4).
 
 use std::sync::Arc;
 
@@ -16,14 +21,17 @@ impl BackendHandle {
     /// already-in-flight tracks are skipped; the rest are fetched sequentially
     /// with a [`BackendEvent::Downloads`] event after each one.
     pub fn download_tracks(&self, tracks: Vec<Track>) {
-        if crate::settings::preview_mode() {
-            return;
-        }
         start_downloads(&self.inner, tracks);
     }
 
     /// Remove offline copies of the given tracks.
     pub fn remove_downloads(&self, ids: Vec<String>) {
+        // Preview mode renders placeholder libraries and must not delete the
+        // user's real offline files (the app does not call backend commands in
+        // preview, but the skip keeps that true if it ever starts to).
+        if crate::settings::preview_mode() {
+            return;
+        }
         for id in &ids {
             self.inner.downloads.remove(id);
         }
@@ -33,6 +41,87 @@ impl BackendHandle {
 
 fn emit_downloads(backend: &BackendInner, state: &DownloadState) {
     backend.emit(BackendEvent::Downloads(state.clone()));
+}
+
+/// Minimum gap between the progress snapshots the download worker emits for one
+/// active track.
+///
+/// The UI redraws from whole `Downloads` snapshots; 100 ms keeps a 3 px bar
+/// smooth without flooding the event bus with one snapshot per network chunk
+/// (`docs/native-streaming.md` §3.4). The transition snapshots (`begin`,
+/// `finish`, and a failed pass) are still emitted immediately by the caller.
+const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether a progress snapshot is due at `now`: the first callback always emits
+/// (so the bar appears at its known start fraction), then at most one snapshot
+/// per [`PROGRESS_EMIT_INTERVAL`].
+///
+/// Pure (instants are passed in) so the throttle contract is unit-testable
+/// without timing a real transfer.
+fn progress_emit_due(last_emit: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_emit.is_none_or(|at| now.saturating_duration_since(at) >= PROGRESS_EMIT_INTERVAL)
+}
+
+/// Download one track into its final `<id>.m4a` path with the native streaming
+/// downloader, emitting throttled [`BackendEvent::Downloads`] snapshots as bytes
+/// arrive.
+///
+/// On success the completed `.part` file is renamed into place and the track is
+/// marked finished. On any failure the `.part` file is removed and the
+/// user-facing failure message is returned; the caller records the failure, and
+/// its lifecycle transition clears the track's progress fraction.
+async fn download_track(
+    backend: &BackendInner,
+    downloads: &Downloads,
+    track: &Track,
+) -> Result<(), String> {
+    let dest = downloads.path(&track.id);
+    // Temp file + rename: a crash mid-write must not leave a truncated .m4a,
+    // which the next launch's directory scan would treat as a valid offline
+    // copy. The downloader writes this part path directly and never renames it.
+    let part = dest.with_extension("m4a.part");
+
+    // Only the active track has a progress entry: `begin` cleared every entry
+    // for this batch, and `finish`/`fail`/`mark_failed` clear it when the
+    // transfer ends.
+    let mut last_emit: Option<std::time::Instant> = None;
+    let mut progress = |received: u64, total: u64| {
+        downloads.set_progress(&track.id, received, total);
+        // Emit the first callback immediately (the bar appears at its known
+        // start fraction) and then at most every `PROGRESS_EMIT_INTERVAL`.
+        let now = std::time::Instant::now();
+        if progress_emit_due(last_emit, now) {
+            last_emit = Some(now);
+            emit_downloads(backend, &downloads.state());
+        }
+    };
+    match crate::stream::fetch_to_path(&track.id, &part, &mut progress).await {
+        Ok(()) => match tokio::fs::rename(&part, &dest).await {
+            Ok(()) => {
+                downloads.finish(&track.id);
+                Ok(())
+            }
+            Err(e) => {
+                // A failed rename can leave the `.part` behind; remove it now
+                // rather than leaving scratch for the next launch's directory
+                // scan to clear.
+                let _ = tokio::fs::remove_file(&part).await;
+                Err(format!(
+                    "Could not save \u{201c}{}\u{201d}: {e}",
+                    track.title
+                ))
+            }
+        },
+        Err(error) => {
+            // Never leave a partial transfer behind: a retry writes the same
+            // part path from scratch.
+            let _ = tokio::fs::remove_file(&part).await;
+            Err(format!(
+                "Could not download \u{201c}{}\u{201d}: {error:#}",
+                track.title
+            ))
+        }
+    }
 }
 
 /// Base pause between consecutive failed retry passes for downloads that a
@@ -52,7 +141,7 @@ const PIN_RETRY_MAX_PASSES: u32 = 5;
 /// Backoff after pass `attempt` (0-based). The first requeue runs immediately:
 /// the rest of the list downloading after the failure already spaced it out,
 /// and the user watching the list finish expects the stragglers to go next.
-/// Only consecutive failed retry passes back off: 30s, 1m, 2m, 4m, then 5m.
+/// Only consecutive failed retry passes back off: 30s, 1m, 2m, then 4m (the cap).
 fn pin_retry_delay(attempt: u32) -> std::time::Duration {
     match attempt {
         0 => std::time::Duration::ZERO,
@@ -179,6 +268,13 @@ fn partition_and_release(
 /// or in flight. Shared by the explicit Download action and the automatic
 /// "keep a fully-downloaded playlist offline" path.
 pub(crate) fn start_downloads(backend: &Arc<BackendInner>, tracks: Vec<Track>) {
+    // Preview mode must never touch the real offline store: the app renders
+    // placeholder rows, and this is the single entry point for every download
+    // (the explicit action and the "keep a playlist offline" auto-top-up), so
+    // the guard lives here rather than only on `download_tracks`.
+    if crate::settings::preview_mode() {
+        return;
+    }
     start_downloads_attempt(backend, tracks, 0);
 }
 
@@ -205,33 +301,7 @@ fn start_downloads_attempt(backend: &Arc<BackendInner>, tracks: Vec<Track>, atte
         let batch = pending.clone();
         let mut failed: Vec<Track> = Vec::new();
         for track in pending {
-            let dest = downloads.path(&track.id);
-            let err = match crate::fetch::fetch_bytes(&track.id).await {
-                Ok((data, _)) => {
-                    // Temp file + rename: a crash mid-write must not leave a
-                    // truncated .m4a, which the next launch's directory scan
-                    // would treat as a valid offline copy.
-                    let tmp = dest.with_extension("m4a.part");
-                    let write = async {
-                        tokio::fs::write(&tmp, &data).await?;
-                        tokio::fs::rename(&tmp, &dest).await
-                    };
-                    match write.await {
-                        Ok(()) => {
-                            downloads.finish(&track.id);
-                            None
-                        }
-                        Err(e) => Some(format!(
-                            "Could not save \u{201c}{}\u{201d}: {e}",
-                            track.title
-                        )),
-                    }
-                }
-                Err(e) => Some(format!(
-                    "Could not download \u{201c}{}\u{201d}: {e:#}",
-                    track.title
-                )),
-            };
+            let err = download_track(&backend, &downloads, &track).await.err();
             if let Some(msg) = err {
                 warn!("download failed for {}: {msg}", track.id);
                 // A track a kept-offline playlist depends on gets requeued; one
@@ -333,9 +403,44 @@ fn start_downloads_attempt(backend: &Arc<BackendInner>, tracks: Vec<Track>, atte
 
 #[cfg(test)]
 mod tests {
-    use super::{partition_and_release, partition_retryable, playlist_kept_offline};
+    use super::{
+        partition_and_release, partition_retryable, playlist_kept_offline, progress_emit_due,
+        PROGRESS_EMIT_INTERVAL,
+    };
     use crate::downloads::Downloads;
     use rift_types::{Playlist, Track};
+
+    /// The UI redraws from whole snapshots, so the worker must emit the first
+    /// progress callback immediately and then throttle to one snapshot per
+    /// 100 ms — not one per network chunk. Pure instants keep the test
+    /// deterministic.
+    #[test]
+    fn progress_snapshots_are_emitted_immediately_then_throttled() {
+        let start = std::time::Instant::now();
+        assert!(
+            progress_emit_due(None, start),
+            "the first callback emits immediately so the bar appears"
+        );
+        assert!(
+            !progress_emit_due(Some(start), start + PROGRESS_EMIT_INTERVAL / 2),
+            "a snapshot inside the interval is throttled"
+        );
+        assert!(
+            progress_emit_due(Some(start), start + PROGRESS_EMIT_INTERVAL),
+            "the interval boundary is due"
+        );
+        assert!(
+            progress_emit_due(Some(start), start + PROGRESS_EMIT_INTERVAL * 3),
+            "a long gap is due"
+        );
+        // A clock that appears to move backwards (or the same instant) must not
+        // panic or emit: `unchecked_duration_subtraction` is a warned lint and
+        // the saturating form is the bug-free one.
+        assert!(
+            !progress_emit_due(Some(start + PROGRESS_EMIT_INTERVAL), start),
+            "a backwards clock is treated as not due"
+        );
+    }
 
     fn track(id: &str) -> Track {
         Track {

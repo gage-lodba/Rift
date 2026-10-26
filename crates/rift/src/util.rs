@@ -7,24 +7,76 @@ use std::sync::{Mutex, MutexGuard};
 use tracing::{debug, warn};
 
 /// Read and parse a JSON state file, defaulting when missing. On a parse
-/// failure the corrupt file is renamed aside (`*.json.bad`) so a later save
-/// can't silently overwrite — and permanently destroy — the user's data.
+/// failure the corrupt file is renamed aside (`*.json.bad`, with a numeric
+/// suffix when that backup already exists, so an earlier corrupt copy is never
+/// overwritten) so a later save can't silently overwrite — and permanently
+/// destroy — the user's data.
 pub(crate) fn load_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
-    let Ok(s) = std::fs::read_to_string(path) else {
-        return T::default();
-    };
-    match serde_json::from_str(&s) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("could not parse {}: {e}", path.display());
-            let backup = path.with_extension("json.bad");
-            match std::fs::rename(path, &backup) {
-                Ok(()) => warn!("moved the corrupt file to {}", backup.display()),
-                Err(e) => warn!("could not preserve the corrupt file: {e}"),
+    match std::fs::read(path) {
+        // Reading bytes rather than a `String` is what makes a file that is not
+        // valid UTF-8 take the corrupt-file path: `read_to_string` fails on it,
+        // and the old code treated every read failure as "no file", so a
+        // corrupt library was silently replaced by an empty one on the next
+        // save instead of being preserved. JSON is UTF-8 by definition, so any
+        // such file *is* the corrupt one this function exists to quarantine.
+        Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("could not parse {}: {e}", path.display());
+                quarantine_corrupt(path);
+                T::default()
             }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
+        Err(e) => {
+            // A read failure is not "no file": the state may still be there but
+            // temporarily unreadable (a sharing violation from a backup/AV tool,
+            // a permission problem). Say so loudly instead of silently starting
+            // from defaults — the caller's next save would then overwrite data
+            // this load never managed to read.
+            warn!(
+                "could not read {} ({e}); starting from defaults — check the file is readable \
+                 before changing anything, because a save will overwrite it",
+                path.display()
+            );
             T::default()
         }
     }
+}
+
+/// Move a corrupt state file aside, never overwriting an earlier backup.
+fn quarantine_corrupt(path: &Path) {
+    let backup = free_backup_path(&path.with_extension("json.bad"));
+    match std::fs::rename(path, &backup) {
+        Ok(()) => warn!("moved the corrupt file to {}", backup.display()),
+        Err(e) => warn!("could not preserve the corrupt file: {e}"),
+    }
+}
+
+/// The first free `*.json.bad` name: the historical single backup first, then
+/// `.1`, `.2`, … so a second corruption cannot destroy the copy an earlier
+/// repair (or the user) was relying on.
+fn free_backup_path(base: &Path) -> PathBuf {
+    if !base.exists() {
+        return base.to_path_buf();
+    }
+    // Append to the file name as text. `with_extension` would treat the ".bad"
+    // as the extension and produce `library.json.json.bad.1`, which both reads
+    // wrong and would not match the documented `*.json.bad` shape.
+    let Some(name) = base.file_name() else {
+        return base.to_path_buf();
+    };
+    for n in 1u32..=999 {
+        let mut candidate_name = name.to_os_string();
+        candidate_name.push(format!(".{n}"));
+        let candidate = base.with_file_name(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // A thousand backups of one file is not a real state; fall back to the
+    // historical name rather than looping forever.
+    base.to_path_buf()
 }
 
 /// Serialize `value` and write it to `path` atomically, logging (not
@@ -357,15 +409,62 @@ fn run_durable_job_catching(job: DurableJob) {
 
 /// Write via a temp file + rename so a crash mid-write can't leave a truncated
 /// file behind.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// The bytes are flushed to the storage device before the rename, so when the
+/// filesystem supports it the *contents* of the published file are durable, not
+/// merely visible in the page cache; a crash can then lose the rename itself,
+/// leaving the previous complete version — never a mix of old and new. A flush
+/// failure is logged and the rename still happens (a filesystem that cannot
+/// flush should not turn every save into a lost write), and the cost is paid on
+/// the writer thread: no command or UI thread calls this directly.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = temp_path_for(path)?;
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let written = write_and_publish(&tmp, path, bytes);
     if written.is_err() {
         // Neither a failed write nor a failed rename should leave scratch next
         // to the user's data — it would accumulate for every failed save.
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// The temp-file half of [`atomic_write`]: create, write, flush, then rename.
+///
+/// Split out so the ordering (flush before publish, close before rename on
+/// Windows) reads as the sequence it is, instead of a chained expression whose
+/// evaluation order a future edit could rearrange.
+fn write_and_publish(tmp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    {
+        let mut file = std::fs::File::create(tmp)?;
+        file.write_all(bytes)?;
+        // The file is closed before the rename below (`File` drops at the end
+        // of this scope), which Windows requires before a file can be renamed.
+        if let Err(e) = file.sync_all() {
+            // Durability degrades, correctness does not: the complete bytes are
+            // still in the file, and the rename either publishes them or fails
+            // (in which case the caller keeps the old file). Log instead of
+            // failing the save, because a filesystem that cannot flush would
+            // otherwise lose every write.
+            warn!(
+                "could not flush {} to disk before publishing it: {e}",
+                tmp.display()
+            );
+        }
+    }
+    std::fs::rename(tmp, path)?;
+    // Make the rename durable where the platform exposes a directory handle:
+    // without this a crash right after the rename can leave the old name. On
+    // Windows a directory cannot be opened as a `File`; NTFS journals the rename,
+    // and the file data is already flushed above.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// The temp path [`atomic_write`] publishes from: a unique name *constructed in
@@ -628,6 +727,50 @@ mod tests {
         assert!(
             path.with_extension("json.bad").exists(),
             "the user's data must survive as a .json.bad backup"
+        );
+    }
+
+    /// A file that is not valid UTF-8 never reached the JSON parser before:
+    /// `read_to_string` failed first, and the old code treated *every* read
+    /// failure as "no file". That returned defaults silently — and the next
+    /// save overwrote the unreadable library. It is corrupt state like any
+    /// other, so it takes the quarantine path.
+    #[test]
+    fn a_state_file_that_is_not_valid_utf8_is_quarantined_too() {
+        let dir = TempDir::new("util-corrupt-utf8");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, [b'{', 0xFF, 0xFE, 0x00, b'}']).expect("seed invalid utf-8");
+
+        let loaded: serde_json::Value = load_json(&path);
+        assert_eq!(loaded, serde_json::Value::Null);
+        assert!(!path.exists(), "the unreadable file must be moved aside");
+        assert!(
+            path.with_extension("json.bad").exists(),
+            "the invalid-UTF-8 file must survive as a .json.bad backup"
+        );
+    }
+
+    /// The historical single `.json.bad` name must not make a second corruption
+    /// destroy the backup the first one produced: the old code renamed over it.
+    #[test]
+    fn a_second_corrupt_file_does_not_overwrite_the_first_backup() {
+        let dir = TempDir::new("util-corrupt-twice");
+        let path = dir.join("library.json");
+
+        std::fs::write(&path, b"{ first corruption").expect("seed first");
+        let _: serde_json::Value = load_json(&path);
+        std::fs::write(&path, b"{ second corruption").expect("seed second");
+        let _: serde_json::Value = load_json(&path);
+
+        assert_eq!(
+            std::fs::read(path.with_extension("json.bad")).expect("first backup"),
+            b"{ first corruption",
+            "the first corrupt copy must stay intact"
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("json.bad.1")).expect("second backup"),
+            b"{ second corruption",
+            "the second corrupt copy gets its own numbered backup"
         );
     }
 

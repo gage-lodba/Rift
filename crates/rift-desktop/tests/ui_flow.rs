@@ -40,12 +40,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rift_desktop::app::{App, WindowCommand};
 use rift_desktop::controller::{BackendCommands, Controller};
 use rift_desktop::gfx::paint::{PaintList, Prim, Rect};
-use rift_desktop::screens::{self, cards, menu, queue as queue_screen, settings};
+use rift_desktop::screens::{self, cards, menu, overlays, queue as queue_screen, settings};
 use rift_desktop::state::View;
 use rift_desktop::text::Weight;
 use rift_desktop::theme::Theme;
 use rift_desktop::ui::{InputState, Key, KeyInput, Modifiers, Ui, SCROLLBAR_WIDTH};
-use rift_types::{Bootstrap, Track};
+use rift_types::{Bootstrap, Playlist, Track, UpdateStatus};
 
 // ---------------------------------------------------------------------------
 // serialisation
@@ -81,9 +81,9 @@ enum Call {
     QueueJump(usize),
     SetDiscordRpc(bool),
     SetCrossfade(f32),
-    CheckYtDlp,
     RenamePlaylist(String, String),
     SearchSongs(String),
+    OpenUrl(String),
 }
 
 type Calls = Arc<Mutex<Vec<Call>>>;
@@ -174,16 +174,10 @@ impl BackendCommands for Recorder {
     // -------------------------------------------------- updates / settings
     fn check_update(&self) {}
     fn set_update_notifications(&self, _: bool) {}
-    fn open_url(&self, _: String) -> Result<(), String> {
+    fn open_url(&self, url: String) -> Result<(), String> {
+        self.record(Call::OpenUrl(url));
         Ok(())
     }
-
-    // -------------------------------------------------------------- yt-dlp
-    fn check_ytdlp(&self) {
-        self.record(Call::CheckYtDlp);
-    }
-    fn set_yt_dlp_path(&self, _: Option<String>) {}
-    fn download_ytdlp(&self) {}
 
     // ------------------------------------------------------ search/catalog
     fn search_songs(&self, _: u64, query: String) {
@@ -262,6 +256,12 @@ impl Harness {
     fn move_to(&mut self, x: f32, y: f32) -> PaintList {
         self.mouse = (x, y);
         self.frame()
+    }
+
+    /// One frame with a wheel delta at the current pointer position (winit
+    /// convention: `+y` is wheel up, so a negative value scrolls down).
+    fn wheel(&mut self, dy: f32) -> PaintList {
+        self.frame_with(|input| input.scroll = (0.0, dy))
     }
 
     fn press(&mut self, x: f32, y: f32) -> PaintList {
@@ -370,6 +370,29 @@ fn sidebar_playlist_center(l: &screens::Layout, index: usize) -> (f32, f32) {
     (x, y)
 }
 
+/// The sidebar's scrollable playlist region (the nav area above the pinned
+/// import rows): `region = (x, 176 at the reference, w, import_y − 8 − top)`,
+/// where `import_y = sidebar.bottom − 151` (53 settings + 9 divider + 49 + 40).
+fn sidebar_playlist_region(l: &screens::Layout) -> Rect {
+    let top = l.sidebar.y + 130.0;
+    let import_y = l.sidebar.bottom() - 151.0;
+    Rect::new(
+        l.sidebar.x + 10.0,
+        top,
+        l.sidebar.w - 20.0,
+        (import_y - 8.0 - top).max(0.0),
+    )
+}
+
+/// Centre of playlist row `index` inside the scroll region, given a scroll
+/// offset (the sidebar scroll list is virtualised/clipped).
+fn scrolled_playlist_center(region: Rect, index: usize, offset: f32) -> (f32, f32) {
+    (
+        region.center().0,
+        region.y + index as f32 * 41.0 - offset + 19.0,
+    )
+}
+
 /// Titlebar search text field centre (screens/chrome/titlebar.rs: box 480×31 centred, button 79
 /// wide reserved on the right).
 fn titlebar_search_center(l: &screens::Layout) -> (f32, f32) {
@@ -462,7 +485,7 @@ struct SettingsGeometry {
     x: f32,
     y: f32,
     width: f32,
-    heights: [f32; 4],
+    heights: [f32; 3],
 }
 
 fn settings_geometry(app: &App, l: &screens::Layout) -> SettingsGeometry {
@@ -675,11 +698,17 @@ fn titlebar_search_types_submits_and_clears() {
         "Enter re-submits the query through the controller"
     );
 
-    // Escape clears the box and cancels the in-flight generation.
+    // Escape clears the box, cancels the in-flight generation and leaves Search
+    // for Home (`SearchClear`, ui-spec §7.4).
     h.key(Key::Escape, Modifiers::default());
     assert_eq!(h.app.state.search.query, "");
     assert_eq!(h.app.state.search.shown_query, "");
     assert!(!h.app.state.search.busy, "clearing resolves the spinner");
+    assert_eq!(
+        h.app.state.view,
+        View::Home,
+        "clearing the search box leaves the Search view"
+    );
     // The framework's `wants_keyboard` is latched for the whole frame that had a
     // text field active (so a global shortcut can't fire in the same frame as the
     // Escape that closed it); one neutral frame later the keyboard is released.
@@ -887,7 +916,7 @@ fn window_controls_emit_window_commands() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn settings_toggles_sliders_and_probes_map_to_commands() {
+fn settings_toggles_and_sliders_map_to_commands() {
     let _lock = test_lock();
     let mut h = Harness::new();
     h.frame();
@@ -947,30 +976,6 @@ fn settings_toggles_sliders_and_probes_map_to_commands() {
     assert!(
         h.contains(|call| matches!(call, Call::SetCrossfade(secs) if *secs > 6.0)),
         "dragging the crossfade slider changes the value: {:?}",
-        h.calls()
-    );
-
-    // --- "Check again" re-probes yt-dlp.
-    h.frame();
-    let l = h.layout();
-    let geometry = settings_geometry(&h.app, &l);
-    let row = geometry.row(2);
-    let button_w = text_width(
-        "Check again",
-        13.0,
-        Weight::SemiBold,
-        rift_desktop::gfx::paint::Color::WHITE,
-    ) + 28.0;
-    let button = Rect::new(
-        row.right() - settings::ROW_PAD_X - button_w,
-        row.y + (row.h - 33.0) * 0.5,
-        button_w,
-        33.0,
-    );
-    h.click(button.center().0, button.center().1);
-    assert!(
-        h.contains(|call| *call == Call::CheckYtDlp),
-        "Check again probes yt-dlp: {:?}",
         h.calls()
     );
 }
@@ -1103,5 +1108,172 @@ fn text_editing_handles_backspace_and_enter_submit() {
                 if id == "preview-pl-1" && name == "Playlist 1 2")),
         "rename reaches the backend with the typed name: {:?}",
         h.calls()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. overlays paint last but interact first
+// ---------------------------------------------------------------------------
+
+/// The update banner floats over the queue panel and the player bar. Because
+/// immediate-mode input is first-come-first-served, the root draws the overlays
+/// *first* (they paint into the deferred buffer, so they still land on top):
+/// otherwise the queue row underneath would latch the press and the banner's
+/// Download button would never receive its click.
+#[test]
+fn update_banner_buttons_win_over_the_queue_panel_underneath() {
+    let _lock = test_lock();
+    let mut h = Harness::new();
+    let url = "https://example.invalid/release";
+    h.app.state.update_banner = Some(UpdateStatus {
+        current: "0.4.0".into(),
+        latest: Some("0.5.0".into()),
+        update_available: true,
+        url: Some(url.into()),
+    });
+    h.frame();
+
+    // Mirror `screens::overlays`' geometry exactly.
+    let theme = Theme::default();
+    let white = rift_desktop::gfx::paint::Color::WHITE;
+    let text = "Rift v0.5.0 is available.";
+    let text_w = text_width(text, 13.0, Weight::Regular, theme.text);
+    let button_w = |label: &str| text_width(label, 13.0, Weight::SemiBold, white);
+    let download_w = button_w("Download") + overlays::BANNER_BTN_PAD_X * 2.0;
+    let silence_w = button_w("Don't ask again") + overlays::BANNER_BTN_PAD_X * 2.0;
+    let room = overlays::banner_text_room(download_w, silence_w);
+    let (w, hgt) = overlays::banner_size(text_w.min(room), download_w, silence_w);
+    let banner = overlays::banner_origin(VIEWPORT, (w, hgt));
+    // `update_banner` lays the buttons out after the full text room (not the
+    // measured text width): x starts at `rect.x + PAD_L`, the text span takes
+    // `room`, then the 4 px text margin + 12 px gap.
+    let download = Rect::new(
+        banner.x
+            + overlays::BANNER_PAD_L
+            + room
+            + overlays::BANNER_TEXT_MARGIN
+            + overlays::BANNER_GAP,
+        banner.y + (hgt - overlays::BANNER_BTN_H) * 0.5,
+        download_w,
+        overlays::BANNER_BTN_H,
+    );
+
+    // Precondition: the button really is over the queue panel's row band.
+    let queue = h.layout().queue.expect("preview queue visible");
+    assert!(
+        (download.center().1 - queue.y).abs() < queue.h,
+        "banner button at {download:?} must overlap the queue panel {queue:?}"
+    );
+    let _ = h.frame();
+
+    let _ = h.take_calls();
+    h.click(download.center().0, download.center().1);
+    assert!(
+        h.contains(|call| matches!(call, Call::OpenUrl(opened) if opened == url)),
+        "the banner Download button receives its click: {:?}",
+        h.calls()
+    );
+    assert!(
+        !h.contains(|call| matches!(call, Call::QueueJump(_))),
+        "the queue row underneath must not also act: {:?}",
+        h.calls()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. sidebar playlist rows: stable ids + scrolling
+// ---------------------------------------------------------------------------
+
+fn minimal_track(id: &str) -> Track {
+    Track {
+        id: id.into(),
+        title: format!("Song {id}"),
+        artist: "Artist Name".into(),
+        album: Some("Album Name".into()),
+        duration: Some(100),
+        cover: String::new(),
+        artists: Vec::new(),
+        album_id: None,
+    }
+}
+
+fn playlist(id: &str, name: &str) -> Playlist {
+    Playlist {
+        id: id.into(),
+        name: name.into(),
+        tracks: vec![minimal_track("t1")],
+    }
+}
+
+/// Two playlists may share a name; each row keeps its own interaction id (derived
+/// from the playlist id), so a click latches and navigates the row it was on.
+#[test]
+fn sidebar_playlist_rows_with_duplicate_names_are_distinct() {
+    let _lock = test_lock();
+    let mut h = Harness::new();
+    h.app.state.library.playlists = vec![
+        playlist("dup-a", "Same name"),
+        playlist("dup-b", "Same name"),
+    ];
+    h.frame();
+
+    let l = h.layout();
+    let (x, y) = sidebar_playlist_center(&l, 0);
+    h.click(x, y);
+    assert_eq!(
+        h.app.state.view,
+        View::Playlist("dup-a".into()),
+        "the first row navigates to its own playlist"
+    );
+
+    h.frame();
+    let l = h.layout();
+    let (x, y) = sidebar_playlist_center(&l, 1);
+    h.click(x, y);
+    assert_eq!(
+        h.app.state.view,
+        View::Playlist("dup-b".into()),
+        "the second same-named row navigates to its own playlist"
+    );
+}
+
+/// A library with more playlists than fit in the nav area scrolls (ui-spec §6.2:
+/// the sidebar's playlist region is an `overflow-y: auto` container with the
+/// standard 10 px scrollbar), so every playlist stays reachable by mouse.
+#[test]
+fn sidebar_playlist_list_scrolls_to_reach_hidden_rows() {
+    let _lock = test_lock();
+    let mut h = Harness::new();
+    h.app.state.library.playlists = (0..12)
+        .map(|i| playlist(&format!("p{i}"), &format!("Playlist {i}")))
+        .collect();
+    h.frame();
+
+    let l = h.layout();
+    let region = sidebar_playlist_region(&l);
+    assert!(
+        region.y + 11.0 * 41.0 > region.bottom(),
+        "row 11 starts clipped before scrolling (region {region:?})"
+    );
+
+    h.move_to(region.center().0, region.center().1);
+    h.wheel(-400.0);
+    let scroll_id = rift_desktop::ui::Id::from_str("sidebar/playlists");
+    let offset = h.app.ui.scroll_offset(scroll_id);
+    assert!(
+        offset > 0.0,
+        "the wheel scrolls the sidebar's playlist list (offset {offset})"
+    );
+
+    let (x, y) = scrolled_playlist_center(region, 11, offset);
+    assert!(
+        region.contains(x, y),
+        "row 11 is inside the viewport after scrolling ({x}, {y} in {region:?})"
+    );
+    h.click(x, y);
+    assert_eq!(
+        h.app.state.view,
+        View::Playlist("p11".into()),
+        "the last playlist is reachable after scrolling"
     );
 }

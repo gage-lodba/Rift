@@ -60,8 +60,8 @@ impl Default for TextEditState {
     }
 }
 
-/// Appearance of a text field. Defaults mirror `.searchbox input` /
-/// `.ytdlp-input` in `styles.css`.
+/// Appearance of a text field. Defaults mirror `.searchbox input` in
+/// `styles.css`.
 #[derive(Clone, Debug)]
 pub struct TextInputStyle {
     pub text: TextStyle,
@@ -77,7 +77,7 @@ pub struct TextInputStyle {
 
 impl TextInputStyle {
     /// The default field look: raised background, 1px border, 6px radius,
-    /// 13px text, 7x12 padding (`.ytdlp-input`, `.side-new-input`).
+    /// 13px text, 7x12 padding (`.side-new-input`).
     pub fn default_theme(theme: &crate::theme::Theme) -> Self {
         Self {
             text: TextStyle::new(13.0, Weight::Regular, theme.text),
@@ -206,7 +206,7 @@ impl Ui {
         // ---- keyboard editing (only while focused) ----
         if now_focused {
             self.text_input_active = true;
-            let (changed, submitted, cancelled) = self.edit_text(&mut st, text, style);
+            let (changed, submitted, cancelled) = self.edit_text(&mut st, text);
             out.changed = changed;
             out.submitted = submitted;
             out.cancelled = cancelled;
@@ -216,17 +216,14 @@ impl Ui {
         }
 
         // ---- paint ----
-        // Only the focused field changes its border (`.ytdlp-input:focus`); hover
-        // alone must not tint it (unlike buttons).
+        // Only the focused field changes its border; hover alone must not tint it
+        // (unlike buttons).
         let border = if now_focused {
             style.border_focused
         } else {
             style.border
         };
         self.bordered_rect(rect, style.bg, style.radius, 1.0, border);
-        if now_focused && style.border.a == 0 && style.bg.a == 0 {
-            // Borderless style (search box): nothing extra; the wrapper draws it.
-        }
 
         // Keep the caret visible horizontally.
         let caret_cursor = floor_boundary(text, st.cursor.min(text.len()));
@@ -308,12 +305,7 @@ impl Ui {
 
     /// Process this frame's key/text events for the focused field.
     /// Returns `(changed, submitted, cancelled)`.
-    fn edit_text(
-        &mut self,
-        st: &mut TextEditState,
-        text: &mut String,
-        _style: &TextInputStyle,
-    ) -> (bool, bool, bool) {
+    fn edit_text(&mut self, st: &mut TextEditState, text: &mut String) -> (bool, bool, bool) {
         let mut changed = false;
         let mut submitted = false;
         let mut cancelled = false;
@@ -484,24 +476,43 @@ impl Ui {
     }
 
     /// Caret byte index closest to local x (measured from the text block's left).
+    ///
+    /// Walks the string once, accumulating per-character advances, instead of
+    /// re-measuring every prefix: drag-selecting calls this every frame, so the
+    /// old `text_width(&text[..idx])` loop was quadratic in glyph-metric
+    /// lookups over long fields.
     fn caret_from_x(&mut self, text: &str, style: &TextStyle, x: f32) -> usize {
         if x <= 0.0 {
             return 0;
         }
-        let mut last_boundary = 0;
-        let mut last_x = 0.0;
-        for (idx, _) in text.char_indices().skip(1) {
-            let w = self.text_width(&text[..idx], style);
-            if w >= x {
+        let spacing = if style.letter_spacing.is_finite() {
+            style.letter_spacing
+        } else {
+            0.0
+        };
+        // Width of the prefix ending at the current char boundary (tracking
+        // included, but no trailing tracking) — the same definition
+        // `Fonts::line_width` uses.
+        let mut width = 0.0f32;
+        let mut last_boundary = 0usize;
+        let mut last_width = 0.0f32;
+        for (idx, ch) in text.char_indices() {
+            if idx > 0 && width >= x {
                 // Pick whichever boundary is closer.
-                return if (w - x) < (x - last_x) {
+                return if (width - x) < (x - last_width) {
                     idx
                 } else {
                     last_boundary
                 };
             }
             last_boundary = idx;
-            last_x = w;
+            last_width = width;
+            // Mirror Fonts::line_width: hard breaks contribute no advance
+            // and no tracking (the field is single-line, but the bound text
+            // can contain them).
+            if ch != '\n' && ch != '\r' {
+                width += self.fonts_mut().advance(ch, style) + spacing;
+            }
         }
         text.len()
     }

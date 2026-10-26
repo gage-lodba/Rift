@@ -7,6 +7,8 @@
 //! 12 recently played rows (54 px each). All of it scrolls inside `main`; this
 //! function returns the total content height so the root can size the scrollbar.
 
+use std::fmt::Write as _;
+
 use crate::state::{Action, State};
 use crate::ui::{Id, Rect, Ui};
 
@@ -17,6 +19,10 @@ use super::{cards, menu, track_list};
 pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: Rect) -> f32 {
     let theme = ui.theme().clone();
     let mut y = content.y;
+    // Visible band for cheap culling: the scroll container clips the paint, but
+    // running the card grid (cover request + text layout per card) for an
+    // arbitrarily large library would still cost per-frame work.
+    let clip = ui.clip_rect().unwrap_or_else(|| ui.viewport());
 
     // ---- "Your library" ----
     y = cards::section_header(ui, content.x, y, content.w, "Your library");
@@ -24,8 +30,15 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
     let (cols, card_w) = cards::grid_metrics(content.w, theme.card_min_width, theme.card_gap);
     let cover = (card_w - cards::CARD_PADDING * 2.0).max(1.0);
     let card_h = cards::card_height(cover);
-    let playlists = state.library.playlists.clone();
+    // Move the playlist list out of `State` for the card grid: `cards::card`
+    // needs `&mut State` for cover requests, so borrowing the list straight from
+    // `state.library` would conflict — and cloning every playlist (with all its
+    // tracks) per frame would allocate on the hot path.
+    let playlists = std::mem::take(&mut state.library.playlists);
     let total = playlists.len() + 1;
+    // One reused buffer for the subtitle strings ("N songs") instead of a
+    // `format!` allocation per card per frame.
+    let mut sub = String::with_capacity(16);
 
     for slot in 0..total {
         let row = slot / cols;
@@ -33,15 +46,21 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
         let x = content.x + col as f32 * (card_w + theme.card_gap);
         let card_y = y + row as f32 * (card_h + theme.card_gap);
         let rect = Rect::new(x, card_y, card_w, card_h);
+        if card_y + card_h < clip.top() || card_y > clip.bottom() {
+            continue;
+        }
 
         if slot == 0 {
             // Liked Songs card: cover from the first liked track.
+            let liked_len = state.library.liked.len();
             let cover_url = state
                 .library
                 .liked
                 .first()
                 .map(|t| t.cover.clone())
                 .unwrap_or_default();
+            sub.clear();
+            let _ = write!(sub, "{liked_len} songs");
             let resp = cards::card(
                 ui,
                 state,
@@ -49,7 +68,7 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
                 Id::from_str("home/card/liked"),
                 &cover_url,
                 "Liked Songs",
-                &format!("{} songs", state.library.liked.len()),
+                &sub,
                 false,
             );
             if resp.clicked {
@@ -57,15 +76,10 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
             }
         } else {
             let playlist = &playlists[slot - 1];
-            let id = playlist.id.clone();
-            let name = playlist.name.clone();
+            let id = &playlist.id;
+            let name = &playlist.name;
             let count = playlist.tracks.len();
-            let cover_url = playlist
-                .tracks
-                .first()
-                .map(|t| t.cover.as_str())
-                .unwrap_or("")
-                .to_string();
+            let cover_url = playlist.tracks.first().map_or("", |t| t.cover.as_str());
             // The kebab is a nested control: interact it *before* the card so
             // its press latches first (the old DOM's `.card-action` overlay
             // sits under the kebab for the same reason), then paint it on top.
@@ -77,21 +91,23 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
                 24.0,
                 24.0,
             );
-            let kebab_id = Id::from_str("home/card-menu").with(&id);
+            let kebab_id = Id::from_str("home/card-menu").with(id);
             let hovering = ui.hovered(rect);
             let kebab_resp = if hovering {
                 Some(ui.interact(kebab, kebab_id, crate::ui::Sense::CLICK))
             } else {
                 None
             };
+            sub.clear();
+            let _ = write!(sub, "{count} songs");
             let resp = cards::card(
                 ui,
                 state,
                 rect,
-                Id::from_str("home/card/playlist").with(&id),
-                &cover_url,
-                &name,
-                &format!("{count} songs"),
+                Id::from_str("home/card/playlist").with(id),
+                cover_url,
+                name,
+                &sub,
                 false,
             );
             // Paint the kebab above the card content.
@@ -128,10 +144,11 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
                 }
             }
             if resp.clicked && !menu::is_open() {
-                actions.push(Action::Navigate(crate::state::View::Playlist(id)));
+                actions.push(Action::Navigate(crate::state::View::Playlist(id.clone())));
             }
         }
     }
+    state.library.playlists = playlists;
     let rows = total.div_ceil(cols.max(1));
     y += rows as f32 * card_h + rows.saturating_sub(1) as f32 * theme.card_gap;
     y += 26.0; // `.card-grid { margin-bottom: 26px }`
@@ -139,14 +156,12 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
     // ---- "Recently played" ----
     y = cards::section_header(ui, content.x, y, content.w, "Recently played");
 
-    let recent: Vec<rift_types::Track> = state
-        .library
-        .recently_played
-        .iter()
-        .take(12)
-        .cloned()
-        .collect();
-    if recent.is_empty() {
+    // The old app: `library.recently_played.iter().take(12)`. Move the list out
+    // for the frame (the row painters need `&mut State`) and restore it below;
+    // only the first 12 are drawn.
+    let recent = std::mem::take(&mut state.library.recently_played);
+    let shown = recent.len().min(12);
+    if shown == 0 {
         let empty_h = 17.0 + 96.0;
         ui.text_centered(
             Rect::new(content.x, y + 48.0, content.w, 17.0),
@@ -155,9 +170,9 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
         );
         y += empty_h;
     } else {
-        // The shared track list (screens-pages' `track_list.rs`) gives the rows
-        // their context menus and correct nested-control click handling; Home is
-        // the `single_click` variant (a row click plays just that song).
+        // The shared track list gives the rows their context menus and correct
+        // nested-control click handling; Home is the `single_click` variant (a
+        // row click plays just that song).
         let opts = track_list::TrackListOpts {
             source: None,
             single_click: true,
@@ -165,16 +180,13 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
             show_album: true,
             show_download: true,
             show_like: true,
+            all_liked: false,
             id: "home/recent",
         };
-        let full = Rect::new(
-            content.x,
-            y,
-            content.w,
-            recent.len() as f32 * cards::TROW_HEIGHT,
-        );
-        y += track_list::track_list(ui, state, actions, full, &recent, &opts);
+        let full = Rect::new(content.x, y, content.w, shown as f32 * cards::TROW_HEIGHT);
+        y += track_list::track_list(ui, state, actions, full, &recent[..shown], &opts);
     }
+    state.library.recently_played = recent;
 
     // Content height includes the main area's bottom padding.
     (y - content.y) + theme.main_padding_v
@@ -201,5 +213,40 @@ mod tests {
             })
             .collect();
         assert_eq!(state.library.recently_played.iter().take(12).count(), 12);
+    }
+
+    /// Home moves the library lists out of `State` for the frame (so the card
+    /// and row painters can request covers through `&mut State`); both must be
+    /// restored after the frame.
+    #[test]
+    fn home_restores_the_library_lists() {
+        let mut ui = Ui::new();
+        let viewport = Rect::new(0.0, 0.0, 1160.0, 740.0);
+        let input = crate::ui::InputState {
+            viewport,
+            mouse_pos: (0.0, 0.0),
+            mouse_in_window: true,
+            time: 1.0,
+            ..Default::default()
+        };
+        ui.begin_frame(input, viewport);
+        let mut state = crate::preview::preview_state();
+        let playlists = state.library.playlists.len();
+        let recent = state.library.recently_played.len();
+        let mut actions = Vec::new();
+        let content = crate::screens::main_content_rect(&ui, Rect::new(335.0, 46.0, 825.0, 375.0));
+        let height = home(&mut ui, &mut state, &mut actions, content);
+        let _ = ui.end_frame();
+        assert_eq!(
+            state.library.playlists.len(),
+            playlists,
+            "playlists restored"
+        );
+        assert_eq!(
+            state.library.recently_played.len(),
+            recent,
+            "recent list restored"
+        );
+        assert!(height > 0.0, "content height reported");
     }
 }

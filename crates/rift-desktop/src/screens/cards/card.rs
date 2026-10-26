@@ -61,7 +61,7 @@ pub fn card(
     } else {
         COVER_RADIUS
     };
-    cover_tile(ui, state, cover_rect, texture, radius);
+    cover_tile(ui, cover_rect, texture, radius);
 
     let name_y = cover_rect.bottom() + CARD_NAME_MARGIN;
     let name_style = style_lh(13.0, Weight::SemiBold, theme.text, CARD_NAME_LINE);
@@ -80,7 +80,9 @@ pub fn card(
         ui.text(sub_rect, sub, &sub_style);
     }
     if resp.focus_visible {
-        ui.focus_ring(rect, CARD_RADIUS);
+        // Cards use `outline-offset: -2px` (ui-spec §2.4/§6.9): the ring must not
+        // bleed into the neighbouring card in the grid.
+        ui.focus_ring_inset(rect, CARD_RADIUS);
     }
     resp
 }

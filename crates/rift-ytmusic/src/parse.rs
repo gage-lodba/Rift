@@ -14,8 +14,14 @@ use tracing::warn;
 /// lockfile has no `indexmap`), so `Value::Object` is a `BTreeMap` and
 /// `map.values()` iterates keys *alphabetically* — not in document order. A
 /// `.first()` on the result therefore depends on key spelling rather than on the
-/// response's layout. Every known location is read directly (see [`at`]); this
-/// stays for shapes a future capture might add.
+/// response's layout, which is why every decision between candidate nodes reads a
+/// known path directly instead (see [`at`] and [`header_of`]).
+///
+/// This stays for shapes a future capture might add. It is also the path search
+/// responses currently take, because their `tabbedSearchResultsRenderer` shape
+/// has no direct path in [`shelf_items`] yet; row order survives that because
+/// rows live in arrays (whose order is preserved) — only object keys are walked
+/// alphabetically.
 fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     match v {
         Value::Object(map) => {
@@ -43,9 +49,10 @@ fn at<'a>(v: &'a Value, pointer: &str) -> Option<&'a Value> {
 /// The page header of `renderer`, from whichever known location carries it.
 ///
 /// Album and playlist pages place their `musicResponsiveHeaderRenderer` at one
-/// of a few paths depending on the surface. Both are checked explicitly, in
-/// document order, so the choice is a decision rather than a key-ordering side
-/// effect. `find_all` remains the last resort for a shape not seen yet.
+/// of a few paths depending on the surface. The known paths are checked
+/// explicitly, in this fixed priority order, so the choice is a decision rather
+/// than a key-ordering side effect. `find_all` remains the last resort for a
+/// shape not seen yet.
 fn header_of<'a>(resp: &'a Value, renderer: &str) -> Option<&'a Value> {
     for pointer in [
         // Browse pages served to the desktop web client.
@@ -298,7 +305,11 @@ fn shelf_items(resp: &Value) -> Vec<&Value> {
             return items;
         }
     }
-    // Unknown shape: fall back to every renderer in the document.
+    // Unknown shape: fall back to every row renderer in the document. Search
+    // responses take this path (their `tabbedSearchResultsRenderer` shape is not
+    // in the list above), where it preserves row order because the rows are
+    // array elements; a shape whose rows must be *chosen* between would need a
+    // direct path instead, since the walk is key-ordered (see [`find_all`]).
     let mut nodes = Vec::new();
     find_all(resp, "musicResponsiveListItemRenderer", &mut nodes);
     nodes
@@ -441,9 +452,7 @@ fn is_non_audio_row(node: &Value) -> bool {
     is_non_audio_type(node) || is_ugc(node)
 }
 
-/// The byline to show for a row with no linked artist.
-///
-/// The row's title, or `None` when the title column is absent or not a string.
+/// The title a row shows, from its first flex column.
 ///
 /// `runs_all` folds a missing or `null` title to `""`, which would otherwise
 /// produce a track the UI renders as a blank, unclickable row. A row this
@@ -468,6 +477,7 @@ fn title_of(node: &Value) -> Option<String> {
 /// Linked runs are kept verbatim: this only runs when no `UC…` run exists, but
 /// the row may still link a *different* byline entry (an album, say), and a
 /// linked run is real text by construction.
+#[must_use]
 pub fn unlinked_artist(node: &Value) -> String {
     let Some(runs) = subtitle_runs(node) else {
         return String::new();
@@ -688,6 +698,7 @@ fn album_type(node: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parse a full album page (header + track list) from a `/browse` response.
+#[must_use]
 pub fn album_page(resp: &Value, browse_id: &str) -> Option<AlbumPage> {
     let header = header_of(resp, "musicResponsiveHeaderRenderer")?;
     let name = header.pointer("/title").map(runs_all).unwrap_or_default();
@@ -746,6 +757,7 @@ pub fn album_page(resp: &Value, browse_id: &str) -> Option<AlbumPage> {
 // ---------------------------------------------------------------------------
 
 /// Parse a full artist page (header + top songs + albums) from a `/browse`.
+#[must_use]
 pub fn artist_page(resp: &Value, browse_id: &str) -> Option<ArtistPage> {
     let header = header_of(resp, "musicImmersiveHeaderRenderer")?;
 
@@ -755,8 +767,10 @@ pub fn artist_page(resp: &Value, browse_id: &str) -> Option<ArtistPage> {
         .and_then(Value::as_array)
         .map(|u| thumb(u))
         .unwrap_or_default();
-    // The description's first run is the main paragraph; later runs are the
-    // Wikipedia attribution link, which we drop.
+    // The description's first run is the main paragraph. Recorded responses fold
+    // the Wikipedia attribution into that same run; only the first run is kept,
+    // because later runs would be attribution links rather than description text
+    // (the UI renders a paragraph, not a link).
     let description = header
         .pointer("/description/runs/0/text")
         .and_then(Value::as_str)
@@ -798,6 +812,7 @@ pub fn artist_page(resp: &Value, browse_id: &str) -> Option<ArtistPage> {
 /// `find_all(..).first()`, which is alphabetical order) would silently load a
 /// different list once the layout shifts — the fixture already carries a second
 /// `VL…` id on the Videos carousel, so "Show all songs" would load that instead.
+#[must_use]
 pub fn tracks_playlist_id(resp: &Value) -> Option<String> {
     // The shelf is the first section of the artist page's tab content; its
     // `bottomEndpoint` is the "Show all" link for that shelf.
@@ -819,9 +834,11 @@ pub fn tracks_playlist_id(resp: &Value) -> Option<String> {
         return Some(id.to_owned());
     }
 
-    // Fallback for a shape we have not seen: the first shelf in the *document*
-    // that carries one, which at least keeps the page working. Any shelf type
-    // counts here — the point is only that the known path did not match.
+    // Fallback for a shape we have not seen: the first shelf the recursive walk
+    // meets that carries one, which at least keeps the page working. Any shelf
+    // type counts here — the known path not matching is the whole reason the walk
+    // runs — and the result is not document order (see [`find_all`]), so this is
+    // a last resort, not a choice between candidate links.
     let mut nodes = Vec::new();
     find_all(resp, "bottomEndpoint", &mut nodes);
     nodes.iter().find_map(|n| {
@@ -931,6 +948,7 @@ pub struct PlaylistPage {
 }
 
 /// Parse one playlist page.
+#[must_use]
 pub fn playlist_page(resp: &Value) -> PlaylistPage {
     let name = header_of(resp, "musicResponsiveHeaderRenderer")
         .and_then(|h| h.pointer("/title"))
@@ -957,14 +975,22 @@ pub fn playlist_page(resp: &Value) -> PlaylistPage {
     })
     .and_then(Value::as_str)
     .map(str::to_owned)
+    .filter(|token| !token.is_empty())
     .or_else(|| {
-        // Unknown shape: the first continuation anywhere, in document order.
+        // Unknown shape: the first continuation the recursive walk meets. That
+        // walk is *not* document order (see [`find_all`]), so this is a last
+        // resort for a layout we have not seen.
+        //
+        // An empty token is no token: the walk in `Client::playlist` would
+        // otherwise send `{"continuation": ""}` and get a 400 back instead of
+        // treating the page as the end of the playlist.
         let mut conts = Vec::new();
         find_all(resp, "nextContinuationData", &mut conts);
         conts
             .iter()
             .find_map(|c| at(c, "/nextContinuationData/continuation"))
             .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
             .map(str::to_owned)
     });
 
@@ -993,6 +1019,7 @@ pub fn playlist_page(resp: &Value) -> PlaylistPage {
 /// credits are then written onto the requested track's row and persisted. The
 /// queue panel for a single video carries one `playlistPanelVideoRenderer` whose
 /// `videoId` is the answer, so it is matched explicitly.
+#[must_use]
 pub fn track_credits(
     resp: &Value,
     video_id: &str,
@@ -1605,6 +1632,33 @@ mod tests {
 
         assert_eq!(trailing_year(&[json!({ "text": "not a year" })]), None);
         assert_eq!(trailing_year(&[]), None);
+    }
+
+    /// An empty continuation token is not a token.
+    ///
+    /// Handing `Some("")` to the paginating caller makes it POST
+    /// `{"continuation": ""}`, which innertube answers with a 400 — an error
+    /// where the page simply had no next page. Both the known path and the
+    /// fallback walk normalize it away, and a real token still comes through.
+    #[test]
+    fn an_empty_continuation_token_is_treated_as_absent() {
+        let known_path = json!({
+            "contents": { "twoColumnBrowseResultsRenderer": { "secondaryContents": {
+                "sectionListRenderer": { "continuations": [
+                    { "nextContinuationData": { "continuation": "" } }
+                ] }
+            } } }
+        });
+        assert!(super::playlist_page(&known_path).continuation.is_none());
+
+        let fallback_path = json!({ "nextContinuationData": { "continuation": "" } });
+        assert!(super::playlist_page(&fallback_path).continuation.is_none());
+
+        let real = json!({ "nextContinuationData": { "continuation": "abc" } });
+        assert_eq!(
+            super::playlist_page(&real).continuation.as_deref(),
+            Some("abc")
+        );
     }
 
     /// 3.8: a response that carries rows but yields no tracks must say so.

@@ -8,16 +8,22 @@
 //! the network for a URL that is already loading or has already failed.
 //!
 //! Decoding and resizing are CPU work and must stay off the UI thread: the
-//! controller runs [`decode_cover`] through `spawn_blocking`.
+//! controller runs [`decode_cover`] through `spawn_blocking`. The bytes are
+//! untrusted network input, so decoding is bounded ([`MAX_SOURCE_EDGE`],
+//! [`MAX_SOURCE_ALLOC`]) before the decoder can reserve a pixel buffer; a
+//! decompression bomb fails as an ordinary "could not decode" error instead of
+//! exhausting memory.
 
 use std::collections::{HashSet, VecDeque};
 
 /// Longest edge of a decoded cover thumbnail, in pixels.
 ///
-/// The UI never draws a cover larger than ~220 logical px (the player bar cover,
-/// the biggest in the design), so 256 leaves headroom for a 125% DPI scale
-/// without keeping multi-megapixel `YouTube` thumbnails in memory: a 256x256 RGBA8
-/// cover is 256 KiB, a 544x544 one is 1.1 MiB.
+/// The design's largest cover is the 170 logical px album art (the player-bar
+/// cover is 44 px), so 256 covers it through 150% DPI scaling without keeping
+/// multi-megapixel `YouTube` thumbnails in memory: a 256x256 RGBA8 cover is
+/// 256 KiB, a 544x544 one is 1.1 MiB. At 200% scaling the GPU upscales the
+/// texture slightly (softer art); that is the accepted trade-off for a bounded
+/// 256-entry texture cache, see `app::MAX_CACHED_COVERS`.
 pub const MAX_COVER_DIMENSION: u32 = 256;
 
 /// How many failed URLs are remembered before the oldest are forgotten.
@@ -26,6 +32,23 @@ pub const MAX_COVER_DIMENSION: u32 = 256;
 /// exists so a pathological feed (every row a different dead URL) cannot grow
 /// the failure set without limit.
 pub const MAX_REMEMBERED_FAILURES: usize = 1024;
+
+/// Largest source edge, in pixels, that [`decode_cover`] will decode.
+///
+/// `YouTube` serves thumbnails at up to ~1280 px; a "cover" claiming more than
+/// 4096 px is not artwork this UI can use and is far more likely to be a
+/// decompression bomb. The limit is enforced by the decoder *before* it reserves
+/// a pixel buffer, so a tiny crafted PNG cannot make the blocking pool allocate
+/// gigabytes.
+const MAX_SOURCE_EDGE: u32 = 4096;
+
+/// Ceiling for the decoded source image's pixel buffer.
+///
+/// `image`'s default is 512 MiB, which a 16 MiB compressed upload (the backend's
+/// fetch cap) could still reach. A 4096x4096 RGBA8 image is 64 MiB, and the
+/// result is downscaled to at most [`MAX_COVER_DIMENSION`] immediately after
+/// decode, so a larger source only wastes memory and CPU.
+const MAX_SOURCE_ALLOC: u64 = 64 * 1024 * 1024;
 
 /// A decoded cover image ready to be uploaded as a texture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,9 +73,15 @@ impl CoverImage {
 ///
 /// Never upscales: a small source is returned at its own size. An empty source
 /// or one whose dimensions are degenerate is an error rather than a panic.
+///
+/// # Errors
+///
+/// Returns `Err` with a human-readable message when the bytes are not a
+/// supported image, when the source exceeds the decode limits
+/// ([`MAX_SOURCE_EDGE`] / [`MAX_SOURCE_ALLOC`]), or when the decoded image has
+/// no pixels.
 pub fn decode_cover(url: &str, bytes: &[u8]) -> Result<CoverImage, String> {
-    let image = image::load_from_memory(bytes)
-        .map_err(|error| format!("could not decode cover art: {error}"))?;
+    let image = decode_source(bytes)?;
     let image = downscale(image, MAX_COVER_DIMENSION)?;
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -62,6 +91,29 @@ pub fn decode_cover(url: &str, bytes: &[u8]) -> Result<CoverImage, String> {
         height,
         rgba: rgba.into_raw(),
     })
+}
+
+/// Decode untrusted image bytes with the resource limits applied *before* the
+/// decoder reserves a pixel buffer.
+///
+/// Cover bytes arrive from the network (the backend caps the transfer at 16 MiB,
+/// but not the decoded size), so a decompression bomb is the realistic attack:
+/// a few KiB of PNG can declare a 50,000 x 50,000 image and make the
+/// `spawn_blocking` worker try to allocate ~10 GB. Both a dimension cap and an
+/// allocation cap keep that bounded; they are generous enough for every real
+/// cover size.
+fn decode_source(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| format!("could not decode cover art: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SOURCE_EDGE);
+    limits.max_image_height = Some(MAX_SOURCE_EDGE);
+    limits.max_alloc = Some(MAX_SOURCE_ALLOC);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|error| format!("could not decode cover art: {error}"))
 }
 
 /// Downscale `image` so neither edge exceeds `max_edge`, preserving aspect ratio.
@@ -227,6 +279,25 @@ mod tests {
         let error = decode_cover("u", b"this is not an image").expect_err("must fail");
         assert!(error.contains("decode"), "unhelpful error: {error}");
         assert!(decode_cover("u", &[]).is_err());
+    }
+
+    /// A source exactly at the decode limit is still accepted: the cap exists to
+    /// stop bombs, not to reject legitimate large artwork. Downscaling still
+    /// applies.
+    #[test]
+    fn a_source_at_the_decode_limit_is_accepted() {
+        let image = decode_cover("u", &png(MAX_SOURCE_EDGE, 4, [3, 4, 5, 255])).expect("decode");
+        assert_eq!((image.width, image.height), (256, 1));
+    }
+
+    /// A decompression bomb (a tiny file declaring dimensions above the limit) is
+    /// rejected by the decode limits before any pixel buffer is allocated, so the
+    /// process never attempts a multi-gigabyte allocation.
+    #[test]
+    fn a_source_above_the_decode_limit_is_rejected() {
+        let error = decode_cover("u", &png(MAX_SOURCE_EDGE + 1, 8, [0, 0, 0, 255]))
+            .expect_err("oversized source must be rejected");
+        assert!(error.contains("decode"), "unhelpful error: {error}");
     }
 
     #[test]

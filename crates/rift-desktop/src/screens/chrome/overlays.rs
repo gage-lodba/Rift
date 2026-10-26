@@ -14,8 +14,8 @@ use crate::ui::{Rect, Ui};
 
 /// The transient toast — drawn by `overlays.rs` (screens-pages owns the card;
 /// this wrapper keeps the root's call sites stable).
-pub fn toast(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, viewport: Rect) {
-    overlays::toast(ui, state, actions, viewport);
+pub fn toast(ui: &mut Ui, state: &mut State, viewport: Rect) {
+    overlays::toast(ui, state, viewport);
 }
 
 /// The dismissible "update available" banner — drawn by `overlays.rs`.

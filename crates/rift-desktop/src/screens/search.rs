@@ -78,6 +78,9 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
     y += pages::TAB_H + pages::TABS_MARGIN_BOTTOM;
 
     // ---- content ----
+    // The result lists are moved out of `State` for their draw (the row/card
+    // painters need `&mut State` for cover requests) and restored immediately:
+    // cloning every result per frame would allocate on the hot path.
     match state.search.tab {
         SearchTab::Songs => {
             if state.search.busy {
@@ -85,7 +88,7 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
             } else if state.search.songs.is_empty() {
                 pages::empty(ui, area.x, y, area.w, "No results.");
             } else {
-                let tracks = state.search.songs.clone();
+                let tracks = std::mem::take(&mut state.search.songs);
                 let opts = track_list::TrackListOpts {
                     id: "search-songs",
                     ..track_list::TrackListOpts::default()
@@ -98,26 +101,33 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
                     &tracks,
                     &opts,
                 );
+                state.search.songs = tracks;
             }
         }
-        SearchTab::Artists => match &state.search.artists {
-            Some(artists) if !artists.is_empty() => {
-                let artists = artists.clone();
-                pages::artist_grid(ui, state, actions, area.x, y, area.w, &artists);
+        SearchTab::Artists => {
+            let artists = state.search.artists.take();
+            match artists.as_ref() {
+                Some(artists) if !artists.is_empty() => {
+                    pages::artist_grid(ui, state, actions, area.x, y, area.w, artists);
+                }
+                _ => {
+                    pages::empty(ui, area.x, y, area.w, "Searching...");
+                }
             }
-            _ => {
-                pages::empty(ui, area.x, y, area.w, "Searching...");
+            state.search.artists = artists;
+        }
+        SearchTab::Albums => {
+            let albums = state.search.albums.take();
+            match albums.as_ref() {
+                Some(albums) if !albums.is_empty() => {
+                    pages::album_grid(ui, state, actions, area.x, y, area.w, albums);
+                }
+                _ => {
+                    pages::empty(ui, area.x, y, area.w, "Searching...");
+                }
             }
-        },
-        SearchTab::Albums => match &state.search.albums {
-            Some(albums) if !albums.is_empty() => {
-                let albums = albums.clone();
-                pages::album_grid(ui, state, actions, area.x, y, area.w, &albums);
-            }
-            _ => {
-                pages::empty(ui, area.x, y, area.w, "Searching...");
-            }
-        },
+            state.search.albums = albums;
+        }
     }
 }
 

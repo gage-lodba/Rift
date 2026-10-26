@@ -1,14 +1,10 @@
 //! Row geometry: the `.settings-row` metrics, the row-height arithmetic shared by
 //! [`height`] and [`view`], and the content height used by the scroll view.
 
-use rift_types::YtDlpStatus;
-
 use crate::screens::cards;
 use crate::state::State;
 use crate::text::Weight;
 use crate::ui::Ui;
-
-use super::ytdlp::ytdlp_status_height;
 
 // ---------------------------------------------------------------------------
 // row geometry
@@ -37,12 +33,12 @@ const BTN_PAD_X: f32 = 14.0;
 pub(crate) const TITLE_BLOCK_H: f32 = 22.0 + 14.0;
 /// The vertical gap inside a row before each extra block (status/actions/input).
 pub(crate) const BLOCK_GAP: f32 = 10.0;
-/// `.ytdlp-status` badge height: 12/600 line 16 + padding 2x2.
+/// Status-line badge height: 12/600 line 16 + padding 2x2.
 pub(crate) const BADGE_H: f32 = 20.0;
 
-/// The four rows' heights for the current state (used by both `height` and
+/// The three rows' heights for the current state (used by both `height` and
 /// `view`, so the scrollbar can never disagree with the painted rows).
-pub fn row_heights(ui: &mut Ui, state: &State, width: f32) -> [f32; 4] {
+pub fn row_heights(ui: &mut Ui, state: &State, width: f32) -> [f32; 3] {
     let theme = ui.theme().clone();
     let desc_style = cards::style_lh(13.0, Weight::Regular, theme.text_dim, LINE_13);
     let row_w = width.min(ROW_MAX_W);
@@ -77,23 +73,7 @@ pub fn row_heights(ui: &mut Ui, state: &State, width: f32) -> [f32; 4] {
     }
     let crossfade = row_h(crossfade_content, SWITCH_H);
 
-    // 3. Streaming engine (yt-dlp).
-    let check_w = btn_width(ui, "Check again");
-    let text_w_ytdlp = text_w(check_w);
-    let ytdlp_desc = desc_h(
-        ui,
-        "Rift uses yt-dlp to fetch audio. It's auto-detected from your PATH and common install locations; set a custom path below if it lives elsewhere.",
-        text_w_ytdlp,
-    );
-    let status_h = ytdlp_status_height(state.yt_dlp_status.as_ref(), ui, text_w_ytdlp, &desc_style);
-    let mut ytdlp_content = LABEL_H + DESC_GAP + ytdlp_desc + BLOCK_GAP + status_h;
-    if is_missing(state.yt_dlp_status.as_ref()) {
-        ytdlp_content += BLOCK_GAP + BTN_H; // "Download yt-dlp" + hint
-    }
-    ytdlp_content += BLOCK_GAP + BTN_H; // custom path input + Save
-    let ytdlp = row_h(ytdlp_content, BTN_H);
-
-    // 4. Updates.
+    // 3. Updates.
     let updates_content = LABEL_H
         + DESC_GAP
         + desc_h(
@@ -107,7 +87,7 @@ pub fn row_heights(ui: &mut Ui, state: &State, width: f32) -> [f32; 4] {
         + BTN_H;
     let updates = row_h(updates_content, SWITCH_H);
 
-    [discord, crossfade, ytdlp, updates]
+    [discord, crossfade, updates]
 }
 
 fn row_h(content_h: f32, control_h: f32) -> f32 {
@@ -119,10 +99,6 @@ pub(crate) fn btn_width(ui: &mut Ui, label: &str) -> f32 {
         label,
         &cards::style(13.0, Weight::SemiBold, crate::ui::Color::WHITE),
     ) + BTN_PAD_X * 2.0
-}
-
-pub(crate) fn is_missing(status: Option<&YtDlpStatus>) -> bool {
-    matches!(status, Some(s) if !s.found)
 }
 
 /// Content height (no main padding) for [`view`].

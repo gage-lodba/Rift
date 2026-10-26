@@ -352,8 +352,7 @@ fn item_width(
     let shortcut_w = item
         .shortcut
         .as_ref()
-        .map(|s| ui.text_width(s, shortcut_style))
-        .unwrap_or(0.0);
+        .map_or(0.0, |s| ui.text_width(s, shortcut_style));
     10.0 + icon_w + ui.text_width(&item.label, label_style) + shortcut_w + 10.0
 }
 

@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use rift_types::{
     AlbumPage, AlbumSummary, ArtistPage, ArtistSummary, Bootstrap, DownloadState, Library,
-    PlaybackState, Playlist, Progress, QueueSnapshot, Track, UpdateStatus, YtDlpStatus,
+    PlaybackState, Playlist, Progress, QueueSnapshot, Track, UpdateStatus,
 };
 
 pub use crate::cover::CoverImage;
@@ -125,9 +125,6 @@ pub enum ControllerEvent {
     },
     /// Result of a requested update check.
     UpdateStatus(UpdateStatus),
-    /// Result of a requested yt-dlp probe (also after setting the path or
-    /// downloading the binary).
-    YtDlpStatus(YtDlpStatus),
     /// A cover URL finished downloading and decoding.
     Cover(CoverImage),
     /// The cover request failed (or this is preview mode, which has no network);
@@ -168,6 +165,11 @@ pub enum ControllerEvent {
 pub trait BackendCommands: Send + Sync + 'static {
     // ------------------------------------------------------------- startup
     /// Synchronous launch snapshot (`backend.bootstrap()`).
+    ///
+    /// # Errors
+    ///
+    /// Implementations return the backend's error message when the launch
+    /// snapshot cannot be read; the controller surfaces it as a startup toast.
     fn bootstrap(&self) -> Result<Bootstrap, String>;
 
     // ------------------------------------------------------------ playback
@@ -194,6 +196,12 @@ pub trait BackendCommands: Send + Sync + 'static {
 
     // ------------------------------------------------------------- library
     fn toggle_like(&self, track: Track);
+    /// Create a playlist.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's validation message (e.g. a blank name) so the
+    /// controller can toast it instead of silently dropping the action.
     fn create_playlist(&self, name: String) -> Result<(), String>;
     fn import_yt_playlist(&self, url: String);
     fn export_playlist(&self, id: String);
@@ -211,12 +219,13 @@ pub trait BackendCommands: Send + Sync + 'static {
     // ------------------------------------------------------------- updates
     fn check_update(&self);
     fn set_update_notifications(&self, enabled: bool);
+    /// Open an external URL in the OS browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's refusal message for a non-`http(s)` URL (or a
+    /// failed native open), which the controller toasts.
     fn open_url(&self, url: String) -> Result<(), String>;
-
-    // -------------------------------------------------------------- yt-dlp
-    fn check_ytdlp(&self);
-    fn set_yt_dlp_path(&self, path: Option<String>);
-    fn download_ytdlp(&self);
 
     // ------------------------------------------------------ search/catalog
     fn search_songs(&self, generation: u64, query: String);
@@ -289,10 +298,6 @@ impl BackendCommands for InertCommands {
         Ok(())
     }
 
-    fn check_ytdlp(&self) {}
-    fn set_yt_dlp_path(&self, _: Option<String>) {}
-    fn download_ytdlp(&self) {}
-
     fn search_songs(&self, _: u64, _: String) {}
     fn search_artists(&self, _: u64, _: String) {}
     fn search_albums(&self, _: u64, _: String) {}
@@ -352,10 +357,7 @@ enum TaskResult {
         result: Result<AlbumPage, String>,
     },
     ImportYtPlaylist(Result<Playlist, String>),
-    SetYtDlpPath(Result<YtDlpStatus, String>),
-    DownloadYtDlp(Result<YtDlpStatus, String>),
     CheckUpdate(Result<UpdateStatus, String>),
-    CheckYtDlp(YtDlpStatus),
     Online(bool),
     Cover {
         url: String,
@@ -523,6 +525,13 @@ impl Controller {
     /// With the `backend` cargo feature disabled this always returns an error
     /// explaining how to build a live application; `main.rs` reacts by falling
     /// back to [`Self::new_preview`] so the UI still opens.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend's construction error when the data directory cannot
+    /// be resolved/created, or the runtime/HTTP client cannot be built. Callers
+    /// fall back to [`Self::new_preview`] and toast the message, so the window
+    /// still opens without a live backend.
     pub fn new(media_hwnd: Option<isize>) -> anyhow::Result<Self> {
         #[cfg(feature = "backend")]
         {
@@ -588,6 +597,12 @@ impl Controller {
     /// Also seeds the controller's mirror state (volume, current track, library,
     /// track cache), runs the launch-time update check the old frontend did when
     /// notifications were enabled, and starts the first reachability probe.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a preview/screenshot controller (no backend attached) and when
+    /// the backend cannot produce its launch snapshot; `app.rs` toasts the
+    /// message and keeps running with the default state.
     pub fn bootstrap(&mut self) -> anyhow::Result<Bootstrap> {
         if !self.live {
             anyhow::bail!("no backend attached");
@@ -624,9 +639,8 @@ impl Controller {
         {
             if let Some(mut incoming) = self.backend_events.take() {
                 while let Some(event) = incoming.try_recv() {
-                    if let Some(mapped) = self.absorb_backend_event(event) {
-                        events.push(mapped);
-                    }
+                    let mapped = self.absorb_backend_event(event);
+                    events.push(mapped);
                 }
                 self.backend_events = Some(incoming);
             }
@@ -737,9 +751,6 @@ impl Controller {
             SetCrossfade(secs) => self.commands.set_crossfade(secs),
             SetUpdateNotifications(enabled) => self.commands.set_update_notifications(enabled),
             CheckUpdate => self.commands.check_update(),
-            CheckYtDlp => self.commands.check_ytdlp(),
-            SetYtDlpPath(path) => self.commands.set_yt_dlp_path(path),
-            DownloadYtDlp => self.commands.download_ytdlp(),
 
             // --------------------------------------------------- downloads
             DownloadTracks(ids) => self.request_downloads(ids),
@@ -786,11 +797,6 @@ impl Controller {
     /// Ask the backend for the latest release status.
     pub fn check_update(&mut self) {
         self.commands.check_update();
-    }
-
-    /// Ask the backend to probe for yt-dlp.
-    pub fn check_ytdlp(&mut self) {
-        self.commands.check_ytdlp();
     }
 
     /// Stop backend threads cleanly (called on exit).
@@ -1094,25 +1100,10 @@ impl Controller {
                 }
                 Err(message) => events.push(ControllerEvent::Error(message)),
             },
-            TaskResult::SetYtDlpPath(result) => match result {
-                Ok(status) => events.push(ControllerEvent::YtDlpStatus(status)),
-                // The backend keeps the old stored value on a rejected path and
-                // the rejection is the interesting half; surface it as a toast.
-                Err(message) => events.push(ControllerEvent::Error(message)),
-            },
-            TaskResult::DownloadYtDlp(result) => {
-                // Failure is already toasted by the backend itself (it emits an
-                // `Error` event before returning `Err`), so only the status is
-                // forwarded here to avoid a duplicate toast.
-                if let Ok(status) = result {
-                    events.push(ControllerEvent::YtDlpStatus(status));
-                }
-            }
             TaskResult::CheckUpdate(result) => match result {
                 Ok(status) => events.push(ControllerEvent::UpdateStatus(status)),
                 Err(message) => events.push(ControllerEvent::Error(message)),
             },
-            TaskResult::CheckYtDlp(status) => events.push(ControllerEvent::YtDlpStatus(status)),
             TaskResult::Online(online) => {
                 self.probe_in_flight = false;
                 if self.online != Some(online) {
@@ -1136,29 +1127,33 @@ impl Controller {
 
     /// Map one backend broadcast to its UI event, updating the controller's
     /// mirrors on the way (current track, library, track cache).
+    ///
+    /// Every backend event currently has a UI counterpart, so the mapping is
+    /// total; a future backend-only event would have to decide explicitly what
+    /// the app should do with it.
     #[cfg(feature = "backend")]
-    fn absorb_backend_event(&mut self, event: rift::BackendEvent) -> Option<ControllerEvent> {
+    fn absorb_backend_event(&mut self, event: rift::BackendEvent) -> ControllerEvent {
         use rift::BackendEvent as Event;
         match event {
             Event::Track(track) => {
                 self.current_track = Some(track.clone());
                 self.tracks.insert(track.clone());
-                Some(ControllerEvent::Track(Some(track)))
+                ControllerEvent::Track(Some(track))
             }
-            Event::State(state) => Some(ControllerEvent::PlaybackState(state)),
+            Event::State(state) => ControllerEvent::PlaybackState(state),
             Event::Queue(queue) => {
                 self.tracks.insert_all(&queue.tracks);
-                Some(ControllerEvent::Queue(queue))
+                ControllerEvent::Queue(queue)
             }
-            Event::Progress(progress) => Some(ControllerEvent::Progress(progress)),
+            Event::Progress(progress) => ControllerEvent::Progress(progress),
             Event::Library(library) => {
                 self.apply_library(&library);
-                Some(ControllerEvent::Library(library))
+                ControllerEvent::Library(library)
             }
-            Event::Downloads(downloads) => Some(ControllerEvent::Downloads(downloads)),
-            Event::Error(message) => Some(ControllerEvent::Error(message)),
-            Event::Notice(message) => Some(ControllerEvent::Notice(message)),
-            Event::OpenPlaylist(id) => Some(ControllerEvent::OpenPlaylist(id)),
+            Event::Downloads(downloads) => ControllerEvent::Downloads(downloads),
+            Event::Error(message) => ControllerEvent::Error(message),
+            Event::Notice(message) => ControllerEvent::Notice(message),
+            Event::OpenPlaylist(id) => ControllerEvent::OpenPlaylist(id),
         }
     }
 
@@ -1393,24 +1388,6 @@ mod live {
             self.handle.open_url(url)
         }
 
-        // --------------------------------------------------------- yt-dlp
-        fn check_ytdlp(&self) {
-            let handle = self.handle.clone();
-            self.spawn_result(async move { TaskResult::CheckYtDlp(handle.check_ytdlp().await) });
-        }
-        fn set_yt_dlp_path(&self, path: Option<String>) {
-            let handle = self.handle.clone();
-            self.spawn_result(async move {
-                TaskResult::SetYtDlpPath(handle.set_yt_dlp_path(path).await)
-            });
-        }
-        fn download_ytdlp(&self) {
-            let handle = self.handle.clone();
-            self.spawn_result(
-                async move { TaskResult::DownloadYtDlp(handle.download_ytdlp().await) },
-            );
-        }
-
         // ------------------------------------------------ search/catalog
         fn search_songs(&self, generation: u64, query: String) {
             let handle = self.handle.clone();
@@ -1536,9 +1513,6 @@ mod tests {
         CheckUpdate,
         SetUpdateNotifications(bool),
         OpenUrl(String),
-        CheckYtDlp,
-        SetYtDlpPath(Option<String>),
-        DownloadYtDlp,
         PlayTracks(Vec<String>, usize, Option<String>),
         PlayTrack(String),
         SearchSongs(u64, String),
@@ -1677,15 +1651,6 @@ mod tests {
             } else {
                 Ok(())
             }
-        }
-        fn check_ytdlp(&self) {
-            self.record(Call::CheckYtDlp);
-        }
-        fn set_yt_dlp_path(&self, path: Option<String>) {
-            self.record(Call::SetYtDlpPath(path));
-        }
-        fn download_ytdlp(&self) {
-            self.record(Call::DownloadYtDlp);
         }
         fn search_songs(&self, generation: u64, query: String) {
             self.record(Call::SearchSongs(generation, query));
@@ -1942,15 +1907,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_maps_settings_update_and_ytdlp_commands() {
+    fn dispatch_maps_settings_update_commands() {
         let mut h = Harness::new();
         h.dispatch(Action::SetDiscordRpc(false));
         h.dispatch(Action::SetCrossfade(3.5));
         h.dispatch(Action::SetUpdateNotifications(false));
         h.dispatch(Action::CheckUpdate);
-        h.dispatch(Action::CheckYtDlp);
-        h.dispatch(Action::SetYtDlpPath(Some("C:\\yt-dlp.exe".into())));
-        h.dispatch(Action::DownloadYtDlp);
         h.dispatch(Action::OpenUrl("https://example.com".into()));
         assert_eq!(
             h.take_calls(),
@@ -1959,9 +1921,6 @@ mod tests {
                 Call::SetCrossfade(3.5),
                 Call::SetUpdateNotifications(false),
                 Call::CheckUpdate,
-                Call::CheckYtDlp,
-                Call::SetYtDlpPath(Some("C:\\yt-dlp.exe".into())),
-                Call::DownloadYtDlp,
                 Call::OpenUrl("https://example.com".into()),
             ]
         );
@@ -2484,18 +2443,14 @@ mod backend_event_tests {
     fn every_backend_event_maps_one_to_one() {
         let mut controller = controller();
 
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::Track(track()))
-            .expect("track maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::Track(track()));
         assert!(matches!(mapped, ControllerEvent::Track(Some(t)) if t.id == "id"));
         assert_eq!(
             controller.current_track.as_ref().map(|t| t.id.as_str()),
             Some("id")
         );
 
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::State(PlaybackState::Playing))
-            .expect("state maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::State(PlaybackState::Playing));
         assert!(matches!(
             mapped,
             ControllerEvent::PlaybackState(PlaybackState::Playing)
@@ -2508,48 +2463,34 @@ mod backend_event_tests {
             repeat: RepeatMode::Off,
             source: Some("liked".into()),
         };
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::Queue(snapshot.clone()))
-            .expect("queue maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::Queue(snapshot.clone()));
         assert!(matches!(mapped, ControllerEvent::Queue(q) if q == snapshot));
 
         let progress = Progress {
             position: 1.0,
             duration: 2.0,
         };
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::Progress(progress))
-            .expect("progress maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::Progress(progress));
         assert!(matches!(mapped, ControllerEvent::Progress(p) if p == progress));
 
         let mut library = Library::default();
         library.liked.push(track());
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::Library(library.clone()))
-            .expect("library maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::Library(library.clone()));
         assert!(matches!(mapped, ControllerEvent::Library(l) if l == library));
         // The library mirror feeds id-resolved actions (MovePlaylist etc.).
         assert_eq!(controller.library.liked.len(), 1);
 
         let downloads = DownloadState::default();
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::Downloads(downloads.clone()))
-            .expect("downloads maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::Downloads(downloads.clone()));
         assert!(matches!(mapped, ControllerEvent::Downloads(d) if d == downloads));
 
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::Error("boom".into()))
-            .expect("error maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::Error("boom".into()));
         assert!(matches!(mapped, ControllerEvent::Error(m) if m == "boom"));
 
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::Notice("hi".into()))
-            .expect("notice maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::Notice("hi".into()));
         assert!(matches!(mapped, ControllerEvent::Notice(m) if m == "hi"));
 
-        let mapped = controller
-            .absorb_backend_event(BackendEvent::OpenPlaylist("pl".into()))
-            .expect("open playlist maps");
+        let mapped = controller.absorb_backend_event(BackendEvent::OpenPlaylist("pl".into()));
         assert!(matches!(mapped, ControllerEvent::OpenPlaylist(id) if id == "pl"));
     }
 }

@@ -42,7 +42,10 @@ impl Rng {
     }
 
     fn f32(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * (self.next_u32() as f32 / u32::MAX as f32)
+        // `t` is in 0..=1; naming the normalised value keeps the lerp readable
+        // (the inline form trips clippy::suspicious_operation_groupings).
+        let t = self.next_u32() as f32 / u32::MAX as f32;
+        lo + (hi - lo) * t
     }
 
     fn chance(&mut self, percent: u32) -> bool {
@@ -352,12 +355,10 @@ fn assert_scene_invariants(ui: &Ui, state: &SceneState, frame: u64) {
         offset >= 0.0,
         "frame {frame}: negative scroll offset {offset}"
     );
-    let max = (30.0 * 26.0_f32 - 40.0).max(0.0); // 30 rows minimum viewport height
     assert!(
         offset <= 30.0 * 26.0,
         "frame {frame}: scroll offset {offset} way past content"
     );
-    let _ = max;
     // Text must remain a valid string (editing never splits UTF-8).
     let _ = std::str::from_utf8(state.text.as_bytes()).expect("text stays valid UTF-8");
     assert!(state.slider.is_finite() && (0.0..=1.0).contains(&state.slider));

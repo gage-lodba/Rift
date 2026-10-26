@@ -12,9 +12,11 @@ crate through:
    (reachable directly on `RiftBackend` through `Deref`).
 
 The crate builds with `cargo check -p rift`; its test suites cover the player,
-library, downloads, settings, util, sha256 and fetch paths; `cargo tree -p rift`
-has no desktop-shell framework crates; `examples/probe.rs` compiles. A complete
-`grep`-able mapping of the old command names is at the end.
+library, downloads, settings, util, native streaming (resolver-backed range
+downloader + progress), and the durable stores; `cargo tree -p rift` has no
+desktop-shell framework crates and no external media binary; `examples/probe.rs`
+and `examples/native_probe.rs` compile. A complete `grep`-able mapping of the old
+command names is at the end.
 
 ---
 
@@ -41,7 +43,6 @@ impl RiftBackend {
 * resolves and creates the data directory (see §4),
 * loads `settings.json`, `library.json`, the restored playback queue,
   offline-download state,
-* applies the persisted yt-dlp override,
 * spawns the audio thread, the OS media thread and the Discord RPC thread,
 * builds the shared `reqwest::Client` (5 s connect / 30 s total timeout),
 * creates the backend's own multi-thread Tokio runtime (2 workers),
@@ -145,7 +146,7 @@ inside a spawned future.
 | `fn spawn_blocking<F, R>(&self, f: F) -> JoinHandle<R>` | run a blocking closure (e.g. own dialogs) off the UI thread |
 | `fn preview_mode(&self) -> bool` | `RIFT_PREVIEW` debug mode |
 | `fn library(&self) -> rift_types::Library` | likes + playlists + recents |
-| `fn downloads_state(&self) -> rift_types::DownloadState` | offline download status |
+| `fn downloads_state(&self) -> rift_types::DownloadState` | offline download status, including per-track progress for in-flight downloads |
 | `fn queue_snapshot(&self) -> rift_types::QueueSnapshot` | queue/current/shuffle/repeat/source |
 | `fn playback_state(&self) -> rift_types::PlaybackState` | stopped/loading/playing/paused |
 | `fn volume(&self) -> f32` | 0.0..=1.0 |
@@ -209,8 +210,8 @@ impl BackendEvent { pub fn name(&self) -> &'static str; }  // the old event name
 | `Queue` | any queue/current/shuffle/repeat change; also on a track's first play (twice is normal: once for the change, once after credit enrichment) |
 | `Progress` | audio-thread position tick (~5 Hz), decoder duration correction, track start, crossfade commit, `seek` |
 | `Library` | like/unlike, playlist create/import/delete/rename/move/add/remove, track backfill + recents on playback |
-| `Downloads` | download claimed/finished/failed/removed, including each retry pass |
-| `Error` | playback failure, download failure/give-up, import parse failure, export write failure, yt-dlp install failure |
+| `Downloads` | download claimed/finished/failed/removed, including each retry pass, plus throttled byte-progress snapshots (≤100 ms apart) while the native downloader transfers a track |
+| `Error` | playback failure, download failure/give-up, import parse failure, export write failure |
 | `Notice` | playlist exported, playlist imported (with count) |
 | `OpenPlaylist` | after a backend-driven playlist import (jump to the new playlist) |
 
@@ -260,23 +261,26 @@ Files written there (all pre-existing formats, unchanged):
 | Path | Contents |
 |---|---|
 | `library.json` | likes, playlists, recently played (`rift_types::Library`) |
-| `settings.json` | volume, discord_rpc, crossfade, yt_dlp_path, update_notifications |
+| `settings.json` | volume, discord_rpc, crossfade, update_notifications |
 | `playback.json` | last queue snapshot (restored stopped on next launch) |
 | `downloads/<id>.m4a` | offline audio (presence == downloaded) |
-| `bin/yt-dlp[.exe]` | one-click yt-dlp install target |
-| `*.json.bad` | backup of a corrupt state file (never overwritten, see `util::load_json`) |
+| `*.json.bad`, `*.json.bad.N` | backup of a corrupt state file; the first copy keeps `*.json.bad`, later corruptions get numbered names so no backup is ever overwritten (see `util::load_json`) |
 
 `library.json` and `settings.json` are **durable** and written off the caller's
 thread: a mutation queues a snapshot to a `util::DurableWriter` background
 thread (`rift-durable`), which serializes it and replaces the file with an
-atomic temp-file + rename in FIFO order — rapid mutations land in order, the
-last write wins, and a sync command called on the UI thread never blocks on
-disk. `RiftBackend::shutdown`/`Drop` flushes that queue (bounded wait, logged if
-it gives up) before the runtime and threads stop. Startup **loads** remain
-synchronous, and the one-time duplicate-song repair's pre-repair backup copy is
-a synchronous startup-only `std::fs::copy`. Failure semantics are unchanged
-from the old synchronous path: a failed write is logged, not retried, and
-`load_json` still moves a corrupt file aside to `*.json.bad`.
+atomic temp-file write + flush + rename in FIFO order — rapid mutations land in
+order, the last write wins, and a sync command called on the UI thread never
+blocks on disk. The contents are flushed to the storage device before the
+rename (a flush failure is logged and the publish still happens), so
+`shutdown`/`flush` returning means the *content* is durable rather than only
+visible in the page cache. Startup **loads** remain synchronous, and the
+one-time duplicate-song repair's pre-repair backup copy is a synchronous
+startup-only `std::fs::copy`. Failure semantics are unchanged from the old
+synchronous path: a failed write is logged, not retried, and `load_json` moves
+a corrupt file aside (`*.json.bad`, numbered if that name is already taken); a
+file that cannot be read at all, or is not valid UTF-8, takes the same corrupt
+path instead of being silently treated as missing.
 
 Preview mode (`RIFT_PREVIEW=1` in a debug build) never persists settings and
 skips network commands; the app renders placeholder data instead of calling the
@@ -291,18 +295,23 @@ parameters and return types**, minus the injected `app: AppHandle` and
 `state: State<AppState>` arguments. Async status is preserved: an `async fn` was
 an async command and still must be driven from a task; a sync method was a
 blocking command and is safe to call directly from the UI/controller thread
-(they take short locks, and do neither network I/O nor disk I/O: library and
-settings writes are queued to the durable writer, see §4).
+(they take short locks and do no network I/O; library and settings writes are
+queued to the durable writer, see §4). The one deliberate disk I/O on a sync
+command is `remove_downloads`, which unlinks the selected offline files inline:
+that is an explicit user delete, the unlinks are cheap and bounded by the
+selection, and the UI needs the resulting `Downloads` event for the next frame.
+`RiftBackend::shutdown`/`Drop` flushes the durable queue (bounded wait, logged
+if it gives up) before the runtime and threads stop.
 
 Notation: `async` = returns a future, must be awaited inside a spawned task.
-"Network" = performs network I/O (or spawns a subprocess that does). Errors are
+"Network" = performs network I/O. Errors are
 `String` (human-readable, exactly as the old commands returned them).
 
 ### Startup
 
 | Method | Signature | Notes |
 |---|---|---|
-| `bootstrap` | `fn bootstrap(&self) -> rift_types::Bootstrap` | synchronous full launch snapshot: library, queue, state, volume, current track, progress, downloads, discord_rpc, crossfade, yt_dlp_path, update_notifications, preview. Use before the first frame; no event race. |
+| `bootstrap` | `fn bootstrap(&self) -> rift_types::Bootstrap` | synchronous full launch snapshot: library, queue, state, volume, current track, progress, downloads, discord_rpc, crossfade, update_notifications, preview. Use before the first frame; no event race. |
 
 `rift_types::Bootstrap` is unchanged from the old frontend contract.
 
@@ -329,13 +338,13 @@ Errors: `"search failed: …"`, `"could not load artist: …"`,
 | `toggle_play` | `fn toggle_play(&self)` | play/pause/resume/cancel-loading |
 | `next_track` | `fn next_track(&self)` | manual Next (wraps, overrides repeat-one) |
 | `prev_track` | `fn prev_track(&self)` | restarts current when near the start |
-| `seek` | `fn seek(&self, position: f64)` | no-op unless playing/paused; clamps to duration; emits `Progress` immediately |
-| `set_volume` | `fn set_volume(&self, volume: f32)` | live change, no disk write (clamped 0..=1) |
-| `save_volume` | `fn save_volume(&self, volume: f32)` | persists; call on slider release only |
+| `seek` | `fn seek(&self, position: f64)` | no-op unless playing/paused; clamps to duration; ignores non-finite positions; emits `Progress` immediately |
+| `set_volume` | `fn set_volume(&self, volume: f32)` | live change, no disk write (clamped 0..=1; non-finite becomes a 0.0 mute) |
+| `save_volume` | `fn save_volume(&self, volume: f32)` | persists; call on slider release only (clamped 0..=1; non-finite mutes) |
 | `set_discord_rpc` | `fn set_discord_rpc(&self, enabled: bool)` | persists + toggles RPC thread |
-| `set_crossfade` | `fn set_crossfade(&self, secs: f32)` | clamps to `0..=MAX_CROSSFADE (12.0)`, persists, next transition |
+| `set_crossfade` | `fn set_crossfade(&self, secs: f32)` | clamps to `0..=MAX_CROSSFADE (12.0)`; non-finite disables crossfade; persists, next transition |
 | `toggle_shuffle` | `fn toggle_shuffle(&self)` | emits `Queue` |
-| `cycle_repeat` | `fn cycle_repeat(&self)` | Off → All → One; emits `Queue` |
+| `cycle_repeat` | `fn cycle_repeat(&self)` | Off → All → One → Off; emits `Queue` |
 
 ### Queue
 
@@ -376,16 +385,34 @@ API is only legal off the main thread, which this satisfies).
 
 | Method | Signature | Notes |
 |---|---|---|
-| `download_tracks` | `fn download_tracks(&self, tracks: Vec<Track>)` | spawns the sequential background job (yt-dlp, SHA-verified only for the yt-dlp installer; audio files are written temp-file-then-rename); emits `Downloads` per track and `Error` on failures; kept-offline playlists retry with backoff |
-| `remove_downloads` | `fn remove_downloads(&self, ids: Vec<String>)` | deletes files, emits `Downloads` |
+| `download_tracks` | `fn download_tracks(&self, tracks: Vec<Track>)` | spawns the sequential background job: native resolved + range-downloaded audio (streamed to a temp `.part` file with a progress callback); audio files are always published temp-file-then-rename; emits `Downloads` per track (including in-flight progress snapshots) and `Error` on failures; kept-offline playlists retry with backoff |
+| `remove_downloads` | `fn remove_downloads(&self, ids: Vec<String>)` | deletes the files inline (the one sanctioned sync-command disk I/O, see §5 intro; no-op in preview mode), emits `Downloads` |
 
-### yt-dlp setup
+`DownloadState` includes `progress: HashMap<String, u16>` — the completed
+fraction of each in-flight download in permille (`0..=1000`). Only ids currently
+in `downloading` appear; absent means unknown (the track is queued behind the
+active transfer), and the desktop app keeps its spinner instead of drawing a bar.
+The worker emits at most one snapshot per 100 ms while bytes are moving.
 
-| Method | Signature | Notes |
-|---|---|---|
-| `check_ytdlp` | `async fn check_ytdlp(&self) -> rift_types::YtDlpStatus` | runs `yt-dlp --version` (10 s cap), no panic if missing |
-| `set_yt_dlp_path` | `async fn set_yt_dlp_path(&self, path: Option<String>) -> Result<YtDlpStatus, String>` | `None`/blank clears; validates + canonicalizes; on invalid path returns `Err` and keeps the stored value |
-| `download_ytdlp` | `async fn download_ytdlp(&self) -> Result<YtDlpStatus, String>` | network; downloads into `<data_dir>/bin`, verifies the release SHA-256 **before** writing, persists the path; emits `Error` on failure |
+### Audio streaming (native only)
+
+Playback and offline downloads share one path: `fetch::fetch_bytes`
+(plus the downloader's file-streaming variant). Resolution is the JS-less
+`VISIONOS` innertube client (`rift_ytmusic::player::resolve`), which returns a
+direct itag-140 URL; `rift::stream` downloads it with 8 MiB ranged GETs,
+resuming at the written offset after a signed-URL expiry. There is no fallback
+backend and no environment switch — a native failure surfaces as the fetch/
+download error (playback toast, or the download worker's kept-offline retry).
+
+Resolution is a small client table tried in preference order, so a YouTube
+client reshuffle is a table row plus a loopback test rather than a new request
+path. Today the table has exactly one entry (`VISIONOS`) — the only JS-less
+client that returned *fully downloadable* direct URLs in the 2026-10-26 probe
+(`ANDROID_VR` resolves but gates transfers after ~1 MiB and the rest are
+cipher/SABR-only). `docs/native-streaming.md` §3.1 records the alternatives, the
+revisit trigger and the add-a-client procedure; `AudioStream::client` names the
+entry that served a stream for logs/probes. Phase 5 removed the yt-dlp path that
+used to sit behind this one.
 
 ### Updates
 
@@ -393,7 +420,7 @@ API is only legal off the main thread, which this satisfies).
 |---|---|---|
 | `check_update` | `async fn check_update(&self) -> Result<rift_types::UpdateStatus, String>` | network; degrades to "latest unknown" instead of erroring; version from `env!("CARGO_PKG_VERSION")` = workspace version |
 | `set_update_notifications` | `fn set_update_notifications(&self, enabled: bool)` | persists |
-| `open_url` | `fn open_url(&self, url: String) -> Result<(), String>` | only `http(s)://` (anything else is `Err`); `explorer.exe` on Windows (with a `cmd /C start` fallback), `xdg-open` on Linux, `open` on macOS |
+| `open_url` | `fn open_url(&self, url: String) -> Result<(), String>` | only well-formed absolute `http(s)` URLs (scheme + non-empty authority, no ASCII whitespace/control characters) — anything else is `Err`; `explorer.exe` on Windows (one argv element, no shell), `xdg-open` on Linux, `open` on macOS |
 
 ### Cover art / images (new: not a former command)
 
@@ -585,9 +612,6 @@ commands moved to the winit app.
 | `bootstrap` | `backend.bootstrap()` | preserved |
 | `download_tracks` | `backend.download_tracks(tracks)` | preserved |
 | `remove_downloads` | `backend.remove_downloads(ids)` | preserved |
-| `check_ytdlp` | `backend.check_ytdlp().await` | preserved |
-| `set_yt_dlp_path` | `backend.set_yt_dlp_path(path).await` | preserved |
-| `download_ytdlp` | `backend.download_ytdlp().await` | preserved |
 | `check_update` | `backend.check_update().await` | preserved |
 | `set_update_notifications` | `backend.set_update_notifications(enabled)` | preserved |
 | `open_url` | `backend.open_url(url)` | preserved (native opener) |
@@ -626,13 +650,32 @@ responsibility and has a native equivalent:
   Stop are routed through the same player methods as before; seek-style media
   events are ignored exactly as they were. If the integration cannot start, the
   backend logs and degrades (no panic).
-* **Discord Rich Presence** — unchanged thread/coalescing logic; enabled state
-  comes from settings and `set_discord_rpc`.
-* **yt-dlp resolution** — `RIFT_YTDLP` env override, then PATH, then common
-  install dirs; the "not found" case is a normal `found: false` status.
-* **ytmusic client / parsers** — `rift-ytmusic` is untouched.
-* **`rift::fetch` and `rift::sha256`** — still public modules (the
-  `examples/probe.rs` smoke test keeps working).
+* **Discord Rich Presence** — the RPC IPC is implemented in-repo by the
+  `rift-discord` crate (official RPC protocol: named pipe / Unix socket, v1
+  handshake, `SET_ACTIVITY`, clear; no OAuth/voice/chat commands). The transport
+  services the protocol's control opcodes instead of treating them as corruption:
+  a `PING` from Discord is answered with a `PONG` carrying the same payload,
+  `PONG`/unknown opcodes are skipped, a frame carrying another command's nonce is
+  skipped instead of being mistaken for the reply, and a `CLOSE` opcode is
+  reported with Discord's close code so the caller reconnects. The backend
+  keeps its dedicated thread, coalescing and 15 s/60 s pacing; enabled state
+  comes from settings and `set_discord_rpc`. A track that restarts (repeat-one,
+  replay) is detected as a same-identity `Track`; the presence is cleared, left
+  clear briefly so Discord registers a real state change, then re-posted with the
+  new `(start, end)` timestamps. The audio event loop also ignores position ticks
+  delivered while a new track is still loading: such a tick carries the outgoing
+  track's end position and would otherwise re-anchor the new bar at the end of
+  the song. Together these make Discord restart the elapsed timer on a loop.
+* **ytmusic client / parsers** — `rift-ytmusic` is untouched in behaviour: the
+  same innertube requests and parsers. Robustness hardening only: an innertube
+  response body is bounded at 32 MiB (declared `Content-Length` early-reject plus
+  a streamed byte count) and reports `Error::ResponseTooLarge` beyond it, and a
+  403 with a non-JSON body now rotates the visitor id and retries once instead of
+  surfacing a parse error.
+* **`rift::fetch`** — still a public module (the `examples/probe.rs` smoke test
+  and the native probes keep working); it is now the thin native-only wrapper
+  over `rift_ytmusic::player` + `rift::stream`. The `sha256` module was removed
+  with the yt-dlp installer it served.
 
 ## 9. Known differences / documented losses
 
@@ -657,7 +700,7 @@ These are deliberate, not silent removals:
    construction.
 8. **ACL / permissions / capabilities / gen schemas** are deleted with the previous shell;
    `tests/acl_covers_commands.rs` and `tests/ipc_contract.rs` (which validated
-   the legacy IPC/ACL contract) are gone. The replacement guard is the 43-method
+   the legacy IPC/ACL contract) are gone. The replacement guard is the command
    mapping table above plus `cargo test -p rift`.
 
 ## 10. Verification
@@ -666,7 +709,7 @@ Run from the repository root:
 
 ```powershell
 cargo check -p rift                       # library builds
-cargo test -p rift                        # 179 unit tests, all green
+cargo test -p rift                        # all green
 cargo check -p rift --examples            # examples/probe.rs + examples/smoke.rs compile
 cargo clippy -p rift --all-targets        # clean
 cargo tree -p rift   # the tree has no desktop-shell or webview framework crates
@@ -677,16 +720,13 @@ The binary is `cargo run -p rift-desktop` (app crate).
 
 ### Live pipeline smoke test (no shell framework, no window, no backend construction)
 
-`cargo run -p rift --example smoke [-- search terms]` proves the full old
-streaming path still works from the library alone: YouTube Music search via
-`rift-ytmusic`, stream fetch through yt-dlp, and an in-memory rodio decode. It
-uses `RIFT_YTDLP` if set, else the app's installed
-`<data dir>/bin/yt-dlp[.exe]`, else auto-detection. Observed on 2026-10-18
-(Windows 11, network available):
+`cargo run -p rift --example smoke [-- search terms]` proves the full streaming
+path still works from the library alone: YouTube Music search via
+`rift-ytmusic`, native stream fetch, and an in-memory rodio decode. Observed on
+2026-10-18 (Windows 11, network available; predates the native migration — the
+smoke output is otherwise unchanged):
 
 ```text
-yt-dlp override: %APPDATA%\dev.jerimiah.rift\bin\yt-dlp.exe
-yt-dlp detected: found=true path=Some("...\yt-dlp.exe") version=Some("2026.08.19")
 search: "Get Lucky (feat. Pharrell Williams and Nile Rodgers)" by Daft Punk, Pharrell Williams, Nile Rodgers (4D7u5KF7SP8)
 fetch: 5979549 bytes (5839 KiB), reported duration 0s
 decode: ok, decoder duration Some(369.662947845s)
@@ -696,16 +736,34 @@ SMOKE PASS: search -> fetch -> decode
 That is the same search -> fetch -> decode pipeline the player uses, with no
 desktop-shell framework crate anywhere in the dependency graph.
 
+`cargo run -p rift --example native_probe [-- <video-id>…]` is the manual native
+matrix: it fetches a default sample of real tracks through the playback path
+(`fetch::fetch_bytes`), decodes each result with the playback decoder, and prints
+bytes/timing/decoded length; it requires every requested id to succeed and pins
+the unavailable-video error mapping with one known-invalid id. Run command and
+latest results are in `docs/native-streaming.md` §6/§4.1.
+
+`cargo run -p rift --example discord_replay_probe` is the manual Discord Rich
+Presence replay check: it plays a short real track ("Me at the zoo", ~19 s) with
+repeat-one enabled and lets it end and loop **naturally** — no seek, so the
+presence's progress bar is not put at an artificial position. With
+`RUST_LOG=rift=debug` the log must contain
+`same track restarted; clearing the Discord presence before re-posting` after
+the replay, and the Discord elapsed timer must restart near 0:00. It needs
+network, an audio device and a running Discord client; audio is muted for the
+probe. The `rift-discord` crate also has an ignored live test that exercises
+handshake/set/clear/refresh against the real Discord client:
+`RIFT_DISCORD_APP_ID=<application id> cargo test -p rift-discord -- --ignored`.
+
 ### Package / targets
 
-* package `rift`, version from the workspace (`0.5.0`), Rust floor 1.88.
+* package `rift`, version from the workspace (`0.6.0`), Rust floor 1.88.
 * `[lib] name = "rift"`, path `src/lib.rs`. No binary, no build script.
 * Public re-exports include `RiftBackend`, `BackendHandle`, `BackendConfig`,
   `BackendError`, `BackendEvent`, `BackendEvents`, `native_data_dir`,
   `APP_IDENTIFIER`, `DATA_DIR_ENV`, `DataDirError`, `MAX_CROSSFADE`,
-  `MAX_IMAGE_BYTES`, `VERSION`, `preview_mode()`, plus the `fetch` and `sha256`
-  modules.
-* Dependencies: `anyhow`, `directories`, `discord-rich-presence`, `rand`,
-  `reqwest`, `rfd`, `rift-types`, `rift-ytmusic`, `rodio`, `serde`,
-  `serde_json`, `souvlaki`, `tokio`, `tracing`. (`rfd` is target-split: native
-  backends on Windows/macOS, `xdg-portal` on Linux.)
+  `MAX_IMAGE_BYTES`, `VERSION`, `preview_mode()`, plus the `fetch` module.
+* Dependencies: `anyhow`, `directories`, `rand`, `reqwest`, `rfd`,
+  `rift-discord`, `rift-types`, `rift-ytmusic`, `rodio`, `serde`, `serde_json`,
+  `souvlaki`, `tokio`, `tracing`. (`rfd` is target-split: native backends on
+  Windows/macOS, `xdg-portal` on Linux.)

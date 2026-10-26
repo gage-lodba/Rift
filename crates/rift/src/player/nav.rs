@@ -201,12 +201,11 @@ pub(crate) fn toggle_playback(backend: &Arc<BackendInner>) {
                 Some(i) => Action::Replay(i),
                 None => Action::None,
             },
-            // Cancel an in-flight load: bump the generation so the pending
-            // fetch is discarded when it lands, and stop.
+            // Cancel an in-flight load: the same cancellation `stop` applies —
+            // bumping the generation is what makes the pending fetch discard
+            // itself when it lands.
             PlaybackState::Loading => {
-                core.generation += 1;
-                core.state = PlaybackState::Stopped;
-                core.position = 0.0;
+                cancel_playback(&mut core);
                 Action::Cancel
             }
         }
@@ -267,11 +266,22 @@ pub(crate) fn play_prev(backend: &Arc<BackendInner>) {
     }
 }
 
+/// Cancel playback, superseding anything still in flight: bump the generation
+/// so a download/decode request that lands later is discarded instead of
+/// starting the track the user just stopped, drop a prefetched crossfade pick,
+/// and reset the transport. Pure so the cancellation rule is testable.
+pub(crate) fn cancel_playback(core: &mut PlayerCore) {
+    core.generation += 1;
+    core.pending_next = None;
+    core.crossfade_armed_for = None;
+    core.state = PlaybackState::Stopped;
+    core.position = 0.0;
+}
+
 pub(crate) fn stop(backend: &Arc<BackendInner>) {
     {
         let mut core = backend.player.core.lock_safe();
-        core.state = PlaybackState::Stopped;
-        core.position = 0.0;
+        cancel_playback(&mut core);
     }
     let _ = backend.player.audio.send(AudioCmd::Stop);
     emit_state(backend, PlaybackState::Stopped);

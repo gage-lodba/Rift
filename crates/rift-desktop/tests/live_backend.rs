@@ -1,20 +1,18 @@
 //! Live end-to-end smoke through the controller → real `rift::RiftBackend`.
 //!
 //! These are **manual, `#[ignore]`-gated** tests: they construct the real backend
-//! (audio/media/Discord threads, Tokio runtime, shared HTTP client), use the
-//! real `YouTube` Music network and the machine's real `yt-dlp`. They are not part
-//! of the CI/default `cargo test -p rift-desktop` run; run them on demand:
+//! (audio/media/Discord threads, Tokio runtime, shared HTTP client) and use the
+//! real `YouTube` Music network. They are not part of the CI/default
+//! `cargo test -p rift-desktop` run; run them on demand:
 //!
 //! ```powershell
 //! cargo test -p rift-desktop --features backend --test live_backend -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! Safety: every test sets `RIFT_DATA_DIR` to a throwaway directory under
-//! `%TEMP%`, seeds it with a `settings.json` whose only field is a `yt_dlp_path`
-//! pointing at the known-working binary, and restores the environment + deletes
-//! the directory when done. The user's real `%APPDATA%\dev.jerimiah.rift` is
-//! never read or written (the backend's data-dir precedence is config →
-//! `RIFT_DATA_DIR` → platform dir).
+//! Safety: every test sets `RIFT_DATA_DIR` to an empty throwaway directory under
+//! `%TEMP%`, and restores the environment + deletes the directory when done. The
+//! user's real `%APPDATA%\dev.jerimiah.rift` is never read or written (the
+//! backend's data-dir precedence is config → `RIFT_DATA_DIR` → platform dir).
 //!
 //! The tests share a process-wide lock because `RIFT_DATA_DIR` is process-global,
 //! and they run on the test thread (never inside a Tokio runtime: the backend
@@ -43,76 +41,16 @@ const SEARCH_QUERY: &str = "daft punk get lucky";
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long any other async reply may take.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a reply that performs real network I/O may take.
+///
+/// The backend's shared HTTP client already allows 30 s for a request, so waiting
+/// exactly that long would race the client's own timeout on a slow connection;
+/// leave headroom instead of turning a slow network into a flaky failure.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
 // live harness: temp data dir + env guard + serialised backend lifetime
 // ---------------------------------------------------------------------------
-
-/// The known-working yt-dlp used to seed `settings.json`.
-///
-/// Resolution order: `RIFT_YTDLP`, then the one-click install target under
-/// `%APPDATA%\dev.jerimiah.rift\bin\yt-dlp.exe` (the path this machine has), then
-/// a bare `yt-dlp` on `PATH` (non-Windows fallback).
-fn seeded_ytdlp_path() -> PathBuf {
-    if let Some(configured) = std::env::var_os("RIFT_YTDLP") {
-        let path = PathBuf::from(configured);
-        if path.is_file() {
-            return path;
-        }
-    }
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let path = PathBuf::from(appdata)
-            .join("dev.jerimiah.rift")
-            .join("bin")
-            .join("yt-dlp.exe");
-        if path.is_file() {
-            return path;
-        }
-    }
-    if let Some(path) = which_ytdlp() {
-        return path;
-    }
-    panic!(
-        "live smoke needs a working yt-dlp: set RIFT_YTDLP, or install it at \
-         %APPDATA%\\dev.jerimiah.rift\\bin\\yt-dlp.exe"
-    );
-}
-
-#[cfg(windows)]
-fn which_ytdlp() -> Option<PathBuf> {
-    let output = std::process::Command::new("where.exe")
-        .arg("yt-dlp")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let first = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    let path = PathBuf::from(first);
-    path.is_file().then_some(path)
-}
-
-#[cfg(not(windows))]
-fn which_ytdlp() -> Option<PathBuf> {
-    let output = std::process::Command::new("which")
-        .arg("yt-dlp")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let first = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    let path = PathBuf::from(first);
-    path.is_file().then_some(path)
-}
 
 /// A unique temp directory, removed on drop.
 fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -143,19 +81,10 @@ impl Live {
         // The whole point is the real backend, not the dev preview mode.
         std::env::remove_var("RIFT_PREVIEW");
 
+        // A bare throwaway data directory: no settings seeding needed, the
+        // backend's defaults fill everything in.
         let data_dir = unique_temp_dir(tag);
         std::fs::create_dir_all(&data_dir).expect("create the throwaway data directory");
-
-        // Seed ONLY the yt-dlp path (the task's requirement); everything else
-        // takes backend defaults. serde's `#[serde(default)]` fills the rest.
-        let settings = serde_json::json!({
-            "yt_dlp_path": seeded_ytdlp_path().to_string_lossy(),
-        });
-        std::fs::write(
-            data_dir.join("settings.json"),
-            serde_json::to_string_pretty(&settings).expect("serialize settings"),
-        )
-        .expect("seed settings.json");
 
         std::env::set_var("RIFT_DATA_DIR", &data_dir);
         let controller = Controller::new(None).expect("live backend should construct");
@@ -209,6 +138,24 @@ impl Live {
             std::thread::sleep(Duration::from_millis(20));
         }
         seen
+    }
+
+    /// Shut the backend down but keep the throwaway data directory, so a test
+    /// can construct a second backend on the same store (the restart path).
+    fn shutdown_backend(&mut self) {
+        if let Some(mut controller) = self.controller.take() {
+            controller.shutdown();
+        }
+    }
+
+    /// Construct a fresh controller/backend on the same data directory after
+    /// [`shutdown_backend`](Self::shutdown_backend).
+    fn restart(&mut self) {
+        assert!(
+            self.controller.is_none(),
+            "restart needs shutdown_backend first"
+        );
+        self.controller = Some(Controller::new(None).expect("live backend should restart"));
     }
 
     /// Shut the backend down and measure how long it takes.
@@ -275,7 +222,6 @@ fn kind(event: &ControllerEvent) -> &'static str {
         ControllerEvent::ArtistSongs { .. } => "ArtistSongs",
         ControllerEvent::AlbumPage { .. } => "AlbumPage",
         ControllerEvent::UpdateStatus(_) => "UpdateStatus",
-        ControllerEvent::YtDlpStatus(_) => "YtDlpStatus",
         ControllerEvent::Cover(_) => "Cover",
         ControllerEvent::CoverFailed(_) => "CoverFailed",
         ControllerEvent::OpenArtist(_) => "OpenArtist",
@@ -565,7 +511,7 @@ fn live_cover_fetch_decode_and_dedupe() {
     live.controller().request_cover(cover_url.clone());
     let events = live
         .poll_until(
-            REPLY_TIMEOUT,
+            NETWORK_TIMEOUT,
             |event| matches!(event, ControllerEvent::Cover(image) if image.url == cover_url),
         )
         .expect("the cover should be fetched and decoded");
@@ -625,7 +571,7 @@ fn live_cover_fetch_decode_and_dedupe() {
         live.controller().request_cover(large_url.clone());
         let large_started = Instant::now();
         match live.poll_until(
-            REPLY_TIMEOUT,
+            NETWORK_TIMEOUT,
             |event| matches!(event, ControllerEvent::Cover(image) if image.url == large_url),
         ) {
             Ok(events) => {
@@ -683,9 +629,9 @@ fn live_cover_fetch_decode_and_dedupe() {
         .filter(|event| matches!(event, ControllerEvent::CoverFailed(url) if url == dead_url))
         .count();
     eprintln!("known-failed URL re-emitted CoverFailed {failures} time(s) with no new fetch");
-    assert!(
-        failures >= 1,
-        "a known-failed URL is reported immediately, not retried"
+    assert_eq!(
+        failures, 1,
+        "a known-failed URL is reported exactly once per request, not retried"
     );
 
     let shutdown = live.shutdown();
@@ -693,59 +639,21 @@ fn live_cover_fetch_decode_and_dedupe() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. update check + yt-dlp probe
+// 5. update check
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "live backend smoke: hits GitHub + runs yt-dlp; run with --ignored"]
-fn live_update_check_and_ytdlp_probe() {
-    let mut live = Live::start("probes");
+#[ignore = "live backend smoke: hits GitHub; run with --ignored"]
+fn live_update_check() {
+    let mut live = Live::start("update");
     live.controller().bootstrap().expect("bootstrap");
-
-    // The seeded yt-dlp path must be the one the backend finds.
-    let seeded = seeded_ytdlp_path();
-    live.controller().check_ytdlp();
-    let ytdlp_started = Instant::now();
-    let events = live
-        .poll_until(REPLY_TIMEOUT, |event| {
-            matches!(event, ControllerEvent::YtDlpStatus(_))
-        })
-        .expect("yt-dlp probe reply");
-    let status = events
-        .iter()
-        .find_map(|event| match event {
-            ControllerEvent::YtDlpStatus(status) => Some(status),
-            _ => None,
-        })
-        .expect("a YtDlpStatus event");
-    eprintln!(
-        "yt-dlp probe in {:?}: found={}, path={:?}, version={:?}",
-        ytdlp_started.elapsed(),
-        status.found,
-        status.path,
-        status.version
-    );
-    assert!(status.found, "seeded yt-dlp binary must be usable");
-    let found_path = PathBuf::from(status.path.as_deref().expect("yt-dlp path"));
-    assert_eq!(
-        found_path.canonicalize().ok(),
-        seeded.canonicalize().ok(),
-        "the backend found the seeded yt-dlp path"
-    );
-    assert!(
-        status
-            .version
-            .as_deref()
-            .is_some_and(|version| !version.is_empty()),
-        "yt-dlp reported a version"
-    );
 
     // Update check: current version always reported; network failure degrades to
     // "latest unknown" rather than hanging, so only require a status event.
     live.controller().check_update();
     let update_started = Instant::now();
     let events = live
-        .poll_until(REPLY_TIMEOUT, |event| {
+        .poll_until(NETWORK_TIMEOUT, |event| {
             matches!(event, ControllerEvent::UpdateStatus(_))
         })
         .expect("update-check reply");
@@ -771,4 +679,120 @@ fn live_update_check_and_ytdlp_probe() {
 
     let shutdown = live.shutdown();
     eprintln!("clean shutdown in {shutdown:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 7. native streaming end-to-end
+// ---------------------------------------------------------------------------
+
+/// One track through the whole native pipeline via the real controller/backend:
+/// native playback, a download whose per-track progress arrives as `Downloads`
+/// events, then a backend restart that discovers the offline copy and plays it
+/// again.
+///
+/// This is the automated equivalent of the interactive Phase 4 pass for a single
+/// track; the human pass still verifies what it sounds and looks like. It drives
+/// the shipping native downloader — there is no other streaming backend.
+#[test]
+#[ignore = "live backend smoke: real network + audio device; run with --ignored"]
+fn live_native_playback_download_progress_and_offline_restart() {
+    /// A stable, well-known upload used by the other live probes.
+    const ID: &str = "K0HSD_i2DvA";
+
+    let mut live = Live::start("native-streaming");
+    let track = Track {
+        id: ID.into(),
+        title: "Around the World".into(),
+        artist: "Daft Punk".into(),
+        album: None,
+        duration: Some(242),
+        cover: String::new(),
+        artists: Vec::new(),
+        album_id: None,
+    };
+
+    // 1. Playback through the real controller.
+    live.controller().dispatch(Action::PlayTrack(track.clone()));
+    let events = live
+        .poll_until(NETWORK_TIMEOUT, |event| {
+            matches!(
+                event,
+                ControllerEvent::PlaybackState(PlaybackState::Playing)
+            )
+        })
+        .expect("native playback should reach Playing");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ControllerEvent::Track(Some(t)) if t.id == track.id)),
+        "the playing track must surface before Playing: {:?}",
+        events.iter().map(kind).collect::<Vec<_>>()
+    );
+    live.poll_until(
+        NETWORK_TIMEOUT,
+        |event| matches!(event, ControllerEvent::Progress(p) if p.position > 0.5),
+    )
+    .expect("playback position should advance");
+
+    // 2. Download through the real controller; the in-flight progress map must
+    // reach the app state before the completed state does.
+    live.controller()
+        .dispatch(Action::DownloadTracks(vec![track.id.clone()]));
+    let mut saw_progress = false;
+    let mut max_permille = 0u16;
+    live.poll_until(NETWORK_TIMEOUT, |event| {
+        if let ControllerEvent::Downloads(state) = event {
+            if let Some(permille) = state.progress.get(&track.id) {
+                saw_progress = true;
+                max_permille = max_permille.max(*permille);
+            }
+            state.downloaded.contains(&track.id)
+        } else {
+            false
+        }
+    })
+    .expect("download should complete");
+    assert!(
+        saw_progress,
+        "a Downloads snapshot must carry the in-flight progress entry before the completed state"
+    );
+    assert!(
+        max_permille <= 1000,
+        "progress permille must stay clamped, saw {max_permille}"
+    );
+    let offline_file = live
+        .data_dir
+        .join("downloads")
+        .join(format!("{}.m4a", track.id));
+    let size = std::fs::metadata(&offline_file)
+        .expect("the offline audio file should exist")
+        .len();
+    assert!(
+        size > 100_000,
+        "offline file suspiciously small: {size} bytes"
+    );
+
+    // 3. Restart on the same store: the startup scan must rediscover the copy,
+    // and playing it must work again (fetch_track prefers the local file).
+    live.shutdown_backend();
+    live.restart();
+    let bootstrap = live
+        .controller()
+        .bootstrap()
+        .expect("bootstrap after restart");
+    assert!(
+        bootstrap.downloads.downloaded.contains(&track.id),
+        "restart must rediscover the offline copy"
+    );
+    live.controller().dispatch(Action::PlayTrack(track.clone()));
+    live.poll_until(NETWORK_TIMEOUT, |event| {
+        matches!(
+            event,
+            ControllerEvent::PlaybackState(PlaybackState::Playing)
+        )
+    })
+    .expect("offline playback should reach Playing");
+
+    let shutdown = live.shutdown();
+    eprintln!("native streaming e2e passed; shutdown in {shutdown:?}");
 }

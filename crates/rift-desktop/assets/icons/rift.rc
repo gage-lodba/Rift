@@ -1,0 +1,8 @@
+// Windows resource script for the executable file icon, compiled by
+// `../../build.rs` with the Windows SDK resource compiler (`rc.exe`).
+//
+// The path is relative to this file: this is the executable's file icon
+// (Explorer/Start menu/shortcuts/pinning), not the runtime window icon, which
+// `src/main.rs` loads from 128x128.png. Resource id 1 is the conventional id for
+// an application's main icon.
+1 ICON "icon.ico"

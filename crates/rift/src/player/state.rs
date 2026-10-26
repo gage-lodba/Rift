@@ -149,9 +149,29 @@ pub(crate) fn session_changed(last: &mut Option<QueueSnapshot>, snap: &QueueSnap
 }
 
 /// Load a queue snapshot persisted by a previous session, if any.
+///
+/// Best effort by design: the snapshot only restores a stopped queue, so an
+/// unreadable or corrupt file means a fresh start rather than an error. The
+/// failure is still logged — a silently discarded restored queue is not
+/// diagnosable from the field — and the file is left in place (unlike
+/// `library.json`/`settings.json`, nothing here is user data worth preserving).
 pub fn load_snapshot(path: &std::path::Path) -> Option<QueueSnapshot> {
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        // A missing file is the normal first-launch case, not worth a log line.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!("could not read {}: {e}", path.display());
+            return None;
+        }
+    };
+    match serde_json::from_str(&data) {
+        Ok(snapshot) => Some(snapshot),
+        Err(e) => {
+            warn!("could not parse {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Broadcast a playback-state change and mirror it to the OS media session and

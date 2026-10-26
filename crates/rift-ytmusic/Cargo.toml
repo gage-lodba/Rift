@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 # Never published to crates.io (the app ships as a binary); marking it private
 # also lets cargo-deny accept the unversioned path dependencies below (deny.toml).
 publish = false
@@ -13,13 +14,13 @@ description = "Clean-room YouTube Music innertube client for Rift"
 rift-types = { path = "../rift-types" }
 serde.workspace = true
 serde_json.workspace = true
-reqwest = { version = "0.13", features = ["json", "gzip", "brotli"] }
+reqwest = { workspace = true, features = ["json", "gzip", "brotli"] }
 regex = "1"
 thiserror = "2"
-tracing = "0.1.44"
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 
 [lints]
 workspace = true

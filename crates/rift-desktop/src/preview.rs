@@ -70,14 +70,47 @@ pub fn preview_state() -> crate::state::State {
         volume: 1.0,
         preview: true,
         // The reference screenshot (`Previews/image.png`) was captured after the
-        // sidebar had been drag-resized to 335 px. Interactive launches keep the
-        // 216 px default from the theme; the deterministic screenshot mode uses
-        // the width in the reference so comparisons are like-for-like.
+        // sidebar had been drag-resized to 335 px. Preview mode (both the
+        // interactive `--preview`/`RIFT_PREVIEW` window and `--screenshot`) starts
+        // from that reference width so captures are like-for-like; an interactive
+        // run can still drag-resize it, and a normal live launch uses the theme's
+        // 216 px default.
         sidebar_width: 335.0,
         ..crate::state::State::default()
     };
     state.search.query = String::new();
+    seed_preview_downloads(&mut state);
     state
+}
+
+/// Dev-only capture aid for the native-streaming download-progress UI.
+///
+/// `RIFT_PREVIEW_DOWNLOAD=<permille>` (0..=1000) marks two preview tracks as
+/// in-flight so an offscreen screenshot can show both determinate and
+/// indeterminate download states without any backend or network:
+///
+/// * `preview-2` — actively transferring, with the requested permille → spinner
+///   plus the determinate bar under the row;
+/// * `preview-3` — claimed/queued behind it, no fraction → spinner only.
+///
+/// Unset, empty, or unparseable values leave preview state untouched, so every
+/// existing reference screenshot is unchanged. This is compiled only in
+/// development/preview builds (this module is `cfg`-gated in `lib.rs`).
+fn seed_preview_downloads(state: &mut crate::state::State) {
+    let Some(permille) = std::env::var("RIFT_PREVIEW_DOWNLOAD")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .map(|value| value.min(1000))
+    else {
+        return;
+    };
+    for id in ["preview-2", "preview-3"] {
+        state.downloads.downloading.insert(id.to_owned());
+    }
+    state
+        .downloads
+        .progress
+        .insert("preview-2".to_owned(), permille);
 }
 
 /// A synthetic artist page for previewing the artist view without network.

@@ -1,8 +1,8 @@
 name: Release
 
 # Build native (`cargo build --release`) binaries and attach them to a GitHub
-# Release when a version tag is pushed (e.g. `git tag v0.5.0 && git push origin
-# v0.5.0`).
+# Release when a version tag is pushed (e.g. `git tag v0.6.0 && git push origin
+# v0.6.0`).
 #
 # Packaging/installers are out of scope: the assets are plain executables, one
 # per platform. (The old shell's bundler is gone, so there is nothing to bundle.)
@@ -64,7 +64,7 @@ jobs:
       # The tag names the artifacts and is what `check_update` compares against
       # the running version, so a tag that disagrees with the workspace version
       # both mislabels every asset and makes the app report a phantom update
-      # forever (it would see `v1.0.0` while running 0.5.0, and never reach it).
+      # forever (it would see `v1.0.0` while running 0.6.0, and never reach it).
       # `app` and `backend` inherit `version.workspace = true`, so Cargo.toml is
       # the single source of the version.
       - name: Verify the tag matches the workspace version
@@ -151,6 +151,17 @@ jobs:
           mkdir -p release-assets
           cp "${{ matrix.binary }}" "release-assets/${{ matrix.asset }}"
 
+      # CI checks the icon on its own release-profile build, but this workflow
+      # uploads a *separately built* binary — check the exact artifact that is
+      # about to be published, not just a same-commit sibling. The failure mode
+      # is silent otherwise: Explorer/Start menu/shortcuts read the icon from the
+      # PE resource without starting the app, so a missing resource only shows up
+      # as Windows' generic application icon after release.
+      - name: Executable carries the Windows app icon resource
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/check-windows-icon.ps1 -Path "release-assets/${{ matrix.asset }}"
+
       # The release assets are built with the default features, so preview mode
       # and its placeholder data must not be present. A shipped executable that
       # accepts the development-only flag would mean the feature leaked into the
@@ -196,7 +207,7 @@ jobs:
             draft="true"
           fi
 
-          notes="Rift ${release_tag} — native Vulkan build. Download the executable for your platform from the assets below. Rift needs an up-to-date Vulkan-capable GPU driver and yt-dlp (https://github.com/yt-dlp/yt-dlp). Installers/packaging are out of scope for this conversion: run the binary directly."
+          notes="Rift ${release_tag} — native Vulkan build. Download the executable for your platform from the assets below. Rift needs an up-to-date Vulkan-capable GPU driver; audio is resolved and streamed natively (no external downloader). Installers/packaging are out of scope for this conversion: run the binary directly."
 
           # A manual run must never modify a published release (that path exists
           # only to test the build). It creates or updates a draft instead.

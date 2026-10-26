@@ -48,6 +48,12 @@ impl std::error::Error for DataDirError {}
 /// The application's data directory, honouring `RIFT_DATA_DIR`.
 ///
 /// Nothing is created here; callers create it (the backend constructor does).
+///
+/// # Errors
+///
+/// Returns [`DataDirError`] when neither the `RIFT_DATA_DIR` override nor a
+/// platform data directory can be determined (a stripped service/sandbox
+/// environment). The message names the environment variable the user can set.
 pub fn native_data_dir() -> Result<PathBuf, DataDirError> {
     // The override does not need the platform base directory at all, so check it
     // before paying for (or failing on) the known-folder lookup.

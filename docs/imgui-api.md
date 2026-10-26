@@ -154,7 +154,6 @@ scroll offsets, text cursors, menus) is keyed by them.
 
 ```rust
 Id::from_str("titlebar/search")     // stable, readable
-ui.id("sidebar")                    // shorthand for Id::from_str
 parent.with(&playlist.name)         // per-data child id (any Hash key)
 parent.child(index as u64)          // per-row child id
 ```
@@ -163,8 +162,10 @@ Convention: screens prefix ids with the screen (`"home/…"`, `"queue/…"`) and
 derive row ids from the row's stable data (track id / playlist id / index).
 Widgets called as `ui.button(rect, label, kind)` build their own id from the
 label + quantised rect, so a list row's buttons are already distinct (rows sit at
-different y). Use the `*_with_id` variants when the label/position can change
-(e.g. a play/pause toggle).
+different y). Use the `*_with_id` variants when the label itself can change
+without the widget being a different control. The stateful widgets
+(`play_button`, `switch`) already derive an id that does **not** depend on their
+on/off state, so toggling them keeps keyboard focus.
 
 ## Layout
 
@@ -573,7 +574,7 @@ card gap/min-width, track row height (=54 incl. padding), etc.
 `ui.theme_mut()` exists for previews/settings; don't mutate it from screens.
 
 Widget-internal colors not in `Theme` (scrollbar `#2a2a30`/`#3a3a42`,
-`.ytdlp-badge` success/warning/danger, slider track `#d7d7dc`) are exported from
+success/warning/danger status tones, slider track `#d7d7dc`) are exported from
 `ui` as constants (`ui::SUCCESS`, `ui::DANGER_TEXT`, `ui::SLIDER_TRACK`, …) if a
 screen needs to match them.
 

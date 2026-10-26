@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 # Never published to crates.io (the app ships as a binary); marking it private
 # also lets cargo-deny accept the unversioned path dependencies elsewhere (deny.toml).
 publish = false
+description = "Shared data models for Rift (tracks, library, queue, playback state)"
 
 [dependencies]
 serde.workspace = true

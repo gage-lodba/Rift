@@ -25,7 +25,7 @@ use rift_types::{AlbumSummary, ArtistSummary};
 use crate::screens::{album, artist, cards, layout, liked, playlist, search, settings, track_list};
 use crate::state::{Action, State, View};
 use crate::text::Weight;
-use crate::ui::{Align, Color, Id, Rect, Response, Sense, Ui, VAlign, SCROLLBAR_WIDTH};
+use crate::ui::{Color, Id, Rect, Response, Sense, Ui, SCROLLBAR_WIDTH};
 
 /// `.empty { padding: 48px 0; font-size: 13px }` line box 17 → 113 px.
 pub const EMPTY_H: f32 = 48.0 * 2.0 + 17.0;
@@ -155,7 +155,7 @@ pub fn view_head_action(
     let style = cards::style(13.0, Weight::SemiBold, theme.text_dim);
     let action_w = ui.text_width(action_label, &style) + 12.0;
     let rect = Rect::new(x + w - action_w, y + 2.0, action_w, H2_LINE - 4.0);
-    let mut resp = ui.interact(
+    let resp = ui.interact(
         rect,
         Id::from_str("view-head-action").with(title),
         Sense::CLICK,
@@ -179,7 +179,6 @@ pub fn view_head_action(
     if resp.focus_visible {
         ui.focus_ring(rect, 4.0);
     }
-    resp.clicked |= ui.keyboard_activated() && resp.focused;
     (y + H2_LINE + VIEW_HEAD_MARGIN_BOTTOM, resp)
 }
 
@@ -238,24 +237,30 @@ pub const SECTION_H: f32 = H2_MARGIN_TOP + H2_LINE + H2_MARGIN_BOTTOM;
 /// gap, `.card-grid` bottom margin excluded so callers can decide).
 pub fn grid_height(ui: &Ui, width: f32, n: usize) -> f32 {
     let theme = ui.theme();
-    let (_cols, card_w) = cards::grid_metrics(width, theme.card_min_width, theme.card_gap);
+    let (cols, card_w) = cards::grid_metrics(width, theme.card_min_width, theme.card_gap);
     let cover = (card_w - cards::CARD_PADDING * 2.0).max(1.0);
     let card_h = cards::card_height(cover);
-    let cols = cards::grid_metrics(width, theme.card_min_width, theme.card_gap)
-        .0
-        .max(1);
-    let rows = n.div_ceil(cols);
+    let rows = n.div_ceil(cols.max(1));
     if rows == 0 {
         return 0.0;
     }
-    rows as f32 * card_h + (rows.saturating_sub(1)) as f32 * theme.card_gap
+    rows as f32 * card_h + rows.saturating_sub(1) as f32 * theme.card_gap
 }
 
 /// `"Album • 2024"` card subtitle (`.card-sub`).
 pub fn album_subtitle(album: &AlbumSummary) -> String {
-    match album.year {
-        Some(year) => format!("{} • {year}", album.album_type),
-        None => album.album_type.clone(),
+    let mut out = String::new();
+    write_album_subtitle(&mut out, album);
+    out
+}
+
+/// Write [`album_subtitle`] into an existing buffer (grids reuse one buffer for
+/// all cards instead of allocating a `String` per card per frame).
+fn write_album_subtitle(out: &mut String, album: &AlbumSummary) {
+    out.clear();
+    out.push_str(&album.album_type);
+    if let Some(year) = album.year {
+        let _ = std::fmt::write(out, format_args!(" • {year}"));
     }
 }
 
@@ -289,6 +294,7 @@ pub fn album_grid(
     let (cols, card_w) = cards::grid_metrics(w, theme.card_min_width, theme.card_gap);
     let cover = (card_w - cards::CARD_PADDING * 2.0).max(1.0);
     let card_h = cards::card_height(cover);
+    let mut sub = String::with_capacity(24);
     for (i, album) in albums.iter().enumerate() {
         let row = i / cols.max(1);
         let col = i % cols.max(1);
@@ -298,6 +304,7 @@ pub fn album_grid(
             card_w,
             card_h,
         );
+        write_album_subtitle(&mut sub, album);
         let resp = cards::card(
             ui,
             state,
@@ -305,7 +312,7 @@ pub fn album_grid(
             Id::from_str("album-card").with(&album.id),
             &album.cover,
             &album.name,
-            &album_subtitle(album),
+            &sub,
             false,
         );
         if resp.clicked {
@@ -380,7 +387,7 @@ pub fn tab(
     );
     let w = ui.text_width(label, &style) + 32.0 + 2.0;
     let rect = Rect::new(x, y, w, TAB_H);
-    let mut resp = ui.interact(rect, Id::from_str("tab").with(id_key), Sense::CLICK);
+    let resp = ui.interact(rect, Id::from_str("tab").with(id_key), Sense::CLICK);
     let (bg, border, fg) = if active {
         (theme.accent, theme.accent, Color::WHITE)
     } else {
@@ -388,7 +395,7 @@ pub fn tab(
         (
             theme.bg_raised,
             theme.border,
-            mix_color(theme.text_dim, theme.text, t),
+            cards::mix(theme.text_dim, theme.text, t),
         )
     };
     ui.bordered_rect(rect, bg, 999.0, 1.0, border);
@@ -396,12 +403,7 @@ pub fn tab(
     if resp.focus_visible {
         ui.focus_ring(rect, 999.0);
     }
-    resp.clicked |= ui.keyboard_activated() && resp.focused;
     (w, resp)
-}
-
-fn mix_color(a: Color, b: Color, t: f32) -> Color {
-    cards::mix(a, b, t)
 }
 
 /// Align helper for the metadata blocks of `page-head` (the old CSS uses
@@ -415,14 +417,14 @@ pub fn centered_meta_y(head_top: f32, head_h: f32, meta_h: f32) -> f32 {
 pub fn artist_avatar(ui: &mut Ui, state: &mut State, x: f32, y: f32, url: &str) {
     let rect = Rect::new(x, y, ARTIST_AVATAR, ARTIST_AVATAR);
     let texture = state.request_cover(url);
-    cards::cover_tile(ui, state, rect, texture, ARTIST_AVATAR * 0.5);
+    cards::cover_tile(ui, rect, texture, ARTIST_AVATAR * 0.5);
 }
 
 /// Draw album art (170 px, radius 8) with the fallback tile.
 pub fn album_art(ui: &mut Ui, state: &mut State, x: f32, y: f32, url: &str) {
     let rect = Rect::new(x, y, ALBUM_ART, ALBUM_ART);
     let texture = state.request_cover(url);
-    cards::cover_tile(ui, state, rect, texture, 8.0);
+    cards::cover_tile(ui, rect, texture, 8.0);
 }
 
 /// A collection-meta + head-actions block height (what [`track_list::head_actions`]
@@ -471,11 +473,6 @@ pub fn collection_head(
 
 /// Height of the [`collection_head`] block (meta line + action row).
 pub const COLLECTION_HEAD_H: f32 = track_list::COLLECTION_META_H + track_list::HEAD_ACTIONS_H;
-
-/// Unused helper kept so VAlign/Align imports are exercised (page heads).
-pub fn align_center(rect: Rect, size: crate::ui::Size) -> Rect {
-    rect.align(size, Align::Center, VAlign::Center)
-}
 
 #[cfg(test)]
 mod tests {

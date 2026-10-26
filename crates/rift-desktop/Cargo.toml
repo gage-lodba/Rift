@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 # Never published to crates.io (the app ships as a binary); marking it private
 # also lets cargo-deny accept the unversioned path dependencies below (deny.toml).
 publish = false
@@ -38,7 +39,7 @@ backend = ["dep:rift"]
 preview = []
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = { workspace = true }
 arboard = "3"
 bytemuck = { version = "1", features = ["derive"] }
 fontdue = "0.9"
@@ -46,16 +47,30 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 pollster = "1.0"
 raw-window-handle = "0.6"
 rift-types = { path = "../rift-types" }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 vulkano = { version = "0.35.2", default-features = false, features = ["macros"] }
 winit = "0.30"
 # The backend bridge (enabled by default; see the `backend` feature above).
 rift = { path = "../rift", optional = true }
 
 [dev-dependencies]
+
+# Windows-only, host-gated build dependency for `build.rs`: it runs the Windows
+# SDK resource compiler (`rc.exe`) to embed `assets/icons/rift.rc` — the *file*
+# icon Explorer, the Start menu and shortcuts read — into `rift-music.exe`.
+# Target-specific build dependencies are selected by the *host* platform (a build
+# script always runs on the host), so this table is only active when the build is
+# started on Windows: the resource compiler does not exist anywhere else, and
+# other hosts must not try to run it. A Windows host cross-compiling to
+# Linux/macOS still compiles this dependency (verified with
+# `cargo build --unit-graph`), but `build.rs` checks the real target
+# (`CARGO_CFG_TARGET_OS`) and returns before `rc.exe` runs; only native Windows
+# builds embed the resource, and those are the builds CI/release gate.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
 
 [lints]
 workspace = true

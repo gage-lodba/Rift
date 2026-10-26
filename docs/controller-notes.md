@@ -28,7 +28,7 @@ both configurations (§14).
 * `navigate_view(&View)` — page-load request bookkeeping (§6).
 * `cancel_search()` — clear-box invalidation (§6).
 * `request_cover(url)` — cover-art fetch/decode/dedupe pipeline (§7).
-* `check_update()` / `check_ytdlp()` — Settings buttons.
+* `check_update()` — Settings button.
 * `shutdown()` — drop the event bus, then `RiftBackend::shutdown()` (stops
   audio/media/Discord threads and the runtime).
 
@@ -54,8 +54,8 @@ without a live backend, a window or a network:
 
 Already true today (unchanged public surface): `Controller::new_preview()`,
 `Controller::new(Option<isize>)`, `is_live()`, `bootstrap()`, `poll()`,
-`dispatch(Action)`, `request_cover(String)`, `check_update()`, `check_ytdlp()`,
-`shutdown()`. `app.tick()` keeps doing:
+`dispatch(Action)`, `request_cover(String)`, `check_update()`, `shutdown()`.
+`app.tick()` keeps doing:
 
 ```rust
 for event in self.controller.poll() { self.apply_controller_event(event); }
@@ -100,7 +100,7 @@ they arrive; an Action is translated exactly once.
 | Where | What |
 |---|---|
 | UI thread | `Controller::new` (backend construction), `bootstrap()`, `poll()`, `dispatch()` sync commands, `navigate_view`, `request_cover` de-dupe bookkeeping, `shutdown()` |
-| Backend runtime (`rift-backend`, owned by `RiftBackend`) | every `async` command future: `play_tracks`, `play_track`, `search*`, `get_artist*`, `get_album`, `import_yt_playlist`, `check_update`, `check_ytdlp`, `set_yt_dlp_path`, `download_ytdlp`, `fetch_image` (cover fetch), `is_online` (reachability probe) |
+| Backend runtime (`rift-backend`, owned by `RiftBackend`) | every `async` command future: `play_tracks`, `play_track`, `search*`, `get_artist*`, `get_album`, `import_yt_playlist`, `check_update`, `fetch_image` (cover fetch), `is_online` (reachability probe) |
 | Backend blocking pool | cover-art decode + downscale (`spawn_blocking`), and the backend's own `rfd` dialogs / file IO |
 | Backend threads | audio (`rift-audio`), media keys (`rift-media`), Discord (`rift-discord`), playback-snapshot persistence (`rift-persist`), durable `library.json`/`settings.json` writes (`rift-durable`) |
 
@@ -139,7 +139,7 @@ commands moved to winit). The table is exhaustive for `Action`:
 | `ToggleShuffle` | `toggle_shuffle()` | sync | backend emits `Queue` |
 | `CycleRepeat` | `cycle_repeat()` | sync | backend emits `Queue`; `app.rs` already optimistically cycles `state.queue.repeat` |
 | `SetDiscordRpc(bool)` | `set_discord_rpc(enabled)` | sync | persists |
-| `SetCrossfade(f32)` | `set_crossfade(secs)` | sync | backend clamps to `0..=MAX_CROSSFADE` |
+| `SetCrossfade(f32)` | `set_crossfade(secs)` | sync | backend clamps to `0..=MAX_CROSSFADE`, non-finite disables crossfade |
 | `SetUpdateNotifications(bool)` | `set_update_notifications(enabled)` | sync | persists |
 
 ### 4.2 Queue
@@ -178,14 +178,11 @@ commands moved to winit). The table is exhaustive for `Action`:
 | `DownloadTracks(Vec<String>)` | `download_tracks(tracks)` | ids resolved via `TrackCache` (backend stores full metadata with the offline copy); unknown ids are reported with an `Error` toast, never silently skipped |
 | `RemoveDownloads(Vec<String>)` | `remove_downloads(ids)` | the old UI's "kept offline playlist" guard lives in the screens (`State::pinned_ids`); unchanged |
 
-### 4.5 Settings / updates / yt-dlp / misc
+### 4.5 Settings / updates / misc
 
 | `Action` | Backend call | Kind | Notes |
 |---|---|---|---|
 | `CheckUpdate` | `check_update()` | async → `TaskResult::CheckUpdate` → `ControllerEvent::UpdateStatus` | launch check also runs from `bootstrap()` when notifications are enabled |
-| `CheckYtDlp` | `check_ytdlp()` | async → `YtDlpStatus` | |
-| `SetYtDlpPath(Option<String>)` | `set_yt_dlp_path(path)` | async → `YtDlpStatus` or `Error` | invalid path keeps the stored value and its rejection message is toasted |
-| `DownloadYtDlp` | `download_ytdlp()` | async → `YtDlpStatus` | backend toasts failure itself, so the controller forwards success only (no duplicate toast) |
 | `OpenUrl(url)` | `open_url(url)` | sync, fallible | http(s)-only; refusal → `Error` |
 | `RetryPage` | last page request re-issued (`get_artist` / `get_artist_songs` / `get_album`) | async | no-op when no page was ever requested |
 | `OpenCurrentArtist` | — (derived) | local | resolves the current track's first linkable artist from the `Track` mirror → `ControllerEvent::OpenArtist(id)`; app clears + navigates |
@@ -265,7 +262,8 @@ open, not with the songs search). Flags reset on every new search/cancel.
    `image` crate (PNG/JPEG) and downscales the longest edge to
    `MAX_COVER_DIMENSION = 256` with Lanczos3, preserving aspect ratio and never
    upscaling, then converts to tightly packed RGBA8. A 256×256 cover is 256 KiB;
-   the player-bar cover is the largest drawn size in the design.
+   the album-page cover (170×170 in ui-spec §7) is the largest drawn size in the
+   design.
 4. **Reply** — one `TaskResult::Cover { url, result }`; `poll()` records
    success/failure in the tracker and emits `ControllerEvent::Cover(CoverImage)`
    or `ControllerEvent::CoverFailed(url)`. `app.rs` allocates the texture id and
@@ -367,7 +365,7 @@ toast-and-stay-put behaviour.
 
 Async command completions become: `SearchResults`, `SearchArtists`,
 `SearchAlbums`, `ArtistPage`, `ArtistSongs`, `AlbumPage`, `UpdateStatus`,
-`YtDlpStatus`, `Cover`/`CoverFailed`, `OpenPlaylist`+`Notice` (YT import),
+`Cover`/`CoverFailed`, `OpenPlaylist`+`Notice` (YT import),
 `Error` (failed playback/search/page/import/path validation), `Online`.
 
 ## 10. Online status
@@ -438,7 +436,7 @@ Feature-independent (no live backend, no network, no window):
 | `dispatch_maps_playback_and_queue_commands` | play_tracks/play_track/queue add/next/move/remove/jump/clear |
 | `dispatch_maps_library_and_playlist_commands` | like (Track + id), create/rename/delete/move (index→id)/add/remove/export/import file + URL trim |
 | `an_unknown_toggle_like_id_reports_an_error_instead_of_guessing` | id miss → Error, no backend call |
-| `dispatch_maps_settings_update_and_ytdlp_commands` | discord/crossfade/update notifications/check/yt-dlp path+download/open_url |
+| `dispatch_maps_settings_update_commands` | discord/crossfade/update notifications/check/open_url |
 | `dispatch_maps_downloads_and_resolves_ids_through_the_track_cache` | id→Track resolution for downloads |
 | `dispatch_keeps_ui_local_actions_off_the_backend` | navigation/window/toast/online/dev actions never reach the backend |
 | `fallible_commands_surface_their_error_on_the_next_poll` | `open_url` refusal → `Error` |
@@ -507,11 +505,10 @@ resulting app state, paint list and controller commands:
    `QueueJump(1)`, trash → `QueueClear`.
 7. `window_controls_emit_window_commands` — minimize/maximize/close glyphs →
    the three `WindowCommand`s; dragging empty titlebar → `WindowCommand::Drag`.
-8. `settings_toggles_sliders_and_probes_map_to_commands` — Discord switch →
+8. `settings_toggles_and_sliders_map_to_commands` — Discord switch →
    `SetDiscordRpc(false)`, crossfade switch → `SetCrossfade(6.0)`, dragging the
-   crossfade slider (row grows when enabled) → `SetCrossfade(>6)`, "Check again"
-   → `CheckYtDlp`; also asserts screen coordinates come from
-   `settings::row_heights` + the row formulas.
+   crossfade slider (row grows when enabled) → `SetCrossfade(>6)`; also asserts
+   screen coordinates come from `settings::row_heights` + the row formulas.
 9. `context_menu_opens_closes_and_dispatches_an_action` — hover a playlist card
    and click its kebab → menu open; Escape closes with no command; re-open and
    click "Rename" → `BeginRenamePlaylist` reaches app state.
@@ -567,23 +564,20 @@ emitted, focus stealing), which is why this suite exists.
 
 Proves the **real** controller ↔ `rift::RiftBackend` bridge on this machine: real
 backend construction (audio/media/Discord threads, Tokio runtime, shared HTTP
-client), the real event bus, real YouTube Music network calls, the real yt-dlp
-binary and the real cover pipeline. They are `#[ignore]`d because they need
-network + yt-dlp (not CI), and they are run manually:
+client), the real event bus, real YouTube Music network calls and the real cover
+pipeline. They are `#[ignore]`d because they need network + an audio device (not
+CI), and they are run manually:
 
 ```powershell
 # current tree: default features already include `backend`, so the flag is
 # redundant (but accepted). `--test-threads=1` is unnecessary: the tests
 # serialise themselves on the process-global RIFT_DATA_DIR.
 cargo test -p rift-desktop --test live_backend -- --ignored --nocapture
-#   test result: ok. 5 passed; 0 failed; finished in 6.21 s
 ```
 
 ### Safety (the user's real data is never touched)
 
-Each test sets `RIFT_DATA_DIR` to a unique throwaway directory under `%TEMP%`,
-seeds it with a `settings.json` whose only field is
-`"yt_dlp_path": "C:\\Users\\<user>\\AppData\\Roaming\\dev.jerimiah.rift\\bin\\yt-dlp.exe"`
+Each test sets `RIFT_DATA_DIR` to an empty throwaway directory under `%TEMP%`
 (the backend's data-dir precedence is config → `RIFT_DATA_DIR` → platform dir, so
 the real `%APPDATA%\dev.jerimiah.rift` is never read or written), removes
 `RIFT_PREVIEW`, and on `Drop` shuts the backend down, restores the previous env
@@ -591,10 +585,10 @@ vars and deletes the directory. Verified: **0** `rift-live-smoke-*` directories
 left in `%TEMP%` after the run, and the real data dir's file mtimes predate the
 run (untouched).
 
-### The five flows
+### The six flows
 
 1. `live_bootstrap_event_pump_and_clean_shutdown` — `Controller::new(None)` with
-   the seeded temp dir is live; `bootstrap()` is sane (empty library, `Stopped`,
+   the empty temp dir is live; `bootstrap()` is sane (empty library, `Stopped`,
    finite volume in `0..=1`, `preview == false`); a backend-local
    `Action::ToggleLike` produces a `Library` broadcast through the **real** event
    bus; an idle 300 ms of `poll()` returns promptly (no replay `Progress` is
@@ -613,7 +607,11 @@ run (untouched).
    real 544×544 variant of the thumbnail is fetched and decoded to **256×256**
    (downscale evidence); a dead URL yields `CoverFailed` and a second request
    re-emits it from the known-failed tracker without a new fetch.
-5. `live_update_check_and_ytdlp_probe` — `check_ytdlp()` reports
-   `found=true` with the seeded path and version; `check_update()` reports the
-   running version (and degrades to "latest unknown" rather than hanging if
-   GitHub is unreachable).
+5. `live_update_check` — `check_update()` reports the running version (and
+   degrades to "latest unknown" rather than hanging if GitHub is unreachable).
+6. `live_native_playback_download_progress_and_offline_restart` — one track
+   through the whole native pipeline: playback reaches `Playing` and the position
+   advances; `Action::DownloadTracks` produces `Downloads` snapshots whose
+   `progress` permille map carries the in-flight entry before completion, and the
+   offline `.m4a` exists; a backend restart on the same store rediscovers the
+   offline copy and plays it again.

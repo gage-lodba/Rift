@@ -79,6 +79,8 @@ impl Ui {
         self.open_popup == Some(id)
     }
 
+    /// Open `id` as the one popup drawn this frame, remembering the currently
+    /// focused widget so [`Ui::close_popup`] can hand focus back to it.
     pub fn open_popup(&mut self, id: Id) {
         if self.open_popup != Some(id) {
             // Remember the trigger so Escape can hand focus back to it.
@@ -88,6 +90,8 @@ impl Ui {
         self.popup_needs_initial_focus = true;
     }
 
+    /// Close the open popup, returning keyboard focus to the widget that had it
+    /// when the popup was opened (unless another widget took focus this frame).
     pub fn close_popup(&mut self) {
         if self.open_popup.is_none() {
             return;
@@ -103,11 +107,17 @@ impl Ui {
         }
     }
 
+    /// Toggle `id`: close it if it is the open popup, otherwise open it.
+    ///
+    /// Opening goes through [`Ui::open_popup`] (not just assigning
+    /// `open_popup`) so a menu opened without the explicit `open_popup` call
+    /// still gets the documented keyboard contract: its first row takes focus
+    /// and Escape returns focus to the trigger.
     pub fn toggle_popup(&mut self, id: Id) {
         if self.open_popup == Some(id) {
-            self.open_popup = None;
+            self.close_popup();
         } else {
-            self.open_popup = Some(id);
+            self.open_popup(id);
         }
     }
 

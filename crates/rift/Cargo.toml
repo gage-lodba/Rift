@@ -20,11 +20,11 @@ name = "rift"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = { workspace = true }
 directories = "6"
-discord-rich-presence = "1.1.0"
 rand = "0.10.1"
-reqwest = "0.13"
+reqwest = { workspace = true }
+rift-discord = { path = "../rift-discord" }
 rift-types = { path = "../rift-types" }
 rift-ytmusic = { path = "../rift-ytmusic" }
 rodio = "0.23.0"
@@ -35,8 +35,8 @@ serde_json.workspace = true
 # (no libdbus); the dbus/zbus deps are Linux-gated inside souvlaki, so this is
 # harmless on Windows/macOS.
 souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "time"] }
-tracing = "0.1.44"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
+tracing = { workspace = true }
 
 # Native file dialogs for playlist import/export. `rfd` replaces the old
 # shell's dialog plugin. Dialogs are only opened on the backend's blocking pool
@@ -57,7 +57,7 @@ rfd = { version = "0.16", default-features = false }
 [dev-dependencies]
 # Used by `examples/probe.rs` to show the fetch pipeline's log output; the app
 # crate owns the real subscriber.
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [lints]
 workspace = true

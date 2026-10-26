@@ -12,7 +12,7 @@ use rodio::stream::DeviceSinkBuilder;
 use rodio::{Decoder, Player, Source};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub enum AudioCmd {
     /// Decode and play a full in-memory audio file, replacing whatever plays.
@@ -72,6 +72,29 @@ pub enum AudioEvent {
     Failed(String),
 }
 
+/// `instant - duration`, falling back to `instant` when the instant is too close
+/// to its epoch to subtract.
+///
+/// An `Instant` is a monotonic count since boot (QPC on Windows, CLOCK_MONOTONIC
+/// elsewhere), so `Instant::now() - 1s` panics on a machine that started Rift
+/// within a second of booting. The tick clock just needs to be "one interval in
+/// the past" — if that predates the epoch, "now" is the safe answer.
+fn checked_earlier(instant: Instant, duration: Duration) -> Instant {
+    instant.checked_sub(duration).unwrap_or(instant)
+}
+
+/// Convert a seek target in seconds into a `Duration` the player can seek to.
+///
+/// `Duration::from_secs_f64` panics on NaN, infinities and out-of-range values,
+/// and this conversion runs on the audio thread, which has no supervisor: one
+/// absurd target would silence playback (and drop the output device) for the
+/// rest of the session. `None` means "not a position" and the seek is skipped.
+fn seek_target(secs: f64) -> Option<Duration> {
+    // `f64::max` ignores NaN, so a NaN target becomes a seek to the start, which
+    // is the same treatment the player's own clamp gives a negative position.
+    Duration::try_from_secs_f64(secs.max(0.0)).ok()
+}
+
 /// Spawn the audio thread, returning the command sender.
 ///
 /// A failure to spawn the thread is logged rather than panicking: the backend
@@ -90,6 +113,7 @@ pub fn spawn(events: UnboundedSender<AudioEvent>) -> Sender<AudioCmd> {
 }
 
 fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
+    let opened = std::time::Instant::now();
     let device = match DeviceSinkBuilder::open_default_sink() {
         Ok(d) => d,
         Err(e) => {
@@ -99,7 +123,10 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
         }
     };
     let mut player = Player::connect_new(device.mixer());
-    info!("audio thread started");
+    info!(
+        "audio thread started (+{:.1} ms opening the default device)",
+        opened.elapsed().as_secs_f64() * 1000.0
+    );
 
     // True while a track is loaded and we should watch for it ending.
     let mut active = false;
@@ -109,7 +136,10 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
     let mut fading: Vec<FadeOut> = Vec::new();
     // Paces position ticks at ~4 Hz: a crossfade tightens the loop to 30 ms
     // for smooth volume ramps, but the UI doesn't need 33 progress events/s.
-    let mut last_position = Instant::now() - Duration::from_secs(1);
+    // Seeded one interval back so the first tick is not delayed; the fallback in
+    // `checked_earlier` is what keeps a machine that booted moments ago from
+    // panicking here.
+    let mut last_position = checked_earlier(Instant::now(), Duration::from_secs(1));
 
     loop {
         // Tick fast enough for smooth fades while one is in progress; idle
@@ -141,6 +171,14 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                             player.set_volume(volume);
                             player.play();
                             active = true;
+                            // Restart the position-tick clock with the new audio.
+                            // Without this, the loop's end-of-iteration tick can
+                            // fire immediately (the clock is still armed from the
+                            // outgoing track) and report the new player's position
+                            // before it has actually started — which arrives as a
+                            // stale end-of-previous-track position and can re-anchor
+                            // Discord's time bar at the end of the song.
+                            last_position = Instant::now();
                             if let Some(d) = dur.filter(|d| *d > 0.0) {
                                 let _ = events.send(AudioEvent::Duration(d));
                             }
@@ -151,11 +189,13 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                             }
                         }
                         Err(e) => {
-                            // The previous track is left exactly as it was —
-                            // still playing, still holding its crossfade — so
-                            // the UI and the audio never disagree.
+                            // The live player (and `active`) are left exactly as
+                            // they were — a previous track keeps playing and
+                            // keeps being reported — so the UI and the audio can
+                            // never disagree. In the player's own flow a `Stop`
+                            // arrives before every `Play`, so there is normally
+                            // nothing playing to preserve.
                             error!("failed to decode audio: {e}");
-                            active = false;
                             let msg = format!("decode error: {e}");
                             match ack {
                                 // A caller is waiting on the outcome and owns
@@ -190,6 +230,9 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                         player.set_volume(volume);
                         player.play();
                         active = true;
+                        // Same fresh-clock rule as the hard `Play` arm: the new
+                        // track's first position must not be the outgoing one's.
+                        last_position = Instant::now();
                         if let Some(d) = dur.filter(|d| *d > 0.0) {
                             let _ = events.send(AudioEvent::Duration(d));
                         }
@@ -217,13 +260,19 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
                     fading.clear();
                     active = false;
                 }
-                AudioCmd::Seek(secs) => {
-                    if let Err(e) = player.try_seek(Duration::from_secs_f64(secs.max(0.0))) {
-                        error!("seek failed: {e}");
+                AudioCmd::Seek(secs) => match seek_target(secs) {
+                    Some(target) => {
+                        if let Err(e) = player.try_seek(target) {
+                            error!("seek failed: {e}");
+                        }
                     }
-                }
+                    None => warn!("ignoring an invalid seek target: {secs}s"),
+                },
                 AudioCmd::Volume(v) => {
-                    volume = v.clamp(0.0, 1.0);
+                    // `f32::clamp` propagates NaN, and a NaN master volume would
+                    // poison every fade volume; NaN is not a level, so treat it
+                    // as silence.
+                    volume = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
                     player.set_volume(volume);
                 }
                 // The backend is shutting down: silence playback and leave the
@@ -257,4 +306,43 @@ fn run(rx: Receiver<AudioCmd>, events: UnboundedSender<AudioEvent>) {
         }
     }
     info!("audio thread stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{checked_earlier, seek_target};
+    use std::time::{Duration, Instant};
+
+    /// The tick clock is seeded one interval back; subtracting more than the
+    /// machine's uptime must degrade to "now" instead of panicking. This test
+    /// would panic against the plain `Instant - Duration` form.
+    #[test]
+    fn seeding_the_tick_clock_cannot_underflow_an_instant() {
+        let now = Instant::now();
+        assert_eq!(
+            checked_earlier(now, Duration::from_secs(1)),
+            now.checked_sub(Duration::from_secs(1)).unwrap_or(now)
+        );
+        // More than any plausible uptime: `Instant` subtraction would overflow,
+        // the fallback just starts from now.
+        assert_eq!(checked_earlier(now, Duration::from_secs(u64::MAX)), now);
+    }
+
+    /// The seek conversion is the audio thread's only `f64` → `Duration` bridge,
+    /// and `Duration::from_secs_f64` panics on values the thread can never
+    /// recover from. Only representable, non-negative targets may become seeks.
+    #[test]
+    fn seek_targets_are_converted_without_panicking() {
+        assert_eq!(seek_target(12.5), Some(Duration::from_secs_f64(12.5)));
+        assert_eq!(seek_target(0.0), Some(Duration::ZERO));
+        // A negative target seeks to the start, exactly as the player clamps a
+        // negative position.
+        assert_eq!(seek_target(-3.0), Some(Duration::ZERO));
+        // NaN is not a position; `max(0.0)` maps it to the start.
+        assert_eq!(seek_target(f64::NAN), Some(Duration::ZERO));
+        // Unrepresentable values are dropped instead of panicking the thread.
+        assert_eq!(seek_target(f64::INFINITY), None);
+        assert_eq!(seek_target(f64::NEG_INFINITY), Some(Duration::ZERO));
+        assert_eq!(seek_target(f64::MAX), None);
+    }
 }

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use rift_types::{
     AlbumPage, AlbumSummary, ArtistPage, ArtistSummary, DownloadState, Library, PlaybackState,
-    Playlist, Progress, QueueSnapshot, RepeatMode, SongIndex, Track, UpdateStatus, YtDlpStatus,
+    Playlist, Progress, QueueSnapshot, RepeatMode, SongIndex, Track, UpdateStatus,
 };
 
 use crate::gfx::paint::TextureId;
@@ -136,15 +136,12 @@ pub struct State {
     pub volume: f32,
     pub discord_rpc: bool,
     pub crossfade: f32,
-    pub yt_dlp_path: Option<String>,
     pub update_notifications: bool,
     pub downloads: DownloadState,
     /// Launch-time update check result (drives the dismissible banner).
     pub update_banner: Option<UpdateStatus>,
     /// Cached update check result for the Settings view.
     pub update_status: Option<UpdateStatus>,
-    /// Cached yt-dlp probe result for the Settings view.
-    pub yt_dlp_status: Option<YtDlpStatus>,
     /// Network reachability; offline greys out un-downloaded tracks.
     pub online: bool,
     /// Dev-only placeholder-data mode (`RIFT_PREVIEW=1`).
@@ -187,33 +184,20 @@ pub struct State {
     pub sidebar_width: f32,
     /// Whether the OS window is currently maximized (titlebar icon).
     pub window_maximized: bool,
-    /// Mouse cursor requested by the UI for this frame.
-    pub cursor: Cursor,
 
     // ------------------------------------------------------- cover cache
     /// Cover-art texture cache keyed by URL.
+    ///
+    /// Bounded in practice: `app.rs` evicts the oldest decoded textures once its
+    /// `MAX_CACHED_COVERS` cap is reached (each 256 px RGBA8 cover is 256 KiB of
+    /// VRAM), so a long browsing session cannot grow the cache without limit.
+    /// Entries without a texture (in flight or known-failed) are a few bytes and
+    /// are left alone by eviction.
     pub covers: HashMap<String, CoverEntry>,
     /// URLs the controller should fetch (deduplicated; drained each frame).
     pub cover_requests: Vec<String>,
     /// Next texture id to hand out for cover art (font atlas uses low ids).
     pub next_texture_id: TextureId,
-    /// Textures to release once the renderer has drawn the current frame.
-    pub dropped_textures: Vec<TextureId>,
-}
-
-/// Cursor shape requested by the UI.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Cursor {
-    #[default]
-    Default,
-    Pointer,
-    Text,
-    ResizeHorizontal,
-    ResizeVertical,
-    ResizeNwse,
-    ResizeNesw,
-    Grab,
-    Grabbing,
 }
 
 impl Default for State {
@@ -227,12 +211,10 @@ impl Default for State {
             volume: 1.0,
             discord_rpc: true,
             crossfade: 0.0,
-            yt_dlp_path: None,
             update_notifications: true,
             downloads: DownloadState::default(),
             update_banner: None,
             update_status: None,
-            yt_dlp_status: None,
             online: true,
             preview: false,
 
@@ -249,12 +231,10 @@ impl Default for State {
             toast: None,
             sidebar_width: crate::theme::Theme::default().sidebar_width,
             window_maximized: false,
-            cursor: Cursor::Default,
 
             covers: HashMap::new(),
             cover_requests: Vec::new(),
             next_texture_id: 1024,
-            dropped_textures: Vec::new(),
         }
     }
 }
@@ -271,7 +251,6 @@ impl State {
         self.downloads = b.downloads;
         self.discord_rpc = b.discord_rpc;
         self.crossfade = b.crossfade;
-        self.yt_dlp_path = b.yt_dlp_path;
         self.update_notifications = b.update_notifications;
         self.preview = b.preview;
     }
@@ -345,6 +324,20 @@ impl State {
         } else {
             DownloadStatus::None
         }
+    }
+
+    /// Known byte-level fraction (`0.0..=1.0`) of a track's in-flight download.
+    ///
+    /// `None` means the fraction is unknown: the track is queued behind the one
+    /// actively transferring (the native downloader reports progress only for the
+    /// active track). Rows keep their indeterminate spinner in that case. The
+    /// backend reports permille (`0..=1000`); it is clamped here so a malformed
+    /// snapshot can never paint a determinate bar past the end of its track.
+    pub fn download_fraction(&self, track_id: &str) -> Option<f32> {
+        self.downloads
+            .progress
+            .get(track_id)
+            .map(|permille| f32::from(*permille).clamp(0.0, 1000.0) / 1000.0)
     }
 
     /// Cover texture for a URL, if it has finished loading.
@@ -545,9 +538,6 @@ pub enum Action {
     SetCrossfade(f32),
     SetUpdateNotifications(bool),
     CheckUpdate,
-    CheckYtDlp,
-    SetYtDlpPath(Option<String>),
-    DownloadYtDlp,
 
     // --------------------------------------------------------- downloads
     DownloadTracks(Vec<String>),
@@ -672,6 +662,29 @@ mod tests {
         let t = Toast::notice("hi", 10.0);
         assert!(!t.is_expired(11.0));
         assert!(t.is_expired(16.0));
+    }
+
+    #[test]
+    fn download_fraction_maps_permille_to_a_clamped_unit_interval() {
+        let mut state = State::default();
+        assert_eq!(state.download_fraction("t1"), None, "absent = unknown");
+
+        state.downloads.progress.insert("t1".into(), 0);
+        assert_eq!(state.download_fraction("t1"), Some(0.0));
+        state.downloads.progress.insert("t1".into(), 250);
+        assert_eq!(state.download_fraction("t1"), Some(0.25));
+        state.downloads.progress.insert("t1".into(), 1000);
+        assert_eq!(state.download_fraction("t1"), Some(1.0));
+
+        // Defensive clamp: the contract is 0..=1000, but a bad snapshot must
+        // not paint a bar wider than the row.
+        state.downloads.progress.insert("t1".into(), u16::MAX);
+        assert_eq!(state.download_fraction("t1"), Some(1.0));
+
+        // Another track's fraction is not ours.
+        state.downloads.progress.insert("t2".into(), 500);
+        assert_eq!(state.download_fraction("t1"), Some(1.0));
+        assert_eq!(state.download_fraction("t2"), Some(0.5));
     }
 
     #[test]
