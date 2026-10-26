@@ -344,11 +344,18 @@ fn check_memory_cap(video_id: &str, current: u64, incoming: usize) -> Result<(),
     )))
 }
 
-/// Write every byte of `bytes` to `file`.
+/// Write every byte of `bytes` to `file` and wait until the file has them.
 ///
 /// Hand-rolled because the crate enables only tokio's `fs`/`process`/`sync`/
 /// `time` features, not `io-util`, so `AsyncWriteExt` is unavailable; the
 /// `AsyncWrite` trait itself is core and is enough.
+///
+/// The trailing `poll_flush` is load-bearing, not a buffer flush: tokio's
+/// `File::poll_write` hands the write to a blocking task and returns as soon as
+/// the bytes are copied, so without waiting for that task the last chunk of a
+/// download could still be in flight when the caller renames/publishes the
+/// `.part` file. `poll_flush` waits for the in-flight write to finish, which is
+/// the completion point this function promises.
 async fn write_all(file: &mut tokio::fs::File, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let written = poll_fn(|cx| Pin::new(&mut *file).poll_write(cx, bytes)).await?;
@@ -360,7 +367,7 @@ async fn write_all(file: &mut tokio::fs::File, mut bytes: &[u8]) -> std::io::Res
         }
         bytes = &bytes[written..];
     }
-    Ok(())
+    poll_fn(|cx| Pin::new(&mut *file).poll_flush(cx)).await
 }
 
 /// Why one download attempt did not finish.
@@ -684,7 +691,7 @@ where
 mod tests {
     use super::{
         check_memory_cap, download_with_refresh, parse_content_range, validate_stream_url,
-        verify_complete, AttemptError, ResolvedStream, Sink, MAX_MEMORY_BYTES,
+        verify_complete, write_all, AttemptError, ResolvedStream, Sink, MAX_MEMORY_BYTES,
     };
     use crate::util::testing::TempDir;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -902,6 +909,25 @@ mod tests {
             itag: 140,
             mime_type: "audio/mp4".to_owned(),
         }
+    }
+
+    /// `write_all` must not return while the final write is still queued on
+    /// tokio's blocking pool: the download worker renames/publishes the `.part`
+    /// file immediately after a transfer returns, so any other handle must
+    /// already see every byte by then.
+    #[tokio::test]
+    async fn file_writes_are_visible_when_write_all_returns() {
+        let dir = TempDir::new("native-stream-write-all");
+        let dest = dir.join("bytes.part");
+        let mut file = tokio::fs::File::create(&dest)
+            .await
+            .expect("create the part file");
+        write_all(&mut file, b"abcdefghij").await.expect("write");
+        assert_eq!(
+            std::fs::read(&dest).expect("read the part file"),
+            b"abcdefghij",
+            "every byte must be on disk when write_all returns"
+        );
     }
 
     /// The core of the native path: ranged requests walk the stream in offset
