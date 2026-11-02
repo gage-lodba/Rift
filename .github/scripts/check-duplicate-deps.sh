@@ -20,31 +20,28 @@
 # `cargo tree` filters by the host target unless told otherwise, so the
 # duplicated set genuinely differs per platform: the `windows-*` generation is
 # not in the graph on Linux or macOS, macOS's Cocoa/objc2 crates are not in the
-# Linux graph, and Linux's second `zbus` is not in either other graph. One
-# combined baseline would flag every platform but the one it was recorded on, for
-# reasons that are not regressions. The lists below were generated with
+# Linux graph, and Linux's rustix/getrandom families are not in the macOS graph.
+# One combined baseline would flag every platform but the one it was recorded on,
+# for reasons that are not regressions. The lists below were generated with
 # `cargo tree -d --locked --workspace` on each target.
 #
 # ## Known duplicates with no lever here
 #
-#   - Linux: `zbus` 3 **and** 5. `souvlaki` 0.8.3 (the newest release on
-#     crates.io) pins zbus 3 for the `use_zbus` backend the workspace selects to
-#     keep Linux pure-Rust (no libdbus); `rfd`'s xdg-portal backend (ashpd)
-#     brings the newer zbus. The whole zbus 3 tree is in `baseline_linux`,
-#     including `rand` 0.8 beside the direct `rand` 0.10.
-#   - Linux: `libloading` 0.7 through `dlib` (wayland-sys/xkbcommon-dl) beside
-#     the 0.8 generation used by ash/vulkano/x11rb; both are dlopen plumbing and
-#     no types cross the boundary.
-#   - Linux: `pollster` 0.3 beside the direct `pollster` 0.4 (rfd's xdg-portal
-#     stack pins the older one), and `rand` 0.8/0.9/0.10 from the same two
-#     generations.
+#   - Linux: `pollster` 0.4 through `rfd`'s xdg-portal stack beside the direct
+#     `pollster` 1.0 (which `souvlaki` 0.9.3 also selects), `rand` 0.9 through
+#     `ashpd` beside the direct `rand` 0.10, `thiserror` 1 beside 2, and the
+#     rustix/linux-raw-sys/getrandom generations.
 #   - All hosts: `base64` 0.22 (hyper-util) beside 0.23 (reqwest 0.13.5's
 #     response decoding); both are internal wire encoders and no types cross the
 #     boundary.
 #   - Windows: the `windows-*` generation is split by different transitive
-#     pins; `windows-sys` appears for both 0.60/0.61/0.62-era consumers.
+#     pins; `windows-sys` appears for 0.52 (`winit`), 0.60 (`rfd`) and 0.61
+#     (`arboard`, `dirs-sys`, `mio`) consumers.
 #   - macOS: the objc2 / core-foundation families split across generations
-#     (winit and souvlaki pin different objc2 majors).
+#     (`winit` 0.30 pins the 0.5 / 0.9 generation; `arboard`, `cpal` and the
+#     `rfd` stack pull 0.6 / 0.10), and `core-graphics-types` splits with
+#     them: `souvlaki` 0.9.3's `core-graphics` 0.25 uses 0.2 while
+#     `winit`'s `core-graphics` 0.23 still uses 0.1.
 #
 # To see the full picture: cargo tree -d --locked
 #
@@ -65,62 +62,42 @@ bitflags
 hashbrown
 miniz_oxide
 syn
-windows
 windows-sys
 windows-targets
 windows_x86_64_msvc
 EOF
 )
 
-# Linux-only: the zbus 3 tree (souvlaki) beside the newer zbus pulled by rfd's
-# xdg-portal backend, plus the usual portable-atomic/rustix families.
+# Linux-only: the rustix/linux-raw-sys, getrandom, thiserror and rand families
+# split across generations; the direct `rand` 0.10 is beside `ashpd`'s 0.9, and
+# the direct `pollster` 1.0 beside `rfd`'s 0.4.
 baseline_linux=$(cat <<'EOF'
-async-broadcast
 base64
 bitflags
-cpufeatures
-event-listener
-fastrand
-futures-lite
 getrandom
 hashbrown
-libloading
 linux-raw-sys
 miniz_oxide
-polling
 pollster
-proc-macro-crate
 rand
-rand_chacha
 rand_core
 rustix
-socket2
 syn
 thiserror
 thiserror-impl
-toml_datetime
-toml_edit
-uuid
-winnow
-zbus
-zbus_macros
-zbus_names
-zvariant
-zvariant_derive
-zvariant_utils
 EOF
 )
 
-# macOS-only: the Cocoa/Swift/objc2 families.
+# macOS-only: the Cocoa/objc2 families. `core-graphics-types` 0.1 comes through
+# `winit`'s `core-graphics` 0.23 while `souvlaki` 0.9.3's `core-graphics` 0.25
+# uses 0.2.
 baseline_macos=$(cat <<'EOF'
 base64
 bitflags
 block2
 core-foundation
 core-graphics
-foreign-types
-foreign-types-shared
-getrandom
+core-graphics-types
 hashbrown
 miniz_oxide
 objc2
