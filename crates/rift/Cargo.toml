@@ -34,7 +34,7 @@ serde_json.workspace = true
 # MPNowPlayingInfoCenter (macOS). use_zbus keeps the Linux backend pure-Rust
 # (no libdbus); the dbus/zbus deps are Linux-gated inside souvlaki, so this is
 # harmless on Windows/macOS.
-souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
+souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 tracing = { workspace = true }
 
