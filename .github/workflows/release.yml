@@ -433,6 +433,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job has no checkout, so `gh` would otherwise try to discover
+          # the repository from a `.git` directory and fail. GH_REPO gives it
+          # the same repository context the other jobs get from checkout.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           release_tag="${GITHUB_REF_NAME}"
