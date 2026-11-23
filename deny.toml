@@ -15,7 +15,7 @@
 # a deliberate decision in review, not a CI surprise. `cargo deny list` prints
 # the licenses and the crates using each one.
 #
-# Written against cargo-deny 0.20.x, which is the version
+# Written against cargo-deny 0.22.x, which is the version
 # `EmbarkStudios/cargo-deny-action` (pinned in `ci.yml`) installs.
 
 [graph]
@@ -36,7 +36,7 @@ targets = [
 all-features = true
 
 [advisories]
-# RustSec advisories. In cargo-deny 0.20 known vulnerabilities, unsound crates
+# RustSec advisories. In cargo-deny 0.22 known vulnerabilities, unsound crates
 # and yanked versions are handled by dedicated fields; the old
 # `vulnerability = "deny"` / `severity-threshold` keys were removed and would
 # now be errors themselves.

@@ -140,10 +140,10 @@ miniz_oxide v0.9.1
 nom v7.1.3
 nom v8.0.0
 pollster v0.4.0
-pollster v1.0.1
+pollster v1.0.3
 rand_core v0.10.1
 rand_core v0.9.5
-rand v0.10.3
+rand v0.10.4
 rand v0.9.5
 rustix v0.38.44
 rustix v1.1.4

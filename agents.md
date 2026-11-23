@@ -2068,7 +2068,7 @@ cheap first:
    deny warnings, so neither a `#[cfg(feature = "preview")]` break nor a warning in
    `not(debug_assertions)` code can ship unnoticed.
 5. **cargo-deny** (ubuntu-22.04) — `check --all-features --locked` via the pinned
-   `EmbarkStudios/cargo-deny-action` (cargo-deny 0.20.x, the version `deny.toml` was
+   `EmbarkStudios/cargo-deny-action` (cargo-deny 0.22.x, the version `deny.toml` was
    validated against).
 
 Jobs build at **1.88.0**, not `stable`. Actions are pinned to commit SHAs with a version

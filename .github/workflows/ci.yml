@@ -274,7 +274,7 @@ jobs:
           # could read it.
           persist-credentials: false
       # SHA-pinned like every other action here; `v2` in the comment is what
-      # Dependabot tracks. The action is a Docker image with cargo-deny 0.20.x
+      # Dependabot tracks. The action is a Docker image with cargo-deny 0.22.x
       # baked in — there is no separate Rust-install step, and the version is
       # deliberately the one `deny.toml` was validated against. The image's
       # entrypoint runs `rustup show` in the checkout before `cargo deny`, so the
