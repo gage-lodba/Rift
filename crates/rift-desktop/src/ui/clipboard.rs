@@ -232,6 +232,11 @@ mod tests {
 
     /// On a machine with a working OS clipboard: exercise the backend through
     /// the trait and restore the previous clipboard contents afterwards.
+    ///
+    /// Windows/Linux only, matching `os_clipboard_tests_enabled`; macOS keeps
+    /// the in-memory test only (the real-clipboard tests are opt-in where the
+    /// helper is compiled).
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn native_clipboard_roundtrips_when_available() {
         if !os_clipboard_tests_enabled() {
