@@ -37,11 +37,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rift_desktop::app::{App, WindowCommand};
+use rift_desktop::app::{App, WindowCommand, SEARCH_DEBOUNCE_SECS};
 use rift_desktop::controller::{BackendCommands, Controller};
 use rift_desktop::gfx::paint::{PaintList, Prim, Rect};
-use rift_desktop::screens::{self, cards, menu, overlays, queue as queue_screen, settings};
-use rift_desktop::state::View;
+use rift_desktop::screens::{self, cards, menu, overlays, pages, queue as queue_screen, settings};
+use rift_desktop::state::{Action, View};
 use rift_desktop::text::Weight;
 use rift_desktop::theme::Theme;
 use rift_desktop::ui::{InputState, Key, KeyInput, Modifiers, Ui, SCROLLBAR_WIDTH};
@@ -83,6 +83,7 @@ enum Call {
     SetCrossfade(f32),
     RenamePlaylist(String, String),
     SearchSongs(String),
+    LoadAlbumPage(u64, String),
     OpenUrl(String),
 }
 
@@ -187,7 +188,9 @@ impl BackendCommands for Recorder {
     fn search_albums(&self, _: u64, _: String) {}
     fn load_artist_page(&self, _: u64, _: String) {}
     fn load_artist_songs(&self, _: u64, _: String) {}
-    fn load_album_page(&self, _: u64, _: String) {}
+    fn load_album_page(&self, generation: u64, id: String) {
+        self.record(Call::LoadAlbumPage(generation, id));
+    }
 
     // --------------------------------------------------------------- images
     fn fetch_cover(&self, _: String) {}
@@ -302,6 +305,16 @@ impl Harness {
         self.frame_with(|input| input.text = text.to_string());
     }
 
+    /// Run frames until at least `seconds` of the synthetic UI clock have
+    /// passed (the app's debounce timer is driven by `InputState::time`, so
+    /// tests advance it exactly like the live redraw loop does).
+    fn wait(&mut self, seconds: f64) {
+        let target = self.time + seconds;
+        while self.time < target {
+            self.frame();
+        }
+    }
+
     fn calls(&self) -> Vec<Call> {
         self.calls
             .lock()
@@ -413,6 +426,22 @@ fn titlebar_window_button_center(l: &screens::Layout, index: usize) -> (f32, f32
         controls_x + 46.0 * index as f32 + 23.0,
         l.titlebar.y + l.titlebar.h * 0.5,
     )
+}
+
+/// Centre of the compact page-error Retry button
+/// (`screens/pages.rs::error_state`: 48 px top pad, 17 px message line, 12 px
+/// gap, 32 px button, centred in the main content column).
+fn page_error_retry_center(l: &screens::Layout) -> (f32, f32) {
+    let theme = Theme::default();
+    let content_x = l.main.x + theme.main_padding_h;
+    let content_y = l.main.y + theme.main_padding_v;
+    let content_w = (l.main.w - theme.main_padding_h * 2.0 - SCROLLBAR_WIDTH).max(0.0);
+    let button_y = content_y
+        + pages::PAGE_ERROR_PAD
+        + 17.0
+        + pages::PAGE_ERROR_GAP
+        + pages::PAGE_ERROR_BTN_H * 0.5;
+    (content_x + content_w * 0.5, button_y)
 }
 
 /// Big play/pause button centre (`screens/chrome/player_bar.rs`: five 36 px controls, block centred).
@@ -677,8 +706,17 @@ fn titlebar_search_types_submits_and_clears() {
     h.type_text("daft punk");
     assert_eq!(h.app.state.search.query, "daft punk");
     assert!(
+        !h.contains(|call| matches!(call, Call::SearchSongs(_))),
+        "a keystroke must not fire a network search immediately: {:?}",
+        h.calls()
+    );
+
+    // The live search fires once the box text has been stable for 300 ms
+    // (`ui-spec.md` §6.1, `SEARCH_DEBOUNCE_SECS`).
+    h.wait(SEARCH_DEBOUNCE_SECS + 0.05);
+    assert!(
         h.contains(|call| matches!(call, Call::SearchSongs(query) if query == "daft punk")),
-        "typing reaches the controller's search command: {:?}",
+        "the debounced live search reaches the controller: {:?}",
         h.calls()
     );
 
@@ -714,6 +752,184 @@ fn titlebar_search_types_submits_and_clears() {
     // Escape that closed it); one neutral frame later the keyboard is released.
     h.frame();
     assert!(!h.app.ui.wants_keyboard(), "field released the keyboard");
+}
+
+/// Whitespace typed into the search box must stay in the box.
+///
+/// The box emits `SearchQueryChanged(raw text)` on every edit frame (the app
+/// debounces the actual `Search`); `App::dispatch_ui` used to write the trimmed
+/// `Search` payload back into `state.search.query` — the field's live edit
+/// buffer — so a space typed as the last character of its frame was deleted
+/// again in the same frame (the field draws from that buffer on the next
+/// frame). Words ran together: "sign of the time" reached the backend as
+/// "signofthetime".
+#[test]
+fn titlebar_search_keeps_typed_spaces() {
+    let _lock = test_lock();
+    let mut h = Harness::new();
+    h.frame();
+
+    let l = h.layout();
+    let (x, y) = titlebar_search_center(&l);
+    h.click(x, y);
+    assert!(h.app.ui.wants_keyboard(), "the box takes keyboard focus");
+
+    // One `type_text` per keystroke, like the live app: the bug only showed when
+    // a space was the last character of its frame (a keystroke batched with the
+    // next character in the same frame happened to survive).
+    h.type_text("sign");
+    assert_eq!(h.app.state.search.query, "sign");
+    h.type_text(" ");
+    assert_eq!(
+        h.app.state.search.query, "sign ",
+        "the typed space stays in the search box"
+    );
+    h.type_text("of");
+    h.type_text(" ");
+    h.type_text("the");
+    h.type_text(" ");
+    h.type_text("time");
+    assert_eq!(
+        h.app.state.search.query, "sign of the time",
+        "every typed space survives the live-search dispatch"
+    );
+    assert!(
+        !h.contains(|call| matches!(call, Call::SearchSongs(_))),
+        "the keystrokes are still inside the debounce window: {:?}",
+        h.calls()
+    );
+    h.wait(SEARCH_DEBOUNCE_SECS + 0.05);
+    assert_eq!(
+        h.app.state.search.shown_query, "sign of the time",
+        "the results header names the submitted (trimmed) query"
+    );
+
+    // The live search carries the whole query, spaces included.
+    assert!(
+        h.contains(|call| matches!(call, Call::SearchSongs(query) if query == "sign of the time")),
+        "the searched query keeps its spaces: {:?}",
+        h.calls()
+    );
+
+    // Enter submits the same text and does not rewrite the box either.
+    h.key(Key::Enter, Modifiers::default());
+    assert_eq!(h.app.state.search.query, "sign of the time");
+    assert_eq!(h.app.state.search.shown_query, "sign of the time");
+    assert!(h.app.state.search.busy, "search in flight");
+    let last_search = h
+        .calls()
+        .into_iter()
+        .filter(|call| matches!(call, Call::SearchSongs(_)))
+        .next_back();
+    assert_eq!(
+        last_search,
+        Some(Call::SearchSongs("sign of the time".into())),
+        "Enter submits the trimmed query through the controller"
+    );
+}
+
+/// Live search is debounced: three quick keystrokes issue exactly one request
+/// once the text settles, while Enter issues one immediately (ui-spec §6.1).
+#[test]
+fn titlebar_search_debounces_quick_typing_but_enter_searches_immediately() {
+    let _lock = test_lock();
+    let mut h = Harness::new();
+    h.frame();
+    let l = h.layout();
+    let (x, y) = titlebar_search_center(&l);
+    h.click(x, y);
+    h.take_calls();
+
+    h.type_text("a");
+    h.type_text("b");
+    h.type_text("c");
+    assert_eq!(h.app.state.search.query, "abc");
+    assert!(
+        h.take_calls().is_empty(),
+        "three quick keystrokes must not launch a request each"
+    );
+
+    h.wait(SEARCH_DEBOUNCE_SECS + 0.05);
+    assert_eq!(
+        h.calls(),
+        vec![Call::SearchSongs("abc".into())],
+        "the stable query issues exactly one search"
+    );
+    h.take_calls();
+
+    // Enter submits the same query immediately, without waiting for a debounce.
+    h.key(Key::Enter, Modifiers::default());
+    assert_eq!(
+        h.calls(),
+        vec![Call::SearchSongs("abc".into())],
+        "Enter searches on its own frame"
+    );
+}
+
+/// Clearing the search box must cancel a pending debounce, so no request fires
+/// for text the user already removed.
+#[test]
+fn clearing_the_search_box_cancels_a_pending_debounce() {
+    let _lock = test_lock();
+    let mut h = Harness::new();
+    h.frame();
+    let l = h.layout();
+    let (x, y) = titlebar_search_center(&l);
+    h.click(x, y);
+
+    h.type_text("abc");
+    assert_eq!(h.app.state.search.query, "abc");
+    // Escape clears the box before the 300 ms deadline.
+    h.key(Key::Escape, Modifiers::default());
+    assert_eq!(h.app.state.search.query, "");
+    h.take_calls();
+
+    h.wait(SEARCH_DEBOUNCE_SECS + 0.05);
+    assert!(
+        !h.contains(|call| matches!(call, Call::SearchSongs(_))),
+        "a cleared box must cancel its pending search: {:?}",
+        h.calls()
+    );
+}
+
+/// A failed artist/album page must render a retryable error instead of staying
+/// on "Loading…" forever; Retry re-issues the last page at a fresh generation.
+#[test]
+fn a_failed_page_renders_retry_and_retry_reissues_the_last_page() {
+    let _lock = test_lock();
+    let mut h = Harness::new();
+    h.frame();
+
+    h.app.dispatch_ui(Action::OpenAlbum("album-1".into()));
+    assert_eq!(h.app.state.view, View::Album("album-1".into()));
+    assert_eq!(
+        h.take_calls(),
+        vec![Call::LoadAlbumPage(1, "album-1".into())],
+        "opening the page issues its first request"
+    );
+
+    // What `App::apply_controller_event` does for a failed page reply; the
+    // controller → app event path itself is covered by the controller and app
+    // unit tests. Here we prove the rendered state and the Retry wiring.
+    h.app.state.page_error = Some("could not load album: offline".into());
+    h.frame();
+    assert_eq!(
+        h.app.state.page_error.as_deref(),
+        Some("could not load album: offline")
+    );
+
+    let l = h.layout();
+    let (x, y) = page_error_retry_center(&l);
+    h.click(x, y);
+    assert!(
+        h.app.state.page_error.is_none(),
+        "Retry leaves the error state immediately"
+    );
+    assert_eq!(
+        h.take_calls(),
+        vec![Call::LoadAlbumPage(2, "album-1".into())],
+        "Retry re-issues the last page with a new generation"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -252,6 +252,32 @@ impl GlyphAtlas {
         });
     }
 
+    /// Copy a sub-rectangle of the atlas into a tightly packed RGBA8 buffer
+    /// suitable for a [`TextureRegion`](crate::gfx::paint::TextureRegion)
+    /// upload.
+    ///
+    /// The rectangle is clamped to the atlas bounds so a bad caller cannot
+    /// panic the UI thread with an out-of-bounds slice; the returned rectangle
+    /// is what was actually copied (possibly empty, in which case the buffer is
+    /// empty too).
+    pub fn copy_region(&self, rect: IRect) -> (IRect, Vec<u8>) {
+        let x = rect.x.min(self.width);
+        let y = rect.y.min(self.height);
+        let w = rect.w.min(self.width.saturating_sub(x));
+        let h = rect.h.min(self.height.saturating_sub(y));
+        let actual = IRect::new(x, y, w, h);
+        if actual.is_empty() {
+            return (actual, Vec::new());
+        }
+        let row_bytes = actual.w as usize * 4;
+        let mut out = Vec::with_capacity(row_bytes * actual.h as usize);
+        for row in 0..actual.h as usize {
+            let start = ((actual.y as usize + row) * self.width as usize + actual.x as usize) * 4;
+            out.extend_from_slice(&self.data[start..start + row_bytes]);
+        }
+        (actual, out)
+    }
+
     /// Blit a whole RGBA8 white-coverage image (used by tests/tools).
     pub fn clear(&mut self) {
         self.data.fill(0);
@@ -318,6 +344,26 @@ mod tests {
         let d = a.take_dirty().unwrap();
         assert!(d.w >= 8);
         assert!(a.take_dirty().is_none());
+    }
+
+    #[test]
+    fn copy_region_is_tightly_packed_and_matches_the_atlas() {
+        let mut a = GlyphAtlas::new();
+        let slot = a.allocate(4, 3).unwrap();
+        a.upload(slot, &(0..12).map(|v| v as u8 + 1).collect::<Vec<_>>());
+        let (rect, bytes) = a.copy_region(IRect::new(slot.x, slot.y, 4, 3));
+        assert_eq!(rect, IRect::new(slot.x, slot.y, 4, 3));
+        assert_eq!(bytes.len(), 4 * 3 * 4);
+        // Every copied texel is the same white-coverage pixel as the atlas.
+        for (i, px) in bytes.chunks_exact(4).enumerate() {
+            let atlas_index =
+                ((slot.y as usize + i / 4) * a.width() as usize + slot.x as usize + i % 4) * 4;
+            assert_eq!(px, &a.pixels()[atlas_index..atlas_index + 4]);
+        }
+        // Out-of-bounds rectangles clamp instead of panicking.
+        let (clamped, bytes) = a.copy_region(IRect::new(a.width() - 1, a.height() - 1, 8, 8));
+        assert_eq!((clamped.w, clamped.h), (1, 1));
+        assert_eq!(bytes.len(), 4);
     }
 
     #[test]

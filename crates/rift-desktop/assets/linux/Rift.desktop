@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Rift
+GenericName=Music Player
+Comment=A minimal, ad-free YouTube Music player with native Vulkan rendering
+Exec=rift-music
+Icon=rift-music
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;player;youtube;youtube music;streaming;ad-free;
+# The Wayland app_id / X11 WM_CLASS class the window advertises (see
+# `rift_desktop::APP_ID`), so the compositor groups the window under this entry
+# and its icon. Keep in step with `crates/rift-desktop/src/lib.rs`.
+StartupWMClass=Rift
+# Rift owns a process-wide single-instance guard (docs/native-platform.md);
+# launch requests should activate the running window, not start a rival.
+SingleMainWindow=true
+# The app has no XDG startup-notification support, so don't make launchers wait
+# for an activation event they will never receive.
+StartupNotify=false

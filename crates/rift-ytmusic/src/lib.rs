@@ -26,6 +26,21 @@ pub use error::{Error, Result};
 pub use params::SearchFilter;
 pub use player::AudioStream;
 
+/// HTTP/2 response header-list ceiling for the innertube clients.
+///
+/// hyper's h2 client defaults to a 16 KiB receive limit, and `YouTube` exceeds
+/// it on a large fraction of `music.youtube.com` home-page responses: the site
+/// intermittently adds a ~6.2 KiB `content-security-policy-report-only` header,
+/// pushing the decoded header list from ~12 KiB to ~18 KiB. h2 then resets the
+/// stream (`REQUEST_HEADER_FIELDS_TOO_LARGE`), which surfaces as an opaque
+/// `http2 error: stream error detected` and fails the visitor scrape every cold
+/// playback/search starts with (~50% of cold starts measured on 2026-10-30).
+/// 64 KiB matches the value Google's own edge advertises in its SETTINGS; the
+/// largest response observed was ~19.9 KiB. The
+/// bound is per response and transient, and these clients only talk to
+/// YouTube/Google hosts, so the headroom costs nothing else.
+pub(crate) const MAX_H2_RESPONSE_HEADER_LIST_BYTES: u32 = 64 * 1024;
+
 /// Raw response parsers, exposed for fixture tests and offline tooling.
 #[doc(hidden)]
 pub mod raw {

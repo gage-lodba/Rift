@@ -18,6 +18,11 @@ impl BackendHandle {
     /// validating the index. In preview mode it is a no-op (placeholder rows
     /// carry ids that cannot be fetched).
     ///
+    /// The queue replacement, the `start` validation and the playback claim are
+    /// one critical section (see `crate::player::play_index`): two rapid play
+    /// requests cannot install one queue and then start an index drawn from the
+    /// other.
+    ///
     /// # Errors
     ///
     /// Returns `"nothing to play"` when `tracks` is empty or `start` is out of
@@ -32,21 +37,17 @@ impl BackendHandle {
         if crate::settings::preview_mode() {
             return Ok(());
         }
-        if tracks.is_empty() || start >= tracks.len() {
-            return Err("nothing to play".into());
+        if player::play_index(&self.inner, start, Some((tracks, source))) {
+            Ok(())
+        } else {
+            Err("nothing to play".into())
         }
-        {
-            let mut core = self.inner.player.core.lock_safe();
-            core.queue = tracks;
-            core.source = source;
-            core.shuffle_history.clear();
-            core.shuffle_cursor = 0;
-        }
-        player::play_index(&self.inner, start);
-        Ok(())
     }
 
     /// Play a single track, replacing the queue with it.
+    ///
+    /// The replacement and the index claim share one critical section, exactly
+    /// like [`play_tracks`](Self::play_tracks).
     ///
     /// # Errors
     ///
@@ -57,14 +58,9 @@ impl BackendHandle {
         if crate::settings::preview_mode() {
             return Ok(());
         }
-        {
-            let mut core = self.inner.player.core.lock_safe();
-            core.queue = vec![track];
-            core.source = None;
-            core.shuffle_history.clear();
-            core.shuffle_cursor = 0;
-        }
-        player::play_index(&self.inner, 0);
+        // A one-track replacement always has index 0, so the claim cannot fail;
+        // the return value is still checked rather than ignored if that changes.
+        let _ = player::play_index(&self.inner, 0, Some((vec![track], None)));
         Ok(())
     }
 
@@ -104,6 +100,11 @@ impl BackendHandle {
                 return;
             };
             core.position = position;
+            // Record the seek for a crossfade that is mid-acknowledgement: the
+            // audio thread may apply this seek to the *incoming* track after the
+            // crossfade command, so the commit must not reset the bar to zero.
+            core.seek_epoch = core.seek_epoch.wrapping_add(1);
+            core.seek_target = position;
             // Re-evaluate the crossfade arm from the new position: a backward seek
             // out of the overlap window should let the crossfade arm again.
             core.crossfade_armed_for = None;

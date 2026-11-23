@@ -51,6 +51,26 @@ tracing = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { version = "0.16", default-features = false, features = ["xdg-portal", "wayland", "tokio"] }
 
+# rodio's output backend, depended on directly only to enable its Linux
+# sound-server host. cpal's default host on Linux is raw ALSA, and ALSA's
+# `default` PCM is a hardware card, not the desktop mixer: on a PipeWire or
+# PulseAudio session the open either fails with `DeviceBusy` (the server is
+# using the card) or, worse, succeeds first and steals a card the server is
+# managing (a USB interface's playback device, say). Playback then ignores the
+# sink the user configured, and the server's own use of that card starts
+# failing. Enabling cpal's `pulseaudio` host makes `default_host()` resolve to
+# the running sound server — PipeWire exposes a PulseAudio-compatible one
+# (`pipewire-pulse`) — and to raw ALSA only when no server is reachable. The
+# host is pure Rust: no libpulse/libpipewire link, no bindgen/libclang, and no
+# new system package. The native `pipewire` host is deliberately not enabled;
+# it would add a libpipewire runtime link and a libclang build dependency
+# without changing where the audio goes. `audio.rs` logs the selected host and
+# has a compile-time guard on `rodio::cpal::HostId::PulseAudio`; feature
+# unification applies this feature to the cpal instance rodio links, so if the
+# two cpal versions ever diverge that guard fails the build instead of silently
+# reverting to raw ALSA.
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = { version = "0.16", default-features = false }
 

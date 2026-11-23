@@ -48,12 +48,13 @@ pub use id::Id;
 pub use input::{InputState, Key, KeyInput, Modifiers};
 pub use layout::{Align, Column, Padding, Row, Size, VAlign, Vec2};
 pub use paint::{
-    Color, PaintList, Prim, Rect, TextureId, TextureUpload, ATLAS_TEXTURE_ID,
-    FIRST_IMAGE_TEXTURE_ID, NO_TEXTURE, SCROLLBAR_THUMB, SCROLLBAR_THUMB_HOVER, SCROLLBAR_WIDTH,
+    Color, PaintList, Prim, Rect, TextureId, TextureRegion, TextureUpdate, TextureUpload,
+    ATLAS_TEXTURE_ID, FIRST_IMAGE_TEXTURE_ID, NO_TEXTURE, SCROLLBAR_THUMB, SCROLLBAR_THUMB_HOVER,
+    SCROLLBAR_WIDTH,
 };
 pub use popup::{PopupAlign, ToastKind, MENU_ITEM_HEIGHT, MENU_MIN_CONTENT_WIDTH};
 pub use scroll::ScrollResponse;
-pub use text_input::{TextInputResponse, TextInputStyle};
+pub use text_input::{push_ime_text, TextInputResponse, TextInputStyle};
 pub use widgets::{
     format_duration, format_position, BadgeKind, ButtonKind, ButtonStyle, CheckboxResponse,
     IconButtonStyle, SliderResponse, SliderStyle, DANGER_BG, DANGER_TEXT, SLIDER_TRACK, SUCCESS,
@@ -170,6 +171,12 @@ pub struct Response {
     pub pressed: bool,
     /// Left button released on this widget this frame.
     pub clicked: bool,
+    /// `clicked` was produced by Enter/Space on the focused widget, not by a
+    /// pointer release. Positional widgets (sliders, scrollbar tracks) must use
+    /// [`Response::pointer_clicked`] instead of `clicked`: a keyboard activation
+    /// carries no pointer position, so reading `mouse_pos` for it would commit a
+    /// fraction the user never pointed at.
+    pub keyboard_activated: bool,
     pub secondary_clicked: bool,
     pub double_clicked: bool,
     /// Left button is currently held on this widget.
@@ -188,6 +195,15 @@ pub struct Response {
 impl Response {
     pub fn is_hovered(&self) -> bool {
         self.hovered
+    }
+
+    /// A click caused by a pointer release, excluding the synthetic Enter/Space
+    /// click [`Ui::interact`] produces for a focused widget. Widgets whose
+    /// meaning depends on *where* the pointer is (sliders, scrollbar tracks)
+    /// must test this rather than [`Response::clicked`]; buttons, rows and menu
+    /// items should keep using `clicked` so keyboard activation still works.
+    pub fn pointer_clicked(&self) -> bool {
+        self.clicked && !self.keyboard_activated
     }
 
     /// Hovered or currently pressed — useful for "reveal on hover" rows.
@@ -248,9 +264,15 @@ pub struct Ui {
 
     // ---- texture lifecycle (PaintList created/updated/dropped) ----
     created_textures: Vec<TextureUpload>,
-    updated_textures: Vec<TextureUpload>,
+    updated_textures: Vec<TextureUpdate>,
     dropped_textures: Vec<TextureId>,
     atlas_created: bool,
+    /// One-shot guard for the screen layer's generated app textures (fallback
+    /// cover, logo, music note). It lives on `Ui`, not in a process static: a
+    /// second `Ui` in the same process (tests, a future second window) renders
+    /// through its own texture set, so a process-wide flag would leave it with
+    /// white fallback tiles.
+    generated_textures_uploaded: bool,
 
     // ---- interaction ----
     active: Option<Id>,
@@ -258,6 +280,17 @@ pub struct Ui {
     focus: Option<Id>,
     focus_visible: bool,
     focus_taken_this_frame: bool,
+    /// Focus id at the beginning of the current frame, captured before
+    /// [`Ui::begin_frame`]'s Tab traversal. [`Ui::end_frame`] compares the final
+    /// focus against it to record which id lost focus this frame.
+    frame_focus_start: Option<Id>,
+    /// Id that lost focus at the end of the previous frame, if any.
+    ///
+    /// [`Ui::text_input`] reads this on the following frame to report
+    /// `lost_focus`: focus can be taken by a widget drawn after the field or
+    /// blurred by `end_frame`'s click-away fallback, which the field cannot see
+    /// while it runs.
+    focus_lost_id: Option<Id>,
     /// Focusable ids in paint order this frame; previous frame's copy drives Tab.
     focus_order: Vec<Id>,
     prev_focus_order: Vec<Id>,
@@ -268,6 +301,15 @@ pub struct Ui {
     /// Widgets an open popup covered last frame: they must not hover/click.
     blockers: Vec<Rect>,
     next_blockers: Vec<Rect>,
+    /// Set when an open popup is dismissed by a press outside it. That press
+    /// belongs to the overlay, not to whatever happens to sit underneath, so
+    /// [`Ui::interact`]/[`Ui::hovered`] stay inert until the gesture's release
+    /// arrives. Without this the control under the pointer latches `active` on
+    /// the press frame and fires on the release frame, when the popup is
+    /// already closed. Cleared on the release edge, on `focus_lost`, and at
+    /// `end_frame` when the button is up without a release edge (a dropped
+    /// gesture, e.g. the window lost focus mid-press).
+    suppress_pointer_until_release: bool,
     popup_depth: u32,
     anims: HashMap<Id, AnimState>,
     cursor: CursorShape,
@@ -300,6 +342,13 @@ pub struct Ui {
     // ---- frame scratch (allocation reuse) ----
     scratch: FrameScratch,
     text_input_active: bool,
+    /// Logical-pixel caret rectangle of the focused text input, recorded while
+    /// it paints and reset at `begin_frame`.
+    ///
+    /// The OS IME candidate window is positioned from this after the frame
+    /// (`main.rs` converts it to physical px). Without it, candidate lists on
+    /// Windows/Wayland open at the window origin instead of the field.
+    ime_cursor: Option<Rect>,
     wants_keyboard: bool,
 }
 
@@ -355,11 +404,14 @@ impl Ui {
             updated_textures: Vec::new(),
             dropped_textures: Vec::new(),
             atlas_created: false,
+            generated_textures_uploaded: false,
             active: None,
             active_seen: false,
             focus: None,
             focus_visible: false,
             focus_taken_this_frame: false,
+            frame_focus_start: None,
+            focus_lost_id: None,
             focus_order: Vec::with_capacity(64),
             prev_focus_order: Vec::with_capacity(64),
             last_click: None,
@@ -368,6 +420,7 @@ impl Ui {
             keyboard_used: false,
             blockers: Vec::new(),
             next_blockers: Vec::new(),
+            suppress_pointer_until_release: false,
             popup_depth: 0,
             anims: HashMap::new(),
             cursor: CursorShape::Default,
@@ -387,6 +440,7 @@ impl Ui {
             toasts: Vec::new(),
             scratch: FrameScratch::default(),
             text_input_active: false,
+            ime_cursor: None,
             wants_keyboard: false,
         }
     }
@@ -428,15 +482,23 @@ impl Ui {
             self.drag_start = Vec2::ZERO;
             self.drag_last = Vec2::ZERO;
             self.last_click = None;
+            // The release edge that would have ended a popup-dismissal gesture
+            // is gone too; do not keep the next gesture inert forever.
+            self.suppress_pointer_until_release = false;
         }
         self.focus_taken_this_frame = false;
         self.cursor = CursorShape::Default;
         self.scroll_wheel_used = false;
         self.text_input_active = false;
+        self.ime_cursor = None;
         self.wants_keyboard = false;
         self.next_blockers.clear();
         self.pending_tooltip = None;
         self.popup_drawn = false;
+
+        // Remember where focus was before Tab handling and before any widget
+        // can take it, so `end_frame` can record the id that lost focus.
+        self.frame_focus_start = self.focus;
 
         // Tab moves keyboard focus through last frame's focusable order.
         if self.input.key_clicked(Key::Tab) {
@@ -482,6 +544,15 @@ impl Ui {
         }
 
         // ---- bookkeeping ----
+        // End the popup-dismissal suppression on the gesture's release edge, or
+        // when the button is already up without a release edge (the gesture was
+        // dropped, e.g. the release arrived while the window was unfocused).
+        // While the button is still held the same gesture is not over yet.
+        if self.suppress_pointer_until_release
+            && (self.input.mouse_left_released || !self.input.mouse_left_down)
+        {
+            self.suppress_pointer_until_release = false;
+        }
         if !self.input.mouse_left_down {
             self.active = None;
         }
@@ -494,6 +565,19 @@ impl Ui {
                 self.focus = None;
             }
         }
+        // Record this frame's focus loss for the next frame. It cannot be
+        // reported in this frame: a click-away press blurs here (after every
+        // widget ran), another widget drawn later in the frame may have taken
+        // focus, and Tab moved focus in `begin_frame`. `frame_focus_start` is
+        // the frame's initial focus; comparing against it catches all three.
+        // The record lives for exactly one frame (this assignment replaces it
+        // every frame), which is the one-frame latency `text_input` documents.
+        let started_focused = self.frame_focus_start.take();
+        self.focus_lost_id = if self.focus != started_focused {
+            started_focused
+        } else {
+            None
+        };
         self.active_seen = false;
 
         // Blockers recorded this frame apply from the next frame on.
@@ -512,12 +596,16 @@ impl Ui {
         self.deferred.clear();
 
         // ---- textures ----
-        if let Some(upload) = self.fonts.take_atlas_update(ATLAS_TEXTURE_ID) {
-            if self.atlas_created {
-                paint.updated.push(upload);
-            } else {
-                paint.created.push(upload);
-                self.atlas_created = true;
+        if let Some(update) = self.fonts.take_atlas_update(ATLAS_TEXTURE_ID) {
+            match update {
+                // The first upload creates the atlas; its dirty rect covers the
+                // whole image (see `Fonts::take_atlas_update`), so `created`
+                // always gets a `Whole` payload.
+                TextureUpdate::Whole(upload) if !self.atlas_created => {
+                    paint.created.push(upload);
+                    self.atlas_created = true;
+                }
+                update => paint.updated.push(update),
             }
         }
         paint.created.append(&mut self.created_textures);
@@ -581,6 +669,15 @@ impl Ui {
     /// [`CursorShape::Pointer`] for any hovered clickable widget; widgets that
     /// want something else override it afterwards. Reset to
     /// [`CursorShape::Default`] at the start of every frame.
+    /// Logical-pixel caret rectangle of the focused text input for this frame,
+    /// if one was drawn and focused.
+    ///
+    /// `main.rs` converts this to physical pixels and calls
+    /// `Window::set_ime_cursor_area`; the framework never touches winit.
+    pub fn ime_cursor_area(&self) -> Option<Rect> {
+        self.ime_cursor
+    }
+
     pub fn cursor_shape(&self) -> CursorShape {
         self.cursor
     }
@@ -673,6 +770,18 @@ impl Ui {
 
     // -------------------------------------------------------------- textures
 
+    /// Claim the one-shot upload of the screen layer's generated textures.
+    ///
+    /// Returns `true` exactly once per `Ui`: a new context (another window, a
+    /// fresh test) owns no GPU textures yet, so it must upload its own copies.
+    pub(crate) fn claim_generated_textures(&mut self) -> bool {
+        if self.generated_textures_uploaded {
+            return false;
+        }
+        self.generated_textures_uploaded = true;
+        true
+    }
+
     /// Register a texture created by the app (cover art, …). It is uploaded by
     /// the renderer before this frame is drawn.
     pub fn upload_texture(&mut self, id: TextureId, width: u32, height: u32, rgba: Vec<u8>) {
@@ -683,7 +792,9 @@ impl Ui {
     /// Replace an existing texture's pixels.
     pub fn update_texture(&mut self, id: TextureId, width: u32, height: u32, rgba: Vec<u8>) {
         self.updated_textures
-            .push(TextureUpload::new(id, width, height, rgba));
+            .push(TextureUpdate::Whole(TextureUpload::new(
+                id, width, height, rgba,
+            )));
     }
 
     /// Release a texture the app no longer needs.
@@ -719,6 +830,26 @@ impl Ui {
     pub fn request_focus(&mut self, id: Id) {
         self.focus = Some(id);
         self.focus_visible = true;
+    }
+
+    /// Focus `id` only on the first frame it is focusable (its "opening"
+    /// frame), and return whether focus was requested.
+    ///
+    /// Use this for autofocus (inline editors, a rename field): call it
+    /// unconditionally while the widget exists. On the frame the widget first
+    /// appears it is not in either focus order, so focus is requested; on every
+    /// later frame it was part of last frame's focus order and the call is a
+    /// no-op — clicking away therefore cannot make the widget re-grab focus.
+    ///
+    /// A widget that stops being drawn for at least one frame is "new" again
+    /// when it reappears, which is what makes close-then-reopen autofocus work
+    /// without resetting any other retained state.
+    pub fn request_focus_on_open(&mut self, id: Id) -> bool {
+        if self.prev_focus_order.contains(&id) || self.focus_order.contains(&id) {
+            return false;
+        }
+        self.request_focus(id);
+        true
     }
 
     pub fn clear_focus(&mut self) {
@@ -767,8 +898,13 @@ impl Ui {
     }
 
     /// Whether the pointer is over `rect`, respecting the active clip and popup
-    /// blocking. Does not consume anything.
+    /// blocking. Does not consume anything. While a popup-dismissal gesture is
+    /// still being consumed (see `Ui::suppress_pointer_gesture`) nothing is
+    /// hovered: the gesture belongs to the overlay that was dismissed.
     pub fn hovered(&self, rect: Rect) -> bool {
+        if self.suppress_pointer_until_release {
+            return false;
+        }
         let pos = self.point();
         self.input.mouse_in_window
             && rect.contains(pos.x, pos.y)
@@ -783,10 +919,43 @@ impl Ui {
 
     // ---------------------------------------------------------- interaction
 
+    /// Consume the rest of the current pointer gesture.
+    ///
+    /// Called when an outside press dismisses an open popup: that press belongs
+    /// to the overlay, so the control under the pointer must neither latch the
+    /// press nor fire on the later release. While the latch is set,
+    /// [`Ui::interact`] returns an inert response and [`Ui::hovered`] is false.
+    /// It is released at the next release edge (or on `focus_lost`), so this is
+    /// scoped to exactly one gesture.
+    fn suppress_pointer_gesture(&mut self) {
+        self.suppress_pointer_until_release = true;
+        // A widget drawn *before* the popup could already have latched this
+        // press; drop it so the release frame cannot turn it into a click.
+        self.active = None;
+        self.drag_start = Vec2::ZERO;
+        self.drag_last = Vec2::ZERO;
+    }
+
     /// Core hit-test + press/release/drag state machine. Called by every widget.
     pub fn interact(&mut self, rect: Rect, id: Id, sense: Sense) -> Response {
         if sense.focus && !self.focus_order.contains(&id) {
             self.focus_order.push(id);
+        }
+        // A popup was dismissed by this gesture's press: stay inert (no hover,
+        // no press latch, no click, no focus change, no drag) until its release
+        // is consumed. Otherwise the row under the pointer would latch `active`
+        // on the press frame and fire on the release frame, after the popup has
+        // already closed.
+        if self.suppress_pointer_until_release {
+            let focused = self.focus == Some(id);
+            return Response {
+                id,
+                rect,
+                focused,
+                focus_visible: focused && self.focus_visible,
+                hover_t: self.animate_hover(id, 0.0),
+                ..Response::default()
+            };
         }
         let pos = self.point();
         let hovered = rect.contains(pos.x, pos.y)
@@ -850,7 +1019,15 @@ impl Ui {
         }
 
         // Keyboard activation: focused button responds to Enter/Space as a click.
+        // Flag it so positional widgets (sliders, scrollbar tracks) can ignore a
+        // keyboard click: there is no pointer position behind it, and reading
+        // `mouse_pos` would commit a fraction the user never pointed at. A
+        // simultaneous pointer release already set `clicked`; keep that one
+        // positional (`keyboard_activated` stays false).
         if sense.click && self.focus == Some(id) && self.keyboard_activated() {
+            if !r.clicked {
+                r.keyboard_activated = true;
+            }
             r.clicked = true;
         }
 

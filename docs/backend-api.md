@@ -121,7 +121,7 @@ as `BackendEvent::Error` from playback/metadata commands.
 | `rift-media` | backend | souvlaki media keys / now-playing |
 | `rift-discord` | backend | Discord Rich Presence IPC |
 | `rift-persist` | backend | background playback-snapshot writes |
-| `rift-durable` | backend | queued durable `library.json`/`settings.json` writes + shutdown flush |
+| `rift-durable` | backend | coalesced durable `library.json`/`settings.json` writes + shutdown flush |
 
 ---
 
@@ -171,7 +171,7 @@ impl BackendEvents {
 
 * Tokio `unbounded` mpsc underneath. Producers never block; the UI must drain
   **every frame** (`while let Some(ev) = events.try_recv() { state.apply(ev) }`)
-  or a long-lived play session grows the queue. At 5 progress events/s this is
+  or a long-lived play session grows the queue. At ~4 progress events/s this is
   trivial for a 60 fps drain.
 * Ordering is FIFO per producer; there is no cross-producer total order (audio
   pump vs command threads), so treat the bus as *broadcast state changes*, not
@@ -180,9 +180,14 @@ impl BackendEvents {
 * When the backend is dropped the channel closes: `try_recv` → `None`,
   `blocking_recv`/`recv` → `None`. Producers ignore a closed bus (shutdown must
   not panic).
-* Progress ticks are produced by the audio thread at ~5 Hz while playing and by
+* Progress ticks are produced by the audio thread at ~4 Hz (250 ms) while playing and by
   `seek`/track start, so the seek bar keeps moving even when nothing else is
-  happening.
+  happening. Every `Position`/`Duration`/`Ended` audio event carries the **play
+  identity** (the player generation the audio is playing under). The manager
+  discards one whose id is not `core.generation`, and discards `Ended` unless
+  playback is still `Playing`: a queued event from a stopped, paused or skipped
+  track can neither move the bar, correct the length, arm a crossfade nor
+  advance the queue.
 
 ### `BackendEvent` variants (payloads are the old `rift://…` payloads 1:1)
 
@@ -194,6 +199,7 @@ pub enum BackendEvent {
     Progress(rift_types::Progress),                // rift://progress
     Library(rift_types::Library),                  // rift://library
     Downloads(rift_types::DownloadState),          // rift://downloads
+    DownloadProgress { id: String, permille: u16 }, // rift://download_progress (new)
     Error(String),                                 // rift://error
     Notice(String),                                // rift://notice
     OpenPlaylist(String),                          // rift://open_playlist (playlist id)
@@ -208,9 +214,10 @@ impl BackendEvent { pub fn name(&self) -> &'static str; }  // the old event name
 | `Track` | playback starts; crossfade commits; credit enrichment updates the current row; player starts a new track |
 | `State` | play/pause/stop/loading transitions, seek does not change state |
 | `Queue` | any queue/current/shuffle/repeat change; also on a track's first play (twice is normal: once for the change, once after credit enrichment) |
-| `Progress` | audio-thread position tick (~5 Hz), decoder duration correction, track start, crossfade commit, `seek` |
+| `Progress` | audio-thread position tick (~4 Hz / 250 ms), decoder duration correction, track start, crossfade commit, `seek` |
 | `Library` | like/unlike, playlist create/import/delete/rename/move/add/remove, track backfill + recents on playback |
-| `Downloads` | download claimed/finished/failed/removed, including each retry pass, plus throttled byte-progress snapshots (≤100 ms apart) while the native downloader transfers a track |
+| `Downloads` | download claimed/finished/failed/removed, including each retry pass — a whole snapshot, authoritative for the status sets |
+| `DownloadProgress` | at most every 100 ms for the actively transferring track; carries only `id` + permille (`0..=1000`), so the UI can update one fraction without cloning `DownloadState` |
 | `Error` | playback failure, download failure/give-up, import parse failure, export write failure |
 | `Notice` | playlist exported, playlist imported (with count) |
 | `OpenPlaylist` | after a backend-driven playlist import (jump to the new playlist) |
@@ -227,6 +234,9 @@ fn pump_events(state: &mut AppState, events: &mut rift::BackendEvents) {
             rift::BackendEvent::Progress(p) => state.progress = p,
             rift::BackendEvent::Library(lib) => state.library = lib,
             rift::BackendEvent::Downloads(d) => state.downloads = d,
+            rift::BackendEvent::DownloadProgress { id, permille } => {
+                state.downloads.progress.insert(id, permille);
+            }
             rift::BackendEvent::Error(msg) | rift::BackendEvent::Notice(msg) => {
                 state.toasts.push(msg)
             }
@@ -256,31 +266,91 @@ data directory + `APP_IDENTIFIER`. This matches the previous shell's
 | Linux | `$XDG_DATA_HOME/dev.jerimiah.rift` (default `~/.local/share/dev.jerimiah.rift`) |
 | macOS | `~/Library/Application Support/dev.jerimiah.rift` |
 
-Files written there (all pre-existing formats, unchanged):
+Files written there (all pre-existing formats except the additive name index,
+which older builds simply ignore):
 
 | Path | Contents |
 |---|---|
 | `library.json` | likes, playlists, recently played (`rift_types::Library`) |
 | `settings.json` | volume, discord_rpc, crossfade, update_notifications |
 | `playback.json` | last queue snapshot (restored stopped on next launch) |
-| `downloads/<id>.m4a` | offline audio (presence == downloaded) |
-| `*.json.bad`, `*.json.bad.N` | backup of a corrupt state file; the first copy keeps `*.json.bad`, later corruptions get numbered names so no backup is ever overwritten (see `util::load_json`) |
+| `downloads/<safe stem>.m4a` | offline audio (presence == downloaded); the stem is `fetch::safe_stem(id)`, an injective `~xx` escape over `[a-z0-9_-]` |
+| `downloads/.names.json` | `stem -> id` ownership index for names that are not self-identifying (a capped/overlong stem, or a stem containing `_` that a pre-P5 fold could also produce); written atomically and pruned on load |
+| `*.json.bad`, `*.json.bad.N` | backup of an unusable (corrupt or unreadable) state file; the first copy keeps `*.json.bad`, later ones get numbered names so no backup is ever overwritten (see `util::load_json_with_parser` / `util::load_json_with_status`) |
+| `library.json.pre-collapse`, `library.json.pre-collapse.N` | snapshot of `library.json` taken before a load-time repair (the duplicate-song collapse, or a tolerant load that dropped unreadable rows); the first snapshot keeps the bare name and later repairs get numbered names, so an earlier snapshot is never overwritten |
+
+Offline naming is an explicit on-disk contract. `fetch::safe_stem` keeps
+`[a-z0-9_-]` literally and writes every other byte as `~` plus two lowercase hex
+digits (`a/b` -> `a~2fb`, `..` -> `~2e~2e`): reversible (`fetch::stem_id`),
+case-insensitively unique (`AbC` vs `abc`), free of separators/dots/spaces, and
+with Windows device names escaped (`con` -> `~63on`). Stems are capped at 120
+characters; a longer id keeps up to a 103-character prefix plus `!` and FNV-1a
+hex, mapped back through `downloads/.names.json`. That index also records a
+stem containing `_`, because the pre-P5 fold could have produced the same name
+for another id; an entry therefore marks an owned name, and `remove` leaves a
+`_` name owned by a different id alone. A transfer's temporary file is
+`<safe stem>.<claim token>.m4a.part`; `remove` invalidates the token, so a stale
+worker cannot publish over or delete the retry's part, and the next startup scan
+deletes any `.part` left by a crash. `Downloads::load` additionally keeps
+every existing non-empty `.m4a` stem and accepts the pre-P5 `_`-folded name
+(`fetch::legacy_safe_stem`, e.g. `a_b.m4a` for `a/b`) as a fallback, so an
+upgraded install's files stay playable without being renamed or deleted. A
+folded legacy name without an index entry cannot be reversed, so it is accepted
+for every id that folds to it; new writes never produce an ambiguous name, and
+publishing refuses to replace a non-empty final file it did not create.
 
 `library.json` and `settings.json` are **durable** and written off the caller's
 thread: a mutation queues a snapshot to a `util::DurableWriter` background
 thread (`rift-durable`), which serializes it and replaces the file with an
-atomic temp-file write + flush + rename in FIFO order — rapid mutations land in
-order, the last write wins, and a sync command called on the UI thread never
-blocks on disk. The contents are flushed to the storage device before the
+atomic temp-file write + flush + rename in FIFO order. Pending snapshots are
+**coalesced per path**: a newer save replaces the queued value/serializer in
+place (same queue position), so N rapid mutations cost one queued snapshot and
+the newest state still wins; the queue holds one pending snapshot per path plus
+the in-flight write, and a hard 64-path cap sends an overflow path's write
+inline on the caller's thread (logged, never silently dropped). A sync command
+called on the UI thread never blocks on disk in the normal path. `flush()`
+(and shutdown flush/drop) is the barrier: when it returns true, the newest
+snapshot for every write queued before it has been attempted — not that every
+save succeeded. The contents are flushed to the storage device before the
 rename (a flush failure is logged and the publish still happens), so
 `shutdown`/`flush` returning means the *content* is durable rather than only
-visible in the page cache. Startup **loads** remain synchronous, and the
-one-time duplicate-song repair's pre-repair backup copy is a synchronous
-startup-only `std::fs::copy`. Failure semantics are unchanged from the old
-synchronous path: a failed write is logged, not retried, and `load_json` moves
-a corrupt file aside (`*.json.bad`, numbered if that name is already taken); a
-file that cannot be read at all, or is not valid UTF-8, takes the same corrupt
-path instead of being silently treated as missing.
+visible in the page cache. Startup **loads** remain synchronous. The pre-repair
+snapshot is also written synchronously, through the same `util::atomic_write`
+(temp file in the library's own directory, `sync_all`, rename), so it is
+complete before the repair it protects can replace the live file; it is
+numbered so a second repair cannot destroy the first snapshot. Failure
+semantics: a failed write is logged and not retried.
+
+`library.json` is parsed **tolerantly per row**. The root must be a JSON object
+and `liked`, `recently_played` and `playlists` must be arrays when present (a
+missing array means empty; an explicit `null` or other type is the wrong type);
+otherwise the whole file takes the corrupt/quarantine path below. Each track
+row, each playlist and each of a playlist's track rows is then deserialized on
+its own (absent fields default, unknown fields are ignored). A row that cannot
+be understood — a non-object, a present field of the wrong type, or a row with
+neither an id nor a title/name — is dropped with a warning naming the category,
+counts and a few ids; every readable row is kept. Dropped rows make the load a
+successful, writable load, and the repaired subset is queued for an atomic save
+after the numbered `library.json.pre-collapse` snapshot, so the good rows are
+not lost on the next launch. A playlist whose own `id`/`name` or `tracks`
+container is malformed is dropped as a unit (there is nothing to iterate in a
+non-array container); its readable sibling playlists and rows are kept.
+`settings.json` has no row structure and keeps the strict parser.
+
+On load, a file that is not parseable (bad JSON or not valid UTF-8) is corrupt:
+it is moved aside to `*.json.bad` (numbered if that name is taken), the store
+starts from defaults, and it stays writable. A file that **exists but cannot be
+read** — a permission problem, or a transient sharing violation from a
+backup/AV tool on Windows — is *not* treated as missing: the same move-aside is
+attempted first, and if it succeeds the defaults are safe to save because the
+original survives as the backup. If the move-aside itself fails, whether for a
+read failure or for parse corruption, the file on disk is the user's only copy:
+the store becomes read-only for the session (`save` returns without writing) and
+an error naming the file is logged. Both unpreserved outcomes are reported
+through one `BackendEvent::Error` toast emitted by `RiftBackend::new` once its
+event bus exists (both stores load before the bus is created, so the warning is
+held until then; library and settings warnings are combined into that single
+toast); the parse-corruption one says the corrupt file could not be preserved.
 
 Preview mode (`RIFT_PREVIEW=1` in a debug build) never persists settings and
 skips network commands; the app renders placeholder data instead of calling the
@@ -297,9 +367,10 @@ an async command and still must be driven from a task; a sync method was a
 blocking command and is safe to call directly from the UI/controller thread
 (they take short locks and do no network I/O; library and settings writes are
 queued to the durable writer, see §4). The one deliberate disk I/O on a sync
-command is `remove_downloads`, which unlinks the selected offline files inline:
-that is an explicit user delete, the unlinks are cheap and bounded by the
-selection, and the UI needs the resulting `Downloads` event for the next frame.
+command is `remove_downloads`, which tombstones the selected ids and unlinks
+their offline files (and any in-flight `.part`) inline: that is an explicit user
+delete, the unlinks are cheap and bounded by the selection, and the UI needs the
+resulting `Downloads` event for the next frame.
 `RiftBackend::shutdown`/`Drop` flushes the durable queue (bounded wait, logged
 if it gives up) before the runtime and threads stop.
 
@@ -343,6 +414,14 @@ Errors: `"search failed: …"`, `"could not load artist: …"`,
 | `save_volume` | `fn save_volume(&self, volume: f32)` | persists; call on slider release only (clamped 0..=1; non-finite mutes) |
 | `set_discord_rpc` | `fn set_discord_rpc(&self, enabled: bool)` | persists + toggles RPC thread |
 | `set_crossfade` | `fn set_crossfade(&self, secs: f32)` | clamps to `0..=MAX_CROSSFADE (12.0)`; non-finite disables crossfade; persists, next transition |
+
+**Play identity / atomic request.** `play_tracks`/`play_track` replace the queue,
+validate `start`, reset the shuffle anchor, drop a prefetched crossfade pick and
+bump the player generation in one core critical section, so two rapid play
+commands cannot install one queue and start an index drawn from the other. The
+generation is the play identity sent to the audio thread; a crossfade sends the
+generation its commit will assign (`anchor + 1`). See
+`player/playback.rs::{prepare_play_index, crossfade_play_id}`.
 | `toggle_shuffle` | `fn toggle_shuffle(&self)` | emits `Queue` |
 | `cycle_repeat` | `fn cycle_repeat(&self)` | Off → All → One → Off; emits `Queue` |
 
@@ -385,8 +464,8 @@ API is only legal off the main thread, which this satisfies).
 
 | Method | Signature | Notes |
 |---|---|---|
-| `download_tracks` | `fn download_tracks(&self, tracks: Vec<Track>)` | spawns the sequential background job: native resolved + range-downloaded audio (streamed to a temp `.part` file with a progress callback); audio files are always published temp-file-then-rename; emits `Downloads` per track (including in-flight progress snapshots) and `Error` on failures; kept-offline playlists retry with backoff |
-| `remove_downloads` | `fn remove_downloads(&self, ids: Vec<String>)` | deletes the files inline (the one sanctioned sync-command disk I/O, see §5 intro; no-op in preview mode), emits `Downloads` |
+| `download_tracks` | `fn download_tracks(&self, tracks: Vec<Track>)` | spawns the sequential background job: native resolved + range-downloaded audio (streamed to a temp `.part` file with a progress callback, then published as `<safe stem>.m4a`); audio files are always published temp-file-then-rename and never over a non-empty file; emits a `Downloads` snapshot on each claim/finish/fail/remove, lightweight `DownloadProgress { id, permille }` at most every 100 ms while bytes move, and one coalesced `Error` per pass for failed one-off tracks (a single failure keeps its exact message; several become a count + first reason); kept-offline playlists retry with backoff |
+| `remove_downloads` | `fn remove_downloads(&self, ids: Vec<String>)` | cancels the id: clears its in-flight claim/progress/failed marks, tombstones it (a later `begin`/retry clears the tombstone), and deletes its `<safe stem>.m4a`, any pre-P5 legacy name for the id (unless the name index says that `_` name belongs to another id), the `.part`, and its `downloads/.names.json` entry (the index write is queued to the dedicated name writer; only the unlinks are sync-command disk I/O, see §5 intro; no-op in preview mode). The worker re-checks the tombstone before and after its rename, so a removed transfer publishes nothing and emits no error. Emits `Downloads`. |
 
 `DownloadState` includes `progress: HashMap<String, u16>` — the completed
 fraction of each in-flight download in permille (`0..=1000`). Only ids currently
@@ -424,13 +503,14 @@ used to sit behind this one.
 
 ### Cover art / images (new: not a former command)
 
-The app renders YouTube thumbnails, and it must not create a second HTTP client
-(second TLS stack / connection pool / timeout policy). The backend's shared
-client is exposed for exactly this one bounded GET:
+The app renders YouTube thumbnails, and it must not build a client per fetch.
+The backend owns one **dedicated image client** with the shared 5 s connect /
+30 s total timeout but a stricter policy; metadata and connectivity keep the
+shared client, so their behaviour is unchanged.
 
 | Method | Signature | Notes |
 |---|---|---|
-| `fetch_image` | `async fn fetch_image(&self, url: String) -> Result<Vec<u8>, String>` | **network**; one GET through the backend's shared `reqwest::Client` (5 s connect / 30 s total timeout). Returns raw encoded image bytes (PNG/JPEG/WebP as served — caller decodes with its `image` crate). Only absolute `http(s)` URLs; body capped at `rift::MAX_IMAGE_BYTES` (16 MiB), enforced against both the declared length and the actual chunks. Errors: `"refusing to fetch a non-http(s) image url"`, `"image fetch failed: …"`, `"image too large …"`. Spawn it from a task; never block a frame on it. |
+| `fetch_image` | `async fn fetch_image(&self, url: String) -> Result<Vec<u8>, String>` | **network**; one GET through the dedicated image client. Absolute **HTTPS** only; no credentials; no non-default port. Host allow-list by label-boundary suffix: `ytimg.com`, `ggpht.com`, `googleusercontent.com`, `gstatic.com` (the hosts the fixtures/app consume: `i.ytimg.com`, `yt3`/`lh3.googleusercontent.com`, `yt3.ggpht.com`, `www.gstatic.com/youtube/media/ytm/images/artist_avatar…`). Response `Content-Type` must start with `image/`. Redirects are re-validated per hop against the same rule, capped at 3, and never followed off-list. Body capped at `rift::MAX_IMAGE_BYTES` (16 MiB), enforced against both the declared length and the streamed chunks. Errors: `"refusing to fetch an image: …"`, `"image fetch failed: …"`, `"image too large …"`. Spawn it from a task; never block a frame on it. |
 
 Use it as the single cover-art path:
 
@@ -562,16 +642,19 @@ Ordering rules that matter:
 A dedicated event-pump thread is possible instead of per-frame draining:
 `std::thread::spawn(move || while let Some(ev) = events.blocking_recv() { ... })`
 `BackendEvents` is `Send`. The per-frame drain is simpler and sufficient at
-5 progress events/s.
+~4 progress events/s.
 
 ---
 
-## 7. Old command → new method mapping (all 46 former commands)
+## 7. Old command → new method mapping (43 legacy commands in the tree)
 
 The old backend registered **46** commands in `invoke_handler`/permissions
 (the migration brief said 55; the checked-in source and the generated
-permission set were both 46). 43 are preserved 1:1 as methods; the 3 window
-commands moved to the winit app.
+permission set were both 46). Native streaming removed three yt-dlp management
+commands (`commands/ytdlp.rs`: check / set-path / install), leaving 43: **40**
+are preserved 1:1 as methods and the **3** window commands moved to the winit
+app. Two methods were added by the native rewrite (`fetch_image`, `is_online`),
+so `BackendHandle` exposes **42** public command methods.
 
 | Old `invoke("…")` | New call | Status |
 |---|---|---|
@@ -639,7 +722,7 @@ responsibility and has a native equivalent:
 * **Audio thread** — rodio playback, in-memory decode, seek, crossfade, volume,
   progress/end/decoder-failure events, all unchanged.
 * **Progress ticker** — still a periodic sender: the audio thread pushes
-  `Position` ~5×/s while playing; the event pump turns it into
+  `Position` every 250 ms (~4×/s) while playing; the event pump turns it into
   `BackendEvent::Progress`. It is not tied to commands or UI activity.
 * **Queue/session persistence** — `playback.json` snapshot on every queue
   change, restored stopped at next launch; identical best-effort semantics
@@ -657,7 +740,15 @@ responsibility and has a native equivalent:
   a `PING` from Discord is answered with a `PONG` carrying the same payload,
   `PONG`/unknown opcodes are skipped, a frame carrying another command's nonce is
   skipped instead of being mistaken for the reply, and a `CLOSE` opcode is
-  reported with Discord's close code so the caller reconnects. The backend
+  reported with Discord's close code so the caller reconnects. On Unix the
+  socket carries a 250 ms read/write timeout, shorter than the backend's 500 ms
+  per-command deadline, so a silent peer is an I/O error and the worker thread
+  retires/reconnects normally instead of being abandoned. A Windows named pipe
+  has no std timeout (an interruptible read needs unsafe FFI, which the crate
+  forbids), so the backend bounds that case: at most 3 stalled workers are
+  abandoned per session, then presence is disabled until restart (one warning),
+  rather than leaking a thread/socket per stall. An activity posted before the cap can
+  remain visible until Discord clears it or the app restarts (clearing needs a request). The backend
   keeps its dedicated thread, coalescing and 15 s/60 s pacing; enabled state
   comes from settings and `set_discord_rpc`. A track that restarts (repeat-one,
   replay) is detected as a same-identity `Track`; the presence is cleared, left
@@ -757,7 +848,7 @@ handshake/set/clear/refresh against the real Discord client:
 
 ### Package / targets
 
-* package `rift`, version from the workspace (`0.6.0`), Rust floor 1.88.
+* package `rift`, version from the workspace (`0.6.1`), Rust floor 1.88.
 * `[lib] name = "rift"`, path `src/lib.rs`. No binary, no build script.
 * Public re-exports include `RiftBackend`, `BackendHandle`, `BackendConfig`,
   `BackendError`, `BackendEvent`, `BackendEvents`, `native_data_dir`,

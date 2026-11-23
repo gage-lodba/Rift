@@ -5,16 +5,249 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rift_types::{Library, Playlist, Track};
+use serde::Deserialize;
+use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::util::DurableWriter;
+use crate::util::{DurableWriter, LoadStatus};
 
 const RECENT_CAP: usize = 30;
 
 /// Where the pre-repair library is snapshotted before the one-time collapse
-/// rewrites it. A sibling of `library.json`, so the repair is recoverable by
-/// hand even if the merge rule ever guesses wrong about a song.
+/// (or a tolerant parse that dropped rows) rewrites it. A sibling of
+/// `library.json`, so the repair is recoverable by hand even if the merge rule
+/// ever guesses wrong about a song. A later repair never overwrites an earlier
+/// snapshot: it gets `.1`, `.2`, … (see [`crate::util::free_backup_path`]).
 const PRE_COLLAPSE_BACKUP: &str = "library.json.pre-collapse";
+
+/// How many dropped-row labels a warning quotes, so a badly broken file cannot
+/// turn one log line into a megabyte of ids.
+const MAX_DROPPED_LABELS: usize = 8;
+
+/// The categories a tolerant load counts separately, so the warning names what
+/// was lost instead of one opaque total.
+#[derive(Debug, Clone, Copy)]
+enum DroppedKind {
+    Liked,
+    Recent,
+    Playlist,
+    PlaylistTrack,
+}
+
+impl DroppedKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Liked => "liked",
+            Self::Recent => "recently played",
+            Self::Playlist => "playlist",
+            Self::PlaylistTrack => "playlist track",
+        }
+    }
+}
+
+/// Rows a tolerant load could not understand, counted per category with a few
+/// ids/titles kept for the warning.
+#[derive(Default)]
+struct DroppedRows {
+    liked: usize,
+    recently_played: usize,
+    playlists: usize,
+    playlist_tracks: usize,
+    labels: Vec<String>,
+}
+
+impl DroppedRows {
+    fn note(&mut self, kind: DroppedKind, index: usize, row: &Value, error: &str) {
+        match kind {
+            DroppedKind::Liked => self.liked += 1,
+            DroppedKind::Recent => self.recently_played += 1,
+            DroppedKind::Playlist => self.playlists += 1,
+            DroppedKind::PlaylistTrack => self.playlist_tracks += 1,
+        }
+        let label = row_label(kind, index, row);
+        debug!("library.json: dropping unreadable {label}: {error}");
+        if self.labels.len() < MAX_DROPPED_LABELS {
+            self.labels.push(label);
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.liked + self.recently_played + self.playlists + self.playlist_tracks
+    }
+
+    fn any(&self) -> bool {
+        self.total() > 0
+    }
+
+    /// Per-kind counts plus the first few row identities: enough for the user
+    /// (and a bug report) to find the rows that were dropped, without quoting
+    /// the rows themselves.
+    fn summary(&self) -> String {
+        let mut counts = Vec::new();
+        let mut push = |n: usize, what: &str| {
+            if n > 0 {
+                counts.push(format!("{n} {what}"));
+            }
+        };
+        push(self.liked, "liked");
+        push(self.recently_played, "recently played");
+        push(self.playlists, "playlist");
+        push(self.playlist_tracks, "playlist track");
+        let mut summary = counts.join(", ");
+        if !self.labels.is_empty() {
+            summary.push_str(" — dropped ");
+            summary.push_str(&self.labels.join(", "));
+            let hidden = self.total() - self.labels.len();
+            if hidden > 0 {
+                summary.push_str(&format!(", and {hidden} more"));
+            }
+        }
+        summary
+    }
+}
+
+/// A safe identity for a dropped row: an id, else a title/name, else its
+/// position. Never the whole row (it may be huge, or not an object at all).
+fn row_label(kind: DroppedKind, index: usize, row: &Value) -> String {
+    let text = |key: &str| -> Option<&str> {
+        row.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    match text("id")
+        .or_else(|| text("title"))
+        .or_else(|| text("name"))
+    {
+        Some(identity) => format!("{} #{index} ({identity:?})", kind.label()),
+        None => format!("{} #{index}", kind.label()),
+    }
+}
+
+/// A root field that must be an array when present.
+///
+/// Missing means "not written by this version", which the additive format
+/// treats as empty. Any other type (including `null`, which is not an absent
+/// field) is not usable state: returning `Err` keeps the existing whole-file
+/// quarantine for a document whose structure is wrong.
+fn array_field<'a>(
+    root: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a Vec<Value>>, String> {
+    match root.get(field) {
+        None => Ok(None),
+        Some(Value::Array(rows)) => Ok(Some(rows)),
+        Some(_) => Err(format!("`{field}` is not an array")),
+    }
+}
+
+/// Deserialize one track row. A row is understood when it is a JSON object whose
+/// present fields have the right types **and** it names something (a video id or
+/// a title); the serde defaults fill absent fields so an old row still loads.
+fn track_from_row(row: &Value) -> Result<Track, String> {
+    let track = Track::deserialize(row).map_err(|e| e.to_string())?;
+    if track.id.is_empty() && track.title.is_empty() {
+        return Err("the row has neither a video id nor a title".into());
+    }
+    Ok(track)
+}
+
+/// Deserialize one playlist row and each of its tracks on its own.
+///
+/// A playlist's own fields are read here rather than through serde's strict
+/// `Playlist` deserializer: absent fields default so an older file still loads,
+/// while a present field of the wrong type rejects the playlist. `tracks` is
+/// split out and parsed row by row, so one bad track costs that track, not the
+/// playlist. A `tracks` container that is not an array is a malformed playlist
+/// row and is dropped whole — there is nothing to iterate.
+fn playlist_from_row(row: &Value, dropped: &mut DroppedRows) -> Result<Playlist, String> {
+    let Some(fields) = row.as_object() else {
+        return Err("the playlist row is not a JSON object".into());
+    };
+    let tracks = match fields.get("tracks") {
+        None => None,
+        Some(Value::Array(rows)) => Some(rows),
+        Some(_) => return Err("the playlist's `tracks` is not an array".into()),
+    };
+    let text_field = |field: &str| -> Result<String, String> {
+        match fields.get(field) {
+            None => Ok(String::new()),
+            Some(Value::String(value)) => Ok(value.clone()),
+            Some(_) => Err(format!("the playlist's `{field}` is not a string")),
+        }
+    };
+    let mut playlist = Playlist {
+        id: text_field("id")?,
+        name: text_field("name")?,
+        tracks: Vec::new(),
+    };
+    if playlist.id.is_empty() && playlist.name.is_empty() {
+        return Err("the playlist has neither an id nor a name".into());
+    }
+    for (index, row) in tracks.into_iter().flatten().enumerate() {
+        match track_from_row(row) {
+            Ok(track) => playlist.tracks.push(track),
+            Err(error) => dropped.note(DroppedKind::PlaylistTrack, index, row, &error),
+        }
+    }
+    Ok(playlist)
+}
+
+/// Parse `library.json` structurally and one row at a time.
+///
+/// `Err` means the document is not usable state at all (not valid JSON, not a
+/// root object, or a root array of the wrong type): the caller must quarantine
+/// it. `Ok((library, true))` means the document was usable but at least one row
+/// was dropped; every readable row is in `library`, and the caller must save it
+/// back after its pre-repair snapshot.
+fn parse_library_document(bytes: &[u8]) -> Result<(Library, bool), String> {
+    let document: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let Some(root) = document.as_object() else {
+        return Err("the root document is not a JSON object".into());
+    };
+    let liked = array_field(root, "liked")?;
+    let recently_played = array_field(root, "recently_played")?;
+    let playlists = array_field(root, "playlists")?;
+
+    let mut library = Library::default();
+    let mut dropped = DroppedRows::default();
+
+    if let Some(rows) = liked {
+        for (index, row) in rows.iter().enumerate() {
+            match track_from_row(row) {
+                Ok(track) => library.liked.push(track),
+                Err(error) => dropped.note(DroppedKind::Liked, index, row, &error),
+            }
+        }
+    }
+    if let Some(rows) = recently_played {
+        for (index, row) in rows.iter().enumerate() {
+            match track_from_row(row) {
+                Ok(track) => library.recently_played.push(track),
+                Err(error) => dropped.note(DroppedKind::Recent, index, row, &error),
+            }
+        }
+    }
+    if let Some(rows) = playlists {
+        for (index, row) in rows.iter().enumerate() {
+            match playlist_from_row(row, &mut dropped) {
+                Ok(playlist) => library.playlists.push(playlist),
+                Err(error) => dropped.note(DroppedKind::Playlist, index, row, &error),
+            }
+        }
+    }
+
+    if dropped.any() {
+        warn!(
+            "library.json: could not understand {} row(s) and dropped them; kept every readable \
+             row ({})",
+            dropped.total(),
+            dropped.summary()
+        );
+        Ok((library, true))
+    } else {
+        Ok((library, false))
+    }
+}
 
 /// Fold rows that are the same song ([`Track::same_song`]) into their first
 /// occurrence, which keeps its position and its id and absorbs whatever a later
@@ -146,6 +379,14 @@ pub struct LibraryStore {
     /// neither read nor written, so interacting with placeholder rows can't
     /// persist junk or reorder the user's real playlists.
     ephemeral: bool,
+    /// Set when `library.json` existed but could not be read or parsed **and**
+    /// could not be moved aside: writing the in-memory defaults would destroy
+    /// the user's only copy, so [`save`](Self::save) refuses to write for this
+    /// session.
+    read_only: bool,
+    /// The startup toast for a load that could not preserve the file, held until
+    /// the backend's event bus exists — this store is constructed before it.
+    load_warning: Option<String>,
     /// The backend's durable writer. Saves are queued to it instead of written
     /// here, so a command called from the UI thread never blocks on disk I/O.
     writer: Arc<DurableWriter>,
@@ -155,11 +396,17 @@ impl LibraryStore {
     /// Load the library at startup.
     ///
     /// Loading stays **synchronous**: startup must finish before the app can
-    /// run, and the repair below has to be part of the returned state. The one
-    /// write this can perform (the collapse repair's save) is queued to
-    /// `writer` like every other save, but [`back_up_before_repair`] is a direct
-    /// `std::fs::copy` — startup-only, once per repaired launch, and deliberate
-    /// rather than an oversight.
+    /// run, and the repairs below have to be part of the returned state. The
+    /// document is parsed row by row ([`parse_library_document`]), so one
+    /// unreadable like, playlist or playlist track costs only that row; the
+    /// repaired value is written back after the pre-repair snapshot so the good
+    /// rows do not disappear on the next launch.
+    ///
+    /// The one write this can perform (the repair save) is queued to `writer`
+    /// like every other save, but [`back_up_before_repair`] is written
+    /// synchronously through [`crate::util::atomic_write`] — temp file in the
+    /// same directory, `sync_all`, then rename — because it must be durable
+    /// before the repair it protects can replace the live file.
     ///
     /// [`back_up_before_repair`]: Self::back_up_before_repair
     pub fn load(dir: &std::path::Path, writer: &Arc<DurableWriter>) -> Self {
@@ -170,16 +417,23 @@ impl LibraryStore {
                 path,
                 data: Library::default(),
                 ephemeral: true,
+                read_only: false,
+                load_warning: None,
                 writer: Arc::clone(writer),
             };
         }
-        let mut data = crate::util::load_json(&path);
+        let (mut data, status) = crate::util::load_json_with_parser(&path, parse_library_document);
+        let read_only = !status.may_overwrite();
+        let load_warning = status.warning(&path);
         info!("library loaded from {}", path.display());
         let collapsed = collapse_duplicates(&mut data);
+        let repaired_rows = matches!(status, LoadStatus::Repaired);
         let store = Self {
             path,
             data,
             ephemeral: false,
+            read_only,
+            load_warning,
             writer: Arc::clone(writer),
         };
         if collapsed > 0 {
@@ -189,24 +443,50 @@ impl LibraryStore {
             // is queued on the durable writer, so startup does not block on it
             // (the backend's shutdown flush makes it durable).
             warn!("collapsed {collapsed} duplicate song row(s) in the library");
+        }
+        if collapsed > 0 || repaired_rows {
+            // Both repairs replace user data with a subset of it, so the old
+            // file is snapshotted first and the repaired save only replaces it
+            // after its own temp file is durable (see `atomic_write`).
             store.back_up_before_repair();
             store.save();
         }
         store
     }
 
-    /// Copy the library aside before the one-time repair rewrites it.
+    /// Snapshot the library aside before a repair rewrites it.
+    ///
+    /// The snapshot is written with [`crate::util::atomic_write`]: a temp file
+    /// in the library's own directory, flushed with `sync_all`, then renamed to
+    /// the backup name. A crash can therefore leave the old snapshot or the new
+    /// one, never a half-written copy. The name is numbered via
+    /// [`crate::util::free_backup_path`] (`library.json.pre-collapse`,
+    /// `.pre-collapse.1`, …), so a second repair cannot destroy the first
+    /// snapshot.
     ///
     /// Best effort on purpose: a backup that cannot be written must not stop the
-    /// repair the user needs, and the write itself stays atomic, so the worst
-    /// case is the pre-repair file being lost on a disk already refusing writes.
+    /// repair the user needs, and that repair's own save is atomic too, so the
+    /// live file is never replaced by a partial write. The only loss in that
+    /// case is the extra hand-recovery copy.
     ///
-    /// This copy is deliberately synchronous: it runs once, during startup, and
+    /// This write is deliberately synchronous: it runs once, during startup, and
     /// the repair it protects must not be able to outrun it.
     fn back_up_before_repair(&self) {
-        let backup = self.path.with_file_name(PRE_COLLAPSE_BACKUP);
-        match std::fs::copy(&self.path, &backup) {
-            Ok(_) => info!("pre-repair library saved to {}", backup.display()),
+        let requested = self.path.with_file_name(PRE_COLLAPSE_BACKUP);
+        let backup = crate::util::free_backup_path(&requested);
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!("no library.json to snapshot before repairing it");
+                return;
+            }
+            Err(e) => {
+                warn!("could not read the library before repairing it: {e}");
+                return;
+            }
+        };
+        match crate::util::atomic_write(&backup, &bytes) {
+            Ok(()) => info!("pre-repair library saved to {}", backup.display()),
             Err(e) => warn!("could not back up the library before repairing it: {e}"),
         }
     }
@@ -219,14 +499,27 @@ impl LibraryStore {
     /// The durable writer serializes and atomically writes the snapshot in
     /// queue order; [`DurableWriter::flush`] is the barrier that makes the
     /// result observable (tests and shutdown).
+    ///
+    /// Refuses to write when the load could neither read nor preserve
+    /// `library.json`: the defaults in memory are not the user's library, and
+    /// saving them would overwrite the one copy that is still on disk.
     pub fn save(&self) {
-        if self.ephemeral {
+        if self.ephemeral || self.read_only {
             return;
         }
         self.writer
             .write(self.path.clone(), "library", self.data.clone(), |data| {
                 serde_json::to_vec_pretty(data).map_err(|e| e.to_string())
             });
+    }
+
+    /// The warning for a load that could not preserve `library.json`, or `None`
+    /// when the load was clean, repairable, or the file was absent.
+    ///
+    /// The backend emits this once its event bus exists; it is empty here
+    /// because loading runs during construction, before the bus.
+    pub(crate) fn load_warning(&self) -> Option<&str> {
+        self.load_warning.as_deref()
     }
 
     /// Like a track, or un-like it if it is already liked.
@@ -581,6 +874,372 @@ mod tests {
     ) -> (LibraryStore, std::sync::Arc<DurableWriter>) {
         let writer = std::sync::Arc::new(DurableWriter::spawn());
         (LibraryStore::load(dir.path(), &writer), writer)
+    }
+
+    /// A first launch: no file, defaults in memory, and the first mutation
+    /// creates the file. Missing is not an error.
+    #[test]
+    fn a_missing_library_loads_defaults_and_stays_writable() {
+        let dir = crate::util::testing::TempDir::new("library-missing");
+        let (mut lib, writer) = temp_store(&dir);
+        assert!(lib.data.liked.is_empty());
+        assert!(!dir.join("library.json").exists());
+
+        lib.create_playlist("First Mix".into());
+        assert!(writer.flush(), "the save must reach disk");
+
+        let reloaded = crate::util::load_json::<Library>(&dir.join("library.json"));
+        assert_eq!(reloaded.playlists.len(), 1);
+        assert_eq!(reloaded.playlists[0].name, "First Mix");
+    }
+
+    /// A readable-but-corrupt file keeps its historical path: quarantine it,
+    /// start from defaults, and let the next save write a fresh file.
+    #[test]
+    fn a_corrupt_library_is_quarantined_and_stays_writable() {
+        let dir = crate::util::testing::TempDir::new("library-corrupt");
+        let path = dir.join("library.json");
+        std::fs::write(&path, b"{ this is not json").expect("seed corrupt file");
+
+        let (mut lib, writer) = temp_store(&dir);
+        lib.toggle_like(track("a"));
+        assert!(writer.flush(), "the fresh library must be written");
+
+        let backup = path.with_extension("json.bad");
+        assert_eq!(
+            std::fs::read(&backup).expect("the corrupt original must be kept"),
+            b"{ this is not json"
+        );
+        let reloaded = crate::util::load_json::<Library>(&path);
+        assert_eq!(reloaded.liked.len(), 1, "the store stayed writable");
+    }
+
+    /// The bug: a file that exists but cannot be read must not be treated as
+    /// "missing". When even the quarantine rename fails, the store is read-only
+    /// and a mutation + save leaves the original bytes untouched.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_library_that_cannot_be_quarantined_is_never_overwritten() {
+        let dir = crate::util::testing::TempDir::new("library-unreadable");
+        if crate::util::testing::running_as_root(&dir) {
+            return; // permission bits do not stop root
+        }
+        let path = dir.join("library.json");
+        let stored = Library {
+            liked: vec![track("kept")],
+            ..Library::default()
+        };
+        crate::util::save_json(&path, &stored, "library");
+        let original = std::fs::read(&path).expect("seed bytes");
+
+        let guard = crate::util::testing::UnreadableFile::apply(dir.path(), &path);
+        guard.lock_parent_dir();
+
+        let (mut lib, writer) = temp_store(&dir);
+        assert!(
+            lib.read_only,
+            "the load must put the store in read-only mode"
+        );
+        assert!(
+            lib.load_warning()
+                .is_some_and(|w| w.contains("changes will not be saved")),
+            "the backend needs a startup warning: {:?}",
+            lib.load_warning()
+        );
+        lib.toggle_like(track("new"));
+        assert!(
+            writer.flush(),
+            "nothing is queued, so this drains instantly"
+        );
+
+        guard.make_file_readable();
+        assert_eq!(
+            std::fs::read(&path).expect("the original must still be there"),
+            original,
+            "an unreadable library that could not be quarantined must not be overwritten"
+        );
+        assert!(
+            !path.with_extension("json.bad").exists(),
+            "the failed quarantine must not leave a bogus backup"
+        );
+    }
+
+    /// Finding 1: one malformed row in `liked`, one malformed playlist and one
+    /// malformed playlist track must cost only those rows. Everything readable
+    /// is kept, the load is not corruption, and the repaired subset is written
+    /// back (after the pre-repair snapshot) so the good rows survive the next
+    /// launch.
+    #[test]
+    fn a_partially_unreadable_library_keeps_every_readable_row() {
+        let dir = crate::util::testing::TempDir::new("library-tolerant");
+        let path = dir.join("library.json");
+        let document = serde_json::json!({
+            "liked": [
+                track("liked-1"),
+                {"id": 42, "title": "wrong id type"},
+                track("liked-2"),
+            ],
+            "recently_played": [
+                track("recent-1"),
+                {"id": null, "title": "wrong id value"},
+            ],
+            "playlists": [
+                {
+                    "id": "pl-1",
+                    "name": "Mix",
+                    "tracks": [
+                        track("track-1"),
+                        {"title": 17},
+                        track("track-2"),
+                    ],
+                },
+                {"id": 9, "name": "wrong field type"},
+                "not a playlist",
+            ],
+        });
+        let original = serde_json::to_vec_pretty(&document).expect("serialize document");
+        std::fs::write(&path, &original).expect("seed partially corrupt library");
+
+        let (lib, writer) = temp_store(&dir);
+
+        assert_eq!(
+            lib.data
+                .liked
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["liked-1", "liked-2"],
+            "the readable likes must all be kept"
+        );
+        assert_eq!(
+            lib.data
+                .recently_played
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent-1"]
+        );
+        assert_eq!(lib.data.playlists.len(), 1, "only the readable playlist");
+        assert_eq!(lib.data.playlists[0].id, "pl-1");
+        assert_eq!(
+            lib.data.playlists[0]
+                .tracks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["track-1", "track-2"],
+            "the playlist's readable tracks must survive their bad sibling"
+        );
+        assert!(
+            lib.load_warning().is_none(),
+            "a repairable file is a successful load, not a startup error"
+        );
+        assert!(
+            !path.with_extension("json.bad").exists(),
+            "a repairable file must not be quarantined"
+        );
+        assert!(
+            !lib.read_only,
+            "dropping rows must leave the library writable"
+        );
+
+        assert!(writer.flush(), "the repaired library must be saved");
+        let reloaded: Library = crate::util::load_json(&path);
+        assert_eq!(
+            reloaded, lib.data,
+            "the repaired file must round-trip the kept rows"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(super::PRE_COLLAPSE_BACKUP)).expect("pre-repair snapshot"),
+            original,
+            "the original document must be recoverable before the repair replaces it"
+        );
+
+        // A reload of the repaired file is a clean load: nothing left to drop,
+        // so it must not queue another repair or make a second snapshot.
+        let (clean, clean_writer) = temp_store(&dir);
+        assert_eq!(clean.data, lib.data);
+        assert!(clean_writer.flush());
+        assert!(
+            !dir.join(&format!("{}.1", super::PRE_COLLAPSE_BACKUP))
+                .exists(),
+            "a clean reload must not create another pre-repair snapshot"
+        );
+    }
+
+    /// The structure that never becomes repairable keeps the historical whole-
+    /// file quarantine: a root that is not an object, or a root array of the
+    /// wrong type.
+    #[test]
+    fn a_library_whose_root_or_arrays_are_unusable_is_still_quarantined() {
+        for (tag, bytes) in [
+            ("root-array", br#"[]"#.as_slice()),
+            ("root-string", br#""not a library""#.as_slice()),
+            ("liked-object", br#"{"liked": {}}"#.as_slice()),
+            (
+                "playlists-string",
+                br#"{"liked": [], "playlists": "nope"}"#.as_slice(),
+            ),
+        ] {
+            let dir = crate::util::testing::TempDir::new(&format!("library-corrupt-{tag}"));
+            let path = dir.join("library.json");
+            std::fs::write(&path, bytes).expect("seed unusable document");
+
+            let (lib, _writer) = temp_store(&dir);
+
+            assert_eq!(
+                lib.data,
+                Library::default(),
+                "{tag}: unusable state must start from defaults"
+            );
+            assert!(
+                !path.exists(),
+                "{tag}: the unusable file must be moved aside"
+            );
+            assert!(
+                path.with_extension("json.bad").is_file(),
+                "{tag}: the unusable file must survive as a backup"
+            );
+            assert!(
+                !dir.join(super::PRE_COLLAPSE_BACKUP).exists(),
+                "{tag}: there is no repaired state to snapshot"
+            );
+        }
+    }
+
+    /// A fully valid file is left byte-for-byte alone: no quarantine, no
+    /// snapshot, no rewrite of rows that did not need one.
+    #[test]
+    fn a_fully_valid_library_is_loaded_without_rewriting_the_file() {
+        let dir = crate::util::testing::TempDir::new("library-valid-unchanged");
+        let path = dir.join("library.json");
+        let stored = Library {
+            liked: vec![track("liked")],
+            recently_played: vec![track("recent")],
+            playlists: vec![Playlist {
+                id: "pl-1".into(),
+                name: "Mix".into(),
+                tracks: vec![track("playlist-track")],
+            }],
+        };
+        crate::util::save_json(&path, &stored, "library");
+        let before = std::fs::read(&path).expect("seed bytes");
+
+        let (lib, writer) = temp_store(&dir);
+
+        assert_eq!(lib.data, stored);
+        assert!(
+            writer.flush(),
+            "nothing is queued, so this drains instantly"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            before,
+            "a valid library must not be rewritten"
+        );
+        assert!(!path.with_extension("json.bad").exists());
+        assert!(!dir.join(super::PRE_COLLAPSE_BACKUP).exists());
+    }
+
+    /// Finding 3: a second repair must not overwrite the first pre-repair
+    /// snapshot. Both are numbered siblings of `library.json`, and the newer one
+    /// holds the content that was live when the second repair ran.
+    #[test]
+    fn a_second_repair_keeps_both_pre_repair_snapshots() {
+        let dir = crate::util::testing::TempDir::new("library-repair-backup-twice");
+        let path = dir.join("library.json");
+        crate::util::save_json(
+            &path,
+            &Library {
+                liked: vec![album_row(), artist_row()],
+                ..Library::default()
+            },
+            "library",
+        );
+        let first_bytes = std::fs::read(&path).expect("first seed");
+
+        let (first, writer) = temp_store(&dir);
+        assert_eq!(first.data.liked.len(), 1);
+        assert!(writer.flush());
+
+        crate::util::save_json(
+            &path,
+            &Library {
+                liked: vec![artist_row(), album_row()],
+                ..Library::default()
+            },
+            "library",
+        );
+        let second_bytes = std::fs::read(&path).expect("second seed");
+
+        let (second, writer) = temp_store(&dir);
+        assert_eq!(second.data.liked.len(), 1);
+        assert!(writer.flush());
+
+        let first_backup = dir.join(super::PRE_COLLAPSE_BACKUP);
+        let second_backup = dir.join(&format!("{}.1", super::PRE_COLLAPSE_BACKUP));
+        assert_eq!(
+            std::fs::read(&first_backup).expect("first snapshot"),
+            first_bytes,
+            "the first repair's snapshot must stay intact"
+        );
+        assert_eq!(
+            std::fs::read(&second_backup).expect("second snapshot"),
+            second_bytes,
+            "the second snapshot must be the content that was live before the second repair"
+        );
+
+        let current: Library = crate::util::load_json(&path);
+        assert_eq!(
+            current.liked.len(),
+            1,
+            "the live file must be the repaired subset, not either snapshot"
+        );
+    }
+
+    /// Finding 2: parse corruption whose quarantine rename fails is the same
+    /// safety problem as an unreadable file whose rename fails. The store must be
+    /// read-only and leave the corrupt original untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_corrupt_library_that_cannot_be_quarantined_is_never_overwritten() {
+        let dir = crate::util::testing::TempDir::new("library-corrupt-unpreserved");
+        if crate::util::testing::running_as_root(&dir) {
+            return; // permission bits do not stop root
+        }
+        let path = dir.join("library.json");
+        let original = b"{ this is not json";
+        std::fs::write(&path, original).expect("seed corrupt file");
+
+        let _guard = crate::util::testing::ReadOnlyDir::apply(dir.path());
+        let (mut lib, writer) = temp_store(&dir);
+        assert!(
+            lib.read_only,
+            "a corrupt file that could not be moved aside must make the store read-only"
+        );
+        assert!(
+            lib.load_warning().is_some_and(|w| {
+                w.contains("corrupt file could not be preserved")
+                    && w.contains("changes will not be saved")
+            }),
+            "the backend needs a warning naming the unpreserved corruption: {:?}",
+            lib.load_warning()
+        );
+        lib.toggle_like(track("new"));
+        assert!(
+            writer.flush(),
+            "nothing is queued, so this drains instantly"
+        );
+
+        assert_eq!(
+            std::fs::read(&path).expect("the original must still be there"),
+            original,
+            "an unpreserved corrupt library must not be overwritten"
+        );
+        assert!(
+            !path.with_extension("json.bad").exists(),
+            "the failed quarantine must not leave a bogus backup"
+        );
     }
 
     #[test]

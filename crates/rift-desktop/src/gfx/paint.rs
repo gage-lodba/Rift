@@ -334,6 +334,50 @@ impl TextureUpload {
     }
 }
 
+/// A partial replacement of an existing texture's pixels.
+///
+/// The glyph atlas rasterises one or two new glyphs on most "typing" frames.
+/// Uploading the whole 1024²/2048² image for those would copy multiple MiB and
+/// force a GPU fence wait for a few hundred changed pixels; a region update
+/// carries only the dirty rectangle. The destination image keeps its existing
+/// size (a size change is a [`TextureUpdate::Whole`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextureRegion {
+    pub id: TextureId,
+    /// Destination origin in texture pixels.
+    pub x: u32,
+    pub y: u32,
+    /// Region size in pixels; `rgba` is tightly packed `width * height * 4`.
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl TextureRegion {
+    pub fn new(id: TextureId, x: u32, y: u32, width: u32, height: u32, rgba: Vec<u8>) -> Self {
+        debug_assert_eq!(rgba.len(), width as usize * height as usize * 4);
+        Self {
+            id,
+            x,
+            y,
+            width,
+            height,
+            rgba,
+        }
+    }
+}
+
+/// One replacement for an existing texture.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextureUpdate {
+    /// Replace the image, possibly with different dimensions (font-atlas growth,
+    /// or a re-created atlas after a scale-factor change). The renderer
+    /// allocates a new image and swaps it in at the end of the frame.
+    Whole(TextureUpload),
+    /// Overwrite a sub-rectangle of the existing image (incremental glyphs).
+    Region(TextureRegion),
+}
+
 /// Everything the renderer needs to draw one frame.
 #[derive(Clone, Debug, Default)]
 pub struct PaintList {
@@ -342,8 +386,10 @@ pub struct PaintList {
     pub layers: Vec<Layer>,
     /// Textures created by the UI since the last frame (atlas, cover art, ...).
     pub created: Vec<TextureUpload>,
-    /// Replacements for textures whose pixels changed (rare; e.g. atlas growth).
-    pub updated: Vec<TextureUpload>,
+    /// Replacements for textures whose pixels changed (atlas growth is whole;
+    /// newly rasterised glyphs are regions). A whole update supersedes any
+    /// region update for the same id in the same frame.
+    pub updated: Vec<TextureUpdate>,
     /// Textures the UI no longer references; the renderer releases them after
     /// this frame.
     pub dropped: Vec<TextureId>,
@@ -378,7 +424,12 @@ impl PaintList {
     }
 
     pub fn update_texture(&mut self, texture: TextureUpload) {
-        self.updated.push(texture);
+        self.updated.push(TextureUpdate::Whole(texture));
+    }
+
+    /// Patch a sub-rectangle of an existing texture (see [`TextureRegion`]).
+    pub fn update_texture_region(&mut self, region: TextureRegion) {
+        self.updated.push(TextureUpdate::Region(region));
     }
 
     pub fn drop_texture(&mut self, id: TextureId) {

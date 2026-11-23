@@ -26,7 +26,7 @@ use std::future::poll_fn;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use reqwest::header::{self, CONTENT_RANGE};
@@ -50,6 +50,24 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// single socket read should ever stall for this long. Applying a total timeout
 /// here would abort valid downloads on a slow link.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Window over which a transfer must receive at least
+/// [`NO_PROGRESS_MIN_BYTES`].
+///
+/// [`READ_TIMEOUT`] bounds a *single* read, not the whole transfer: a server
+/// that drips one byte just under it would hold a playback fetch in `Loading`,
+/// and a download claim, alive forever. This is the transfer-wide rule. It also
+/// catches the case the read timeout cannot: a response that keeps producing
+/// tiny chunks sets no error at all.
+const NO_PROGRESS_WINDOW: Duration = Duration::from_secs(30);
+
+/// Minimum bytes a transfer must receive per [`NO_PROGRESS_WINDOW`] to count as
+/// making progress.
+///
+/// Well below a real audio transfer (an 8 MiB range arrives in one chunk) and
+/// far above a keep-alive drip. It counts **bytes**, not requests or chunks, so
+/// a genuine large download — many full ranges — always resets the window.
+const NO_PROGRESS_MIN_BYTES: u64 = 1024;
 
 /// User agent sent with the audio requests. The resolved URL is already
 /// authorized, so this only needs to be a plausible non-empty client identity.
@@ -238,7 +256,7 @@ pub async fn fetch_bytes(video_id: &str) -> anyhow::Result<Vec<u8>> {
 /// truncates it and writes every byte as it arrives, but never renames it. The
 /// download worker publishes the file only after a successful return, so a
 /// crash or a native failure can never leave a truncated file under the real
-/// `<id>.m4a` name.
+/// `<safe_stem>.m4a` name.
 ///
 /// `progress(received, total)` is invoked once before the first request and
 /// after every received chunk; `total` is `0` until/unless the stream's length
@@ -274,6 +292,14 @@ pub async fn fetch_to_path(
     )
     .await
     .context("the native audio download failed")?;
+    // Publication happens by rename in the download worker. The rename is atomic
+    // against a torn write but not against a lost page cache: sync the completed
+    // `.part` file now so a crash can never publish a non-zero, truncated
+    // `<safe_stem>.m4a` that `Downloads::load` would trust as an offline copy. (The
+    // in-memory playback sink has no file and skips this.)
+    sink.sync_all()
+        .await
+        .with_context(|| format!("could not flush {} to disk", dest.display()))?;
     info!(
         "native stream: downloaded {video_id} to {} ({} bytes)",
         dest.display(),
@@ -326,6 +352,21 @@ impl Sink {
             }
         }
         Ok(())
+    }
+
+    /// Flush a file sink all the way to the storage device.
+    ///
+    /// The offline worker publishes by renaming the `.part` file. A rename is
+    /// atomic against a *torn* write, but not against the page cache: without
+    /// `fsync`, a crash right after the rename can leave a non-zero, truncated
+    /// `<safe_stem>.m4a` that the startup scan trusts (`Downloads::load` rejects only
+    /// zero-byte files). So the final write must be durable before the caller
+    /// can rename. In-memory playback has no file to sync and is unchanged.
+    async fn sync_all(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Memory(_) => Ok(()),
+            Self::File { file, .. } => file.sync_all().await,
+        }
     }
 }
 
@@ -385,6 +426,82 @@ fn failed(message: String) -> AttemptError {
     AttemptError::Failed(anyhow::anyhow!(message))
 }
 
+/// What the no-progress accounting should do after a chunk lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressWindow {
+    /// Too few bytes so far, but the window has not expired: keep accumulating.
+    Open,
+    /// The window reached its (rate-proportional) byte minimum: it made
+    /// progress, so a new window starts at this instant.
+    Reset,
+    /// The window expired below the rate-proportional minimum: the transfer is
+    /// stalled and must fail instead of holding a claim forever.
+    Stalled,
+}
+
+/// Decide what a transfer's current no-progress window does after a chunk.
+///
+/// Pure — the window start, "now" and the window's byte count are passed in —
+/// so the rule is unit-tested with synthetic instants and never sleeps. Bytes
+/// are what count, not request or chunk count: one real audio chunk is 8 MiB in
+/// production, so a large multi-request download always resets the window and
+/// can never be mistaken for a stall.
+fn progress_window(window_start: Instant, now: Instant, window_bytes: u64) -> ProgressWindow {
+    let elapsed = now.saturating_duration_since(window_start);
+    if elapsed < NO_PROGRESS_WINDOW {
+        if window_bytes >= NO_PROGRESS_MIN_BYTES {
+            ProgressWindow::Reset
+        } else {
+            ProgressWindow::Open
+        }
+    } else {
+        // Once the window has expired, require the minimum as a *rate* over the
+        // whole elapsed period, not just a cumulative total. Checking only
+        // `window_bytes >= MIN` let a server that sends 600 bytes at t=29.9 s and
+        // another 600 at t=59.8 s reset the window (1.2 KiB crossed the floor)
+        // despite averaging 20 B/s. The proportional minimum keeps a genuine
+        // large chunk after a long stall a reset, while a sub-rate drip stalls.
+        let required = u64::try_from(
+            (NO_PROGRESS_MIN_BYTES as u128).saturating_mul(elapsed.as_nanos())
+                / NO_PROGRESS_WINDOW.as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        if window_bytes >= required {
+            ProgressWindow::Reset
+        } else {
+            ProgressWindow::Stalled
+        }
+    }
+}
+
+/// Account for bytes that just arrived and enforce the no-progress rule.
+///
+/// A zero-byte call handles empty body frames: an edge that keeps sending empty
+/// frames (or a body that never advances) must not hold the transfer open just
+/// because each individual read completes.
+fn account_progress(
+    video_id: &str,
+    window_start: &mut Instant,
+    window_bytes: &mut u64,
+    now: Instant,
+    new_bytes: u64,
+) -> Result<(), AttemptError> {
+    *window_bytes = window_bytes.saturating_add(new_bytes);
+    match progress_window(*window_start, now, *window_bytes) {
+        ProgressWindow::Open => Ok(()),
+        ProgressWindow::Reset => {
+            *window_start = now;
+            *window_bytes = 0;
+            Ok(())
+        }
+        ProgressWindow::Stalled => Err(failed(format!(
+            "the native audio stream for {video_id} made no progress: fewer than \
+             {NO_PROGRESS_MIN_BYTES} bytes per {NO_PROGRESS_WINDOW:?} arrived over the current \
+             window; aborting a stalled transfer"
+        ))),
+    }
+}
+
 /// One transfer attempt: request ranges from `resolved` until the stream is
 /// complete, appending to `sink` starting at its current length.
 ///
@@ -420,6 +537,13 @@ async fn download_from(
     // UI would otherwise keep its indeterminate spinner even though the length
     // is known.
     progress(offset, total.unwrap_or(0));
+
+    // No-progress accounting: a window opens when the transfer starts and is
+    // replaced whenever it has received at least `NO_PROGRESS_MIN_BYTES`. A
+    // slow-drip server (one byte every 29 s) keeps each read under
+    // `READ_TIMEOUT`, so only this window can notice it.
+    let mut window_start = Instant::now();
+    let mut window_bytes: u64 = 0;
 
     loop {
         if total.is_some_and(|t| offset >= t) {
@@ -482,6 +606,15 @@ async fn download_from(
             })?;
             let Some(bytes) = next else { break };
             if bytes.is_empty() {
+                // An empty frame is not progress, but it is a chance to notice
+                // that the window has run out.
+                account_progress(
+                    video_id,
+                    &mut window_start,
+                    &mut window_bytes,
+                    Instant::now(),
+                    0,
+                )?;
                 continue;
             }
             if sink.is_memory() {
@@ -495,6 +628,13 @@ async fn download_from(
             offset = sink.len();
             this_response += bytes.len() as u64;
             progress(offset, total.unwrap_or(0));
+            account_progress(
+                video_id,
+                &mut window_start,
+                &mut window_bytes,
+                Instant::now(),
+                bytes.len() as u64,
+            )?;
             if let Some(t) = total {
                 if offset > t {
                     return Err(failed(format!(
@@ -690,13 +830,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        check_memory_cap, download_with_refresh, parse_content_range, validate_stream_url,
-        verify_complete, write_all, AttemptError, ResolvedStream, Sink, MAX_MEMORY_BYTES,
+        check_memory_cap, download_with_refresh, parse_content_range, progress_window,
+        validate_stream_url, verify_complete, write_all, AttemptError, ProgressWindow,
+        ResolvedStream, Sink, MAX_MEMORY_BYTES, NO_PROGRESS_MIN_BYTES, NO_PROGRESS_WINDOW,
     };
     use crate::util::testing::TempDir;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// A loopback audio server's answer to one request.
     #[derive(Debug)]
@@ -927,6 +1068,83 @@ mod tests {
             std::fs::read(&dest).expect("read the part file"),
             b"abcdefghij",
             "every byte must be on disk when write_all returns"
+        );
+    }
+
+    /// The offline path `fsync`s the completed `.part` file before returning so
+    /// the worker's rename can publish only durable bytes; in-memory playback has
+    /// no file and must stay a no-op.
+    #[tokio::test]
+    async fn sync_all_flushes_a_file_sink_and_is_a_noop_for_memory() {
+        let mut memory = Sink::memory();
+        memory
+            .sync_all()
+            .await
+            .expect("the in-memory sink has nothing to sync");
+        assert_eq!(memory.len(), 0);
+
+        let dir = TempDir::new("native-stream-sync");
+        let dest = dir.join("bytes.part");
+        let mut sink = Sink::file(&dest).await.expect("create the part file");
+        sink.append(b"durable").await.expect("append bytes");
+        sink.sync_all().await.expect("sync the part file");
+        assert_eq!(
+            std::fs::read(&dest).expect("read the part file"),
+            b"durable"
+        );
+    }
+
+    /// The no-progress rule is the transfer-level complement to `READ_TIMEOUT`:
+    /// a server dripping bytes just under the per-read timeout never errors, but
+    /// must not hold a playback fetch (or a download claim) open forever. Pure
+    /// instants keep this test free of sleeps.
+    #[test]
+    fn a_window_with_too_few_bytes_is_a_stall_and_enough_bytes_resets_it() {
+        let start = Instant::now();
+        assert_eq!(progress_window(start, start, 0), ProgressWindow::Open);
+        assert_eq!(
+            progress_window(start, start + NO_PROGRESS_WINDOW / 2, 0),
+            ProgressWindow::Open,
+            "half a window is not a stall"
+        );
+        assert_eq!(
+            progress_window(start, start + NO_PROGRESS_WINDOW, NO_PROGRESS_MIN_BYTES - 1),
+            ProgressWindow::Stalled,
+            "a full window one byte short of the minimum is a stall"
+        );
+        assert_eq!(
+            progress_window(start, start + NO_PROGRESS_WINDOW, 0),
+            ProgressWindow::Stalled
+        );
+        assert_eq!(
+            progress_window(start, start + NO_PROGRESS_WINDOW * 3, 1),
+            ProgressWindow::Stalled,
+            "a one-byte drip spanning several windows is still a stall"
+        );
+        assert_eq!(
+            progress_window(
+                start,
+                start + NO_PROGRESS_WINDOW * 2,
+                NO_PROGRESS_MIN_BYTES + 176
+            ),
+            ProgressWindow::Stalled,
+            "crossing 1 KiB only after two windows is still a sub-rate drip"
+        );
+        assert_eq!(
+            progress_window(start, start + NO_PROGRESS_WINDOW, NO_PROGRESS_MIN_BYTES),
+            ProgressWindow::Reset,
+            "hitting the minimum is progress: a real transfer opens a new window"
+        );
+        assert_eq!(
+            progress_window(start, start + NO_PROGRESS_WINDOW * 5, 8 * 1024 * 1024),
+            ProgressWindow::Reset,
+            "a genuine large chunk is never a stall, however long the window was open"
+        );
+        // A backwards clock reads as "not yet" rather than panicking: the rule
+        // uses saturating time math.
+        assert_eq!(
+            progress_window(start + NO_PROGRESS_WINDOW, start, 0),
+            ProgressWindow::Open
         );
     }
 

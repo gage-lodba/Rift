@@ -1,14 +1,17 @@
 //! Queue navigation: choosing the next/previous index (shuffle-aware) and the
 //! play/pause, next, previous, and stop controls that act on those picks.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use rift_types::{PlaybackState, RepeatMode};
+use rift_types::{PlaybackState, Progress, RepeatMode};
+use tracing::debug;
 
 use super::playback::{play_index, start_playback};
 use super::state::{emit_state, PlayerCore};
 use crate::audio::AudioCmd;
 use crate::backend::BackendInner;
+use crate::event::BackendEvent;
 use crate::util::LockExt;
 
 fn rand_index(len: usize) -> usize {
@@ -206,13 +209,21 @@ pub(crate) fn toggle_playback(backend: &Arc<BackendInner>) {
             // itself when it lands.
             PlaybackState::Loading => {
                 cancel_playback(&mut core);
+                // Same rule as `stop`: invalidate a queued crossfade command
+                // before its `Stop` is processed.
+                backend
+                    .player
+                    .crossfade_epoch
+                    .fetch_add(1, Ordering::SeqCst);
                 Action::Cancel
             }
         }
     };
     match action {
         Action::Emit(s) => emit_state(backend, s),
-        Action::Replay(i) => play_index(backend, i),
+        Action::Replay(i) => {
+            let _ = play_index(backend, i, None);
+        }
         Action::Cancel => {
             let _ = backend.player.audio.send(AudioCmd::Stop);
             emit_state(backend, PlaybackState::Stopped);
@@ -226,6 +237,80 @@ pub(crate) fn play_next(backend: &Arc<BackendInner>, manual: bool) {
         let mut core = backend.player.core.lock_safe();
         pick_next(&mut core, manual)
     };
+    advance_to(backend, next);
+}
+
+/// Advance the queue for the audio thread's end-of-track event.
+///
+/// The event names the play identity of the track that ended. The gate and the
+/// pick share one core lock, so a Stop/Pause/Next that landed while the event sat
+/// in the channel cannot make this advance the state that replaced the track: a
+/// stale `Ended` used to run `play_next` after the user's command, undoing a Stop
+/// or skipping a track. The generation gate covers Stop/Next/jumps (all bump it);
+/// the `Playing` gate covers Pause, which deliberately does not bump it.
+pub(crate) fn play_next_after_ended(backend: &Arc<BackendInner>, play_id: u64) {
+    let (outcome, current_generation) = {
+        let mut core = backend.player.core.lock_safe();
+        let current = core.generation;
+        (handle_ended(&mut core, play_id), current)
+    };
+    match outcome {
+        EndedOutcome::Advance(next) => advance_to(backend, next),
+        EndedOutcome::PauseAtEnd(duration) => {
+            // The end raced a pause: the audio thread has stopped and unloaded,
+            // so `Resume` would do nothing and the UI would keep painting a
+            // frozen `Playing` bar. Stop honestly at the end; Play/Next recover.
+            emit_state(backend, PlaybackState::Stopped);
+            backend.emit(BackendEvent::Progress(Progress {
+                position: duration,
+                duration,
+            }));
+        }
+        EndedOutcome::Ignore => debug!(
+            "dropping an end-of-track event from play {play_id}: the current play is \
+             {current_generation} (stale generation or no longer playing)"
+        ),
+    }
+}
+
+/// What a matching end-of-track event means.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum EndedOutcome {
+    /// Advance to the picked queue index (`None` = stop; the queue ended).
+    Advance(Option<usize>),
+    /// The end raced a pause. Stop at the end instead of silently resuming a
+    /// finished track.
+    PauseAtEnd(f64),
+    /// A different generation or a transport that is already stopped/loading.
+    Ignore,
+}
+
+/// Decide the action for an `Ended` event, with the same core lock covering the
+/// identity/state check and the pick.
+///
+/// A `Pause` does not bump the generation (the audio thread stays loaded and
+/// paused), so an end that raced the pause arrives with the *current* id while
+/// `state == Paused`. Advancing the queue would start the next track while the
+/// user asked for silence; ignoring it would leave a silent `Playing` bar that
+/// `Resume` cannot revive (the audio thread unloaded on end). Stopping at the
+/// end is the only outcome the user can recover from with Play/Next.
+pub(super) fn handle_ended(core: &mut PlayerCore, play_id: u64) -> EndedOutcome {
+    if core.generation != play_id {
+        return EndedOutcome::Ignore;
+    }
+    match core.state {
+        PlaybackState::Playing => EndedOutcome::Advance(pick_next(core, false)),
+        PlaybackState::Paused => {
+            core.state = PlaybackState::Stopped;
+            core.position = core.duration;
+            EndedOutcome::PauseAtEnd(core.duration)
+        }
+        PlaybackState::Stopped | PlaybackState::Loading => EndedOutcome::Ignore,
+    }
+}
+
+/// Start whatever `next` named, or stop when the queue has no continuation.
+fn advance_to(backend: &Arc<BackendInner>, next: Option<usize>) {
     match next {
         Some(i) => start_playback(backend, i),
         None => stop(backend),
@@ -271,7 +356,10 @@ pub(crate) fn play_prev(backend: &Arc<BackendInner>) {
 /// starting the track the user just stopped, drop a prefetched crossfade pick,
 /// and reset the transport. Pure so the cancellation rule is testable.
 pub(crate) fn cancel_playback(core: &mut PlayerCore) {
-    core.generation += 1;
+    // Skip the value reserved by an in-flight crossfade (`generation + 1`), for
+    // the same reason `claim_play` advances by two: a cancellation must never
+    // hand a new play the id a crossfade already started under.
+    core.generation += 2;
     core.pending_next = None;
     core.crossfade_armed_for = None;
     core.state = PlaybackState::Stopped;
@@ -283,6 +371,12 @@ pub(crate) fn stop(backend: &Arc<BackendInner>) {
         let mut core = backend.player.core.lock_safe();
         cancel_playback(&mut core);
     }
+    // Drop a crossfade command that may already be queued ahead of this Stop;
+    // otherwise the audio thread could start it before it gets to the Stop.
+    backend
+        .player
+        .crossfade_epoch
+        .fetch_add(1, Ordering::SeqCst);
     let _ = backend.player.audio.send(AudioCmd::Stop);
     emit_state(backend, PlaybackState::Stopped);
 }

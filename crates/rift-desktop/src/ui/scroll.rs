@@ -204,7 +204,10 @@ impl Ui {
                     offset = new;
                     scrolled = true;
                 }
-            } else if track_resp.clicked {
+            } else if track_resp.pointer_clicked() {
+                // Keyboard activation of the focused track (Enter/Space) must
+                // not jump to `mouse_pos`: that would scroll to wherever the
+                // pointer happened to be parked.
                 let my = self.input().mouse_pos.1;
                 let t = ((my - rect.y - thumb_h * 0.5) / travel.max(1.0)).clamp(0.0, 1.0);
                 offset = t * max_offset;

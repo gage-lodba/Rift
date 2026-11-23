@@ -1,24 +1,60 @@
 name: Release
 
 # Build native (`cargo build --release`) binaries and attach them to a GitHub
-# Release when a version tag is pushed (e.g. `git tag v0.6.0 && git push origin
-# v0.6.0`).
+# Release when a version tag is pushed (e.g. `git tag v0.6.1 && git push origin
+# v0.6.1`).
 #
 # Packaging/installers are out of scope: the assets are plain executables, one
 # per platform. (The old shell's bundler is gone, so there is nothing to bundle.)
 #
-# `workflow_dispatch` allows a manual run for testing the build; that path only
-# creates/updates a *draft*, so a test run can't be mistaken for a release — and
-# it refuses to touch a published release.
+# `workflow_dispatch` allows a manual run for testing the build; a manual run
+# from any ref (including a tag named with `--ref`) only creates/updates a
+# *draft*, so a test run can't be mistaken for a release — and it refuses to
+# touch a published release. Manual mode is derived from `github.event_name`,
+# because a dispatch can target a tag ref; only a tag *push* can publish.
+#
+# For a new release, the three matrix jobs upload into a *draft* release. A
+# `checksums` job then attaches a `SHA256SUMS` manifest built from those uploaded
+# assets. A final `publish` job flips the release public with `gh release edit
+# --draft=false` only after both have succeeded, so a failed/expired job cannot
+# leave a public release that is missing platform assets or checksums. A tag
+# rerun of an already-published release uploads to it as before; `publish` is
+# then a no-op.
+#
+# Release integrity policy:
+#
+#   * The binaries are UNSIGNED. There is no Windows Authenticode signature and
+#     no Apple Developer ID signature/notarization: both require project-owned
+#     certificates and credentials, which do not exist yet, so code signing is
+#     deliberately out of scope. Do not add signing steps that depend on secrets
+#     the project cannot provision.
+#   * `SHA256SUMS` is integrity/transport only: it shows that a download matches
+#     the bytes attached to this release. It is not a signature — whoever can
+#     replace an asset can replace the manifest too.
+#   * The `checksums` job attaches build-provenance attestations for the three
+#     platform assets. They state that the assets were built by this
+#     repository's `release.yml` workflow from this tag/branch commit, signed
+#     with a short-lived Sigstore certificate bound to this workflow's GitHub
+#     OIDC identity. That is the provenance claim; verify a download with:
+#         gh attestation verify <downloaded-file> --repo gage-lodba/Rift
+#     (add `--signer-workflow gage-lodba/Rift/.github/workflows/release.yml` to
+#     pin the signer workflow as well).
+#   * The attestation step is fail-hard (no `continue-on-error`): if provenance
+#     cannot be produced the `checksums` job fails, so `publish` cannot make a
+#     draft public without it.
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
-# `gh release` needs write access to create the release and upload assets.
+# Least privilege: reading the repository (checkout, tag/version comparison) is
+# all the workflow itself needs. The jobs that use `gh release` to create,
+# upload or publish raise `contents: write` themselves, so every other job (and
+# every checkout) stays read-only. `GH_TOKEN` is passed explicitly where needed;
+# no checkout persists the token in `.git/config`.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
@@ -58,17 +94,25 @@ jobs:
             asset: rift-music-windows-x86_64.exe
 
     runs-on: ${{ matrix.platform }}
+    # Creating the draft and uploading the matrix's asset need write; scoped to
+    # this job rather than the whole workflow.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `gh` authenticates with the explicit GH_TOKEN below; git push is not
+          # part of this workflow, so don't persist the token in `.git/config`.
+          persist-credentials: false
 
       # The tag names the artifacts and is what `check_update` compares against
       # the running version, so a tag that disagrees with the workspace version
       # both mislabels every asset and makes the app report a phantom update
-      # forever (it would see `v1.0.0` while running 0.6.0, and never reach it).
+      # forever (it would see `v1.0.0` while running 0.6.1, and never reach it).
       # `app` and `backend` inherit `version.workspace = true`, so Cargo.toml is
       # the single source of the version.
       - name: Verify the tag matches the workspace version
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: bash
         run: |
           set -euo pipefail
@@ -189,30 +233,41 @@ jobs:
           esac
 
       # `gh` is preinstalled on the hosted runners and uses GITHUB_TOKEN, so this
-      # needs no third-party release action. The three matrix jobs share one
-      # release and run concurrently: creating is retried, and the upload retries
-      # briefly in case a sibling job is still creating the release.
-      - name: Publish to the GitHub release
+      # needs no third-party release action. For a new release the three matrix
+      # jobs share one *draft* release and run concurrently: creation is
+      # retried/tolerated when a sibling wins the race, and the upload retries
+      # briefly in case a sibling job is still creating the release. Nothing is
+      # made public here — the `publish` job below does that only after every
+      # matrix job has succeeded.
+      - name: Upload assets to the GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          # A manual run is defined by the EVENT, not the ref type: GitHub lets
+          # `gh workflow run release.yml --ref v0.6.1` dispatch against a tag, and
+          # that must still be a draft-only test build — never a publish path and
+          # never a `--clobber` upload to the published release. Only a real tag
+          # push is a release.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
             release_tag="${GITHUB_REF_NAME}"
-            draft="false"
+            manual="false"
           else
             declared=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
             release_tag="v${declared}"
-            draft="true"
+            manual="true"
           fi
 
-          notes="Rift ${release_tag} — native Vulkan build. Download the executable for your platform from the assets below. Rift needs an up-to-date Vulkan-capable GPU driver; audio is resolved and streamed natively (no external downloader). Installers/packaging are out of scope for this conversion: run the binary directly."
+          notes="Rift ${release_tag} — native Vulkan build. Download the executable for your platform from the assets below; SHA256SUMS is attached for integrity verification (checksums are not a signature). Rift needs an up-to-date Vulkan-capable GPU driver; audio is resolved and streamed natively (no external downloader). Installers/packaging are out of scope for this conversion: run the binary directly."
 
           # A manual run must never modify a published release (that path exists
-          # only to test the build). It creates or updates a draft instead.
+          # only to test the build). It creates or updates a draft instead. A tag
+          # rerun may reuse a draft left by an earlier failed run; an already
+          # published release (a tag rerun) is uploaded to as before, and the
+          # publish job treats that as a no-op.
           if gh release view "$release_tag" >/dev/null 2>&1; then
-            if [ "$draft" = "true" ]; then
+            if [ "$manual" = "true" ]; then
               is_draft=$(gh release view "$release_tag" --json isDraft --jq '.isDraft')
               if [ "$is_draft" != "true" ]; then
                 echo "::error::refusing to upload a manual-run build to the published release $release_tag"
@@ -220,10 +275,17 @@ jobs:
               fi
             fi
           else
-            if [ "$draft" = "true" ]; then
-              gh release create "$release_tag" --draft --title "Rift $release_tag" --notes "$notes" || true
-            else
-              gh release create "$release_tag" --title "Rift $release_tag" --notes "$notes" || true
+            # Always create a draft: the `publish` job is the only thing that
+            # makes it public, and only after all three matrix jobs uploaded.
+            if ! gh release create "$release_tag" --draft --title "Rift $release_tag" --notes "$notes"; then
+              # The matrix jobs race here. If a sibling created the release
+              # between our view and create, this view proves it; otherwise the
+              # creation really failed and the job must fail (no `|| true`).
+              if ! gh release view "$release_tag" >/dev/null 2>&1; then
+                echo "::error::could not create the draft release $release_tag"
+                exit 1
+              fi
+              echo "draft release $release_tag already exists (created by a sibling matrix job)"
             fi
           fi
 
@@ -237,3 +299,157 @@ jobs:
           done
           echo "::error::could not upload $asset to $release_tag"
           exit 1
+
+  # Release assets are only verifiable if the hash list is derived from the exact
+  # files attached to the release, after every platform job has uploaded. This
+  # job downloads them, refuses an incomplete release, writes `SHA256SUMS`, and
+  # attaches it with `--clobber` (a rerun replaces a stale list). It runs for a
+  # manual run too, which is draft-only, so the path is exercised there as well.
+  # `publish` needs this job, so a tag release cannot become public without its
+  # manifest. Checksums are integrity, not provenance: they are not a signature
+  # and do not attest who built the artifacts. The actual provenance claim comes
+  # from the final step, which fails this job (and therefore blocks `publish`) if
+  # an attestation cannot be created.
+  checksums:
+    name: generate SHA256SUMS
+    needs: release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      # Build provenance needs an OIDC token for Sigstore and write access to
+      # persist the attestation; both are scoped to this job. The
+      # `artifact-metadata: write` permission is deliberately NOT granted: it is
+      # only needed for registry storage records, and this job attests plain
+      # files with no `push-to-registry`.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Only Cargo.toml is read (a manual run derives the tag from it); git
+          # credentials are not needed.
+          persist-credentials: false
+
+      - name: Download the uploaded assets, write and attach SHA256SUMS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same event-based split as the matrix jobs: a dispatch against a tag
+          # ref is still a manual draft-only run.
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            declared=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            release_tag="v${declared}"
+          fi
+
+          # Same manual-run rule as the matrix upload: a branch run exists to
+          # test the build and may only touch a draft. The matrix jobs already
+          # refuse a published release; re-check here so a draft published
+          # between the jobs cannot be modified by a manual run.
+          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+            is_draft=$(gh release view "$release_tag" --json isDraft --jq '.isDraft')
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::refusing to attach checksums to the published release $release_tag from a manual run"
+              exit 1
+            fi
+          fi
+
+          rm -rf release-assets
+          mkdir -p release-assets
+          # The release exists and every matrix upload has finished (`needs`).
+          gh release download "$release_tag" --dir release-assets --clobber
+
+          # Keep the manifest out of its own input, and hash only regular files.
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::release $release_tag has no assets to checksum"
+            exit 1
+          fi
+
+          # The three platform jobs must each have contributed their asset; a
+          # manifest over an incomplete release would make the missing download
+          # look merely corrupted. Keep in step with `matrix.asset` above.
+          required_assets=(rift-music-linux-x86_64 rift-music-macos-universal rift-music-windows-x86_64.exe)
+          for required in "${required_assets[@]}"; do
+            if [ ! -f "release-assets/$required" ]; then
+              echo "::error::release $release_tag is missing $required; refusing to checksum an incomplete release"
+              exit 1
+            fi
+          done
+
+          echo "hashing ${#assets[@]} asset(s) from $release_tag:"
+          printf '  %s\n' "${assets[@]}"
+          (cd release-assets && sha256sum -- "${assets[@]}" > SHA256SUMS)
+          echo "--- SHA256SUMS ---"
+          cat release-assets/SHA256SUMS
+
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$release_tag" release-assets/SHA256SUMS --clobber; then
+              echo "uploaded SHA256SUMS to $release_tag"
+              exit 0
+            fi
+            sleep $((attempt * 2))
+          done
+          echo "::error::could not upload SHA256SUMS to $release_tag"
+          exit 1
+
+      # Policy: provenance is part of the release, not an optional extra. There
+      # is deliberately no `continue-on-error`: an attestation failure fails this
+      # job, and `publish` needs this job, so a tag release cannot become public
+      # without it. The glob matches exactly the three platform assets (the
+      # downloaded `SHA256SUMS` is transport integrity, not a build output, and
+      # is not attested).
+      - name: Attest build provenance for the three platform assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          # Explicit paths, not a glob: exactly the three platform assets are
+          # attested. An extra file that happened to match `rift-music-*` must
+          # not sneak into the provenance claim.
+          subject-path: |
+            release-assets/rift-music-linux-x86_64
+            release-assets/rift-music-macos-universal
+            release-assets/rift-music-windows-x86_64.exe
+
+  # For a new release the matrix jobs only write to a draft. This job is the
+  # single place that makes a tag release public, and `needs: [release,
+  # checksums]` means it runs only after all three platform jobs succeeded and
+  # uploaded their assets *and* the manifest was attached. If the release is
+  # already published (a tag rerun) it is a no-op; it never unpublishes or
+  # recreates a release.
+  publish:
+    name: publish the release
+    needs: [release, checksums]
+    # Only a real tag push may publish. `github.ref_type` alone is not enough:
+    # a workflow_dispatch can name a tag ref, so the event must be `push`.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_tag="${GITHUB_REF_NAME}"
+          # `needs` already gates on the checksums job; re-check the asset so this
+          # job reads the same invariant it then publishes.
+          asset_names=$(gh release view "$release_tag" --json assets --jq '.assets[].name')
+          if ! grep -qx 'SHA256SUMS' <<< "$asset_names"; then
+            echo "::error::release $release_tag has no SHA256SUMS asset; refusing to publish"
+            exit 1
+          fi
+          is_draft=$(gh release view "$release_tag" --json isDraft --jq '.isDraft')
+          if [ "$is_draft" = "false" ]; then
+            echo "release $release_tag is already published; nothing to publish"
+            exit 0
+          fi
+          # A failure here fails the workflow on purpose: the assets and checksums
+          # are uploaded but the release is still draft — visible as an incomplete
+          # release rather than a public one missing downloads.
+          gh release edit "$release_tag" --draft=false
+          echo "published release $release_tag with all platform assets and SHA256SUMS"

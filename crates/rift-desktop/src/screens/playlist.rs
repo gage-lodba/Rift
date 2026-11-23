@@ -85,13 +85,14 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
             let style = TextInputStyle::rename(&theme);
             let w = area.w.clamp(RENAME_MIN_W, 520.0);
             let rect = Rect::new(area.x, area.y, w, RENAME_H);
-            let resp = ui.text_input(
-                rect,
-                Id::from_str("playlist/rename"),
-                draft,
-                "Playlist name",
-                &style,
-            );
+            let rename_id = Id::from_str("playlist/rename");
+            // Autofocus on the editor's opening frame only
+            // (`docs/ui-spec.md` §7.3 `.rename-input`): the one-shot helper is a
+            // no-op once the field has been drawn, so a click-away cannot make
+            // the field steal focus back. Typing appends from the caret-at-end
+            // placement the text input gives a focus gain without a click.
+            ui.request_focus_on_open(rename_id);
+            let resp = ui.text_input(rect, rename_id, draft, "Playlist name", &style);
             if resp.submitted {
                 let name = draft.trim().to_string();
                 if !name.is_empty() {
@@ -102,9 +103,9 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
                 }
                 commit = true;
             } else if resp.cancelled || resp.lost_focus {
+                // `lost_focus` is reported one frame after `Ui::end_frame`
+                // committed the blur (click into another widget / empty space).
                 cancel = true;
-            } else if resp.response.hovered && ui.input().mouse_left_pressed {
-                ui.request_focus(Id::from_str("playlist/rename"));
             }
         }
         if commit || cancel {
@@ -351,6 +352,64 @@ mod tests {
             );
         }
     }
+    /// Clicking away from the rename field closes the editor with the cancel
+    /// path (no rename), one frame after `Ui::end_frame` commits the blur.
+    #[test]
+    fn rename_editor_closes_on_click_away() {
+        let mut state = playlist_state();
+        state.renaming = Some(("pl".into(), "Mix".into()));
+        let area = playlist_area();
+        let mut sim = Sim::new();
+        let mut draw = |ui: &mut Ui, actions: &mut Vec<Action>| {
+            view(ui, &mut state, actions, area, "pl");
+        };
+        let _ = sim.step(&mut draw);
+        assert_eq!(sim.ui.focused_id(), Some(Id::from_str("playlist/rename")));
+
+        // Empty space below the header: nothing takes focus, so the press frame
+        // blurs and the release frame reports `lost_focus` -> cancel.
+        let actions = sim.click((area.x + 20.0, area.y + 200.0), &mut draw);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ClosePlaylistEditor)),
+            "a click-away closes the rename editor: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::RenamePlaylist { .. })),
+            "a click-away must not rename: {actions:?}"
+        );
+        assert!(state.renaming.is_none(), "State::renaming is cleared");
+    }
+
+    /// `.rename-input` autofocus (`ui-spec.md` §7.3): the editor focuses its
+    /// field on the opening frame, so typing works without clicking it first.
+    /// The focus gain also places the caret at the end, so typing appends.
+    #[test]
+    fn rename_editor_autofocuses_and_typing_appends() {
+        let mut state = playlist_state();
+        state.renaming = Some(("pl".into(), "Mix".into()));
+        let area = playlist_area();
+        let mut sim = Sim::new();
+        let mut draw = |ui: &mut Ui, actions: &mut Vec<Action>| {
+            view(ui, &mut state, actions, area, "pl");
+        };
+        let _ = sim.step(&mut draw);
+        assert_eq!(
+            sim.ui.focused_id(),
+            Some(Id::from_str("playlist/rename")),
+            "the rename field autofocuses on the opening frame"
+        );
+        let _ = sim.type_text(" 2", &mut draw);
+        assert_eq!(
+            state.renaming.as_ref().map(|(_, draft)| draft.as_str()),
+            Some("Mix 2"),
+            "typing appends to the draft from the caret-at-end focus placement"
+        );
+    }
+
     #[test]
     fn missing_playlist_is_just_the_empty_state() {
         let mut ui = Ui::new();

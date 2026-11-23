@@ -6,11 +6,13 @@
 //! width). Screens read `&State` and push [`Action`]s; they never call the
 //! backend and never mutate state themselves.
 //!
-//! Action application lives in `app.rs` + `controller.rs`; the backend bridge
+//! Action application lives in `app.rs` + `controller/**`; the backend bridge
 //! turns [`Action`]s into backend commands and backend events back into state
 //! updates.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use rift_types::{
     AlbumPage, AlbumSummary, ArtistPage, ArtistSummary, DownloadState, Library, PlaybackState,
@@ -83,6 +85,24 @@ pub struct CoverEntry {
     pub failed: bool,
 }
 
+/// Upper bound on cached cover *textures*.
+///
+/// A 256 px RGBA8 cover is 256 KiB of VRAM, and a long browsing session can
+/// visit thousands of distinct URLs (every album/artist card and every track
+/// row has one). `app.rs` therefore evicts the oldest decoded covers once this
+/// many are cached; a later frame that still shows an evicted cover simply
+/// re-requests it.
+pub const MAX_CACHED_COVERS: usize = 256;
+
+/// Upper bound on [`State::covers`] entries, including the failed/in-flight
+/// URLs that own no texture.
+///
+/// [`MAX_CACHED_COVERS`] bounds the GPU memory, but only entries with a texture
+/// are evicted by the texture trimmer. Offline sessions can visit many URLs
+/// that never decode (and every distinct failure is remembered so it is not
+/// retried every frame), so this second, larger cap bounds the map itself.
+pub const MAX_CACHED_COVER_ENTRIES: usize = MAX_CACHED_COVERS * 2;
+
 /// A short-lived toast. `shown_at` is `Ui` time (seconds) when it appeared, so
 /// `app.rs` can expire it after [`Toast::LIFETIME`].
 #[derive(Clone, Debug)]
@@ -122,11 +142,61 @@ impl Toast {
     }
 }
 
+/// Identity of the liked-list allocation a [`LikedCache`] was built from.
+///
+/// The pointer/len pair changes whenever `library.liked` is replaced,
+/// reallocated or resized through `&mut State`, which is what lets
+/// [`State::liked_index`] notice a stale cache even when a caller assigns
+/// `state.library` directly instead of going through [`State::set_library`]
+/// (tests and preview data do exactly that). It is deliberately *not* a
+/// content hash: hashing every like would reintroduce the per-frame O(likes)
+/// cost the cache exists to remove.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LikedKey {
+    ptr: usize,
+    len: usize,
+}
+
+impl LikedKey {
+    fn of(tracks: &[Track]) -> Self {
+        Self {
+            ptr: tracks.as_ptr() as usize,
+            len: tracks.len(),
+        }
+    }
+}
+
+/// Cached [`SongIndex`] over `library.liked`, rebuilt lazily when the liked
+/// list changes.
+///
+/// `track_list` needs a liked lookup for every rendered row and the player bar
+/// needs one for the current track; building a fresh index per list per frame
+/// is O(likes) allocation and hashing on the UI thread every frame. This cache
+/// makes the per-frame cost an `Arc` clone. `SongIndex` is immutable once
+/// built, so sharing it behind `Arc` is safe and cheap.
+#[derive(Clone, Debug, Default)]
+pub struct LikedCache {
+    /// `None` forces a rebuild; `Some` is valid only while the liked list still
+    /// has this allocation identity (see [`LikedKey`]).
+    key: Option<LikedKey>,
+    index: Arc<SongIndex>,
+    /// Number of times the index was built (test evidence only).
+    #[cfg(test)]
+    builds: u64,
+}
+
 /// Everything the UI renders.
 #[derive(Clone, Debug)]
 pub struct State {
     // ---------------------------------------------------- backend data
     pub library: Library,
+    /// Cached looked-up index over [`Library::liked`].
+    ///
+    /// Internal: [`State::liked_index`] keeps it in sync with `library.liked`
+    /// and callers must never read it directly. It is public only because
+    /// `State` is a public field bag that tests build with struct-update
+    /// syntax, and the cache self-heals if a caller assigns `library` directly.
+    pub liked_cache: Arc<Mutex<LikedCache>>,
     pub queue: QueueSnapshot,
     pub playback: PlaybackState,
     /// The currently loaded/playing track, if any.
@@ -156,6 +226,14 @@ pub struct State {
     pub artist_songs: Option<(String, Vec<Track>)>,
     /// Album page cache for the current `View::Album`.
     pub album_page: Option<AlbumPage>,
+    /// Why the current artist/album page could not be loaded, if it could not.
+    ///
+    /// Set by `App` from a failed page reply ([`crate::controller::ControllerEvent::ArtistPage`]
+    /// / `ArtistSongs` / `AlbumPage` with an `Err`), so the page views can render
+    /// a compact error with a Retry button instead of a permanent "Loading…"
+    /// state. Cleared on navigation, on a new page request (including Retry) and
+    /// when a page reply succeeds.
+    pub page_error: Option<String>,
     /// Generation of the newest artist/album page request the controller issued,
     /// mirrored from [`crate::controller::ControllerEvent`] page results.
     ///
@@ -188,12 +266,21 @@ pub struct State {
     // ------------------------------------------------------- cover cache
     /// Cover-art texture cache keyed by URL.
     ///
-    /// Bounded in practice: `app.rs` evicts the oldest decoded textures once its
-    /// `MAX_CACHED_COVERS` cap is reached (each 256 px RGBA8 cover is 256 KiB of
-    /// VRAM), so a long browsing session cannot grow the cache without limit.
-    /// Entries without a texture (in flight or known-failed) are a few bytes and
-    /// are left alone by eviction.
+    /// Bounded twice. `app.rs` evicts the oldest decoded textures once
+    /// [`MAX_CACHED_COVERS`] is reached (each 256 px RGBA8 cover is 256 KiB of
+    /// VRAM), and [`State::request_cover`] evicts failed/in-flight entries once
+    /// the map exceeds [`MAX_CACHED_COVER_ENTRIES`], so URLs that never decode
+    /// (offline/failed fetches) cannot accumulate for the session. Entry-cap
+    /// eviction never picks an entry that owns a live texture; the texture
+    /// trimmer removes those entries together with their texture.
     pub covers: HashMap<String, CoverEntry>,
+    /// Insertion order of [`Self::covers`] keys, oldest first.
+    ///
+    /// Drives [`State::request_cover`]'s eviction of never-decoded entries and
+    /// is kept in sync by [`State::remove_cover`]. Entries that own a texture
+    /// are rotated to the back, never dropped, so the order stays usable while
+    /// the texture trimmer catches up.
+    pub cover_order: VecDeque<String>,
     /// URLs the controller should fetch (deduplicated; drained each frame).
     pub cover_requests: Vec<String>,
     /// Next texture id to hand out for cover art (font atlas uses low ids).
@@ -204,6 +291,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             library: Library::default(),
+            liked_cache: Arc::new(Mutex::new(LikedCache::default())),
             queue: QueueSnapshot::default(),
             playback: PlaybackState::Stopped,
             track: None,
@@ -223,6 +311,7 @@ impl Default for State {
             artist_page: None,
             artist_songs: None,
             album_page: None,
+            page_error: None,
             page_generation: 0,
 
             renaming: None,
@@ -233,6 +322,7 @@ impl Default for State {
             window_maximized: false,
 
             covers: HashMap::new(),
+            cover_order: VecDeque::new(),
             cover_requests: Vec::new(),
             next_texture_id: 1024,
         }
@@ -242,7 +332,7 @@ impl Default for State {
 impl State {
     /// Apply a backend bootstrap snapshot.
     pub fn apply_bootstrap(&mut self, b: rift_types::Bootstrap) {
-        self.library = b.library;
+        self.set_library(b.library);
         self.queue = b.queue;
         self.playback = b.state;
         self.volume = b.volume;
@@ -270,10 +360,59 @@ impl State {
         self.playback == PlaybackState::Playing
     }
 
-    /// A lookup for whether a song is liked, by song identity rather than video
-    /// id (the old UI matched `Track::same_song`, and so must this).
-    pub fn liked_index(&self) -> SongIndex {
-        SongIndex::new(&self.library.liked)
+    /// Replace the library mirror and invalidate the liked index.
+    ///
+    /// Prefer this over assigning [`Self::library`] directly: an explicit
+    /// invalidation is correct even for an in-place edit that leaves the
+    /// liked-list allocation unchanged. The rebuild itself is deferred to the
+    /// next [`Self::liked_index`] call, so a library event that only changes
+    /// playlists costs nothing until a screen actually needs the index.
+    pub fn set_library(&mut self, library: Library) {
+        self.library = library;
+        // Poison recovery: a library event must still invalidate the cache; the
+        // index holds no user-code state, so the poisoned guard is safe to use.
+        let mut cache = self
+            .liked_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.key = None;
+    }
+
+    /// A cached lookup for whether a song is liked, by song identity rather
+    /// than video id (the old UI matched `Track::same_song`, and so must this).
+    ///
+    /// Rebuilds only when `library.liked` changed, then returns a cheap `Arc`
+    /// clone: screen rendering calls this once per list per frame. The key check
+    /// also self-heals after a direct `state.library = ...` assignment (tests,
+    /// preview data), which must never leave hearts empty because a cache went
+    /// stale.
+    #[must_use]
+    pub fn liked_index(&self) -> Arc<SongIndex> {
+        let key = LikedKey::of(&self.library.liked);
+        // Poison recovery: the UI thread must keep rendering even if another
+        // thread panicked while holding this lock (nothing here runs user code).
+        let mut cache = self
+            .liked_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.key != Some(key) {
+            cache.index = Arc::new(SongIndex::new(&self.library.liked));
+            cache.key = Some(key);
+            #[cfg(test)]
+            {
+                cache.builds += 1;
+            }
+        }
+        Arc::clone(&cache.index)
+    }
+
+    /// How many times [`Self::liked_index`] actually built an index (tests).
+    #[cfg(test)]
+    pub(crate) fn liked_index_builds(&self) -> u64 {
+        self.liked_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .builds
     }
 
     pub fn is_liked(&self, liked: &SongIndex, track: &Track) -> bool {
@@ -347,11 +486,25 @@ impl State {
 
     /// Mark a cover URL as needed; the controller fetches it if it has not been
     /// requested yet. Returns the texture if already available.
+    ///
+    /// Inserting a new URL can evict the oldest never-decoded entry once the
+    /// map exceeds [`MAX_CACHED_COVER_ENTRIES`] (see [`Self::remove_cover`]).
     pub fn request_cover(&mut self, url: &str) -> Option<TextureId> {
         if url.is_empty() {
             return None;
         }
-        let entry = self.covers.entry(url.to_string()).or_default();
+        let is_new = match self.covers.entry(url.to_string()) {
+            Entry::Vacant(slot) => {
+                slot.insert(CoverEntry::default());
+                true
+            }
+            Entry::Occupied(_) => false,
+        };
+        if is_new {
+            self.cover_order.push_back(url.to_string());
+            self.evict_untextured_covers();
+        }
+        let entry = self.covers.get_mut(url)?;
         if let Some(id) = entry.texture {
             return Some(id);
         }
@@ -360,6 +513,73 @@ impl State {
             self.cover_requests.push(url.to_string());
         }
         None
+    }
+
+    /// Remove a cover entry and its insertion-order slot.
+    ///
+    /// Used by `app.rs` when it releases an evicted texture (the caller drops
+    /// the GPU image) and by the failed/in-flight eviction fallback.
+    pub fn remove_cover(&mut self, url: &str) {
+        let _ = self.covers.remove(url);
+        self.cover_order.retain(|ordered| ordered != url);
+    }
+
+    /// Evict never-decoded covers — failed or still in flight — oldest first,
+    /// until [`Self::covers`] is back within [`MAX_CACHED_COVER_ENTRIES`].
+    ///
+    /// Entries that own a texture are never removed here: dropping one would
+    /// orphan its GPU image. Those are `app.rs`'s responsibility (it removes the
+    /// texture and the entry together via [`Self::remove_cover`]); this cap only
+    /// stops URLs that never decode from accumulating all session.
+    fn evict_untextured_covers(&mut self) {
+        if self.covers.len() <= MAX_CACHED_COVER_ENTRIES {
+            return;
+        }
+        // At most one pass over the insertion order: textured entries are
+        // rotated to the back, everything else is a candidate.
+        let passes = self.cover_order.len();
+        for _ in 0..=passes {
+            if self.covers.len() <= MAX_CACHED_COVER_ENTRIES {
+                break;
+            }
+            let Some(url) = self.cover_order.pop_front() else {
+                break;
+            };
+            let owns_texture = self
+                .covers
+                .get(&url)
+                .is_some_and(|entry| entry.texture.is_some());
+            if owns_texture {
+                self.cover_order.push_back(url);
+            } else {
+                let _ = self.covers.remove(&url);
+            }
+        }
+        // Defensive fallback for entries that are absent from `cover_order`
+        // (only possible if a caller built `covers` directly): keep the map
+        // bounded anyway, preferring failed entries over in-flight ones and
+        // still never touching a textured entry.
+        if self.covers.len() > MAX_CACHED_COVER_ENTRIES {
+            let excess = self.covers.len() - MAX_CACHED_COVER_ENTRIES;
+            let mut victims: Vec<String> = self
+                .covers
+                .iter()
+                .filter(|(_, entry)| entry.texture.is_none() && entry.failed)
+                .map(|(url, _)| url.clone())
+                .take(excess)
+                .collect();
+            let remaining = excess - victims.len();
+            victims.extend(
+                self.covers
+                    .iter()
+                    .filter(|(_, entry)| entry.texture.is_none() && !entry.failed)
+                    .map(|(url, _)| url.clone())
+                    .take(remaining),
+            );
+            for url in victims {
+                self.remove_cover(&url);
+            }
+        }
     }
 }
 
@@ -448,10 +668,15 @@ pub enum Action {
     OpenArtistSongs(String),
     OpenAlbum(String),
     SetSearchTab(SearchTab),
-    /// Submit the current search query.
+    /// Submit the current search query (immediately: Enter / the Search button,
+    /// or the app's debounced live search once the box text has been stable).
     Search(String),
-    /// Update the search box text (no command).
+    /// Update the search box text; `App` schedules the debounced live search
+    /// (ui-spec §6.1) and updates [`SearchState::query`] immediately.
     SearchQueryChanged(String),
+    /// The search box lost keyboard focus. `App` cancels a pending debounced
+    /// live search so it cannot switch the view after the user moved on.
+    SearchBlur,
     ToggleQueuePanel,
     ToggleQueueCollapsed,
 
@@ -664,6 +889,126 @@ mod tests {
         assert!(t.is_expired(16.0));
     }
 
+    fn liked_track(id: &str) -> Track {
+        Track {
+            id: id.into(),
+            title: format!("Song {id}"),
+            artist: "Artist".into(),
+            album: None,
+            duration: Some(180),
+            cover: String::new(),
+            artists: Vec::new(),
+            album_id: None,
+        }
+    }
+
+    /// The per-frame win: an unchanged library must be indexed exactly once, no
+    /// matter how many lists/rows ask for it, and every reply must share the
+    /// same `Arc` (copying a whole `SongIndex` per list would undo the cache).
+    #[test]
+    fn liked_index_is_built_once_for_an_unchanged_library() {
+        let mut state = State::default();
+        state.set_library(Library {
+            liked: vec![liked_track("a"), liked_track("b")],
+            ..Library::default()
+        });
+
+        let first = state.liked_index();
+        assert!(first.contains(&liked_track("a")));
+        let builds = state.liked_index_builds();
+        assert_eq!(builds, 1, "the first lookup builds the index");
+
+        for _ in 0..20 {
+            let again = state.liked_index();
+            assert!(
+                Arc::ptr_eq(&first, &again),
+                "an unchanged library must reuse the cached index"
+            );
+        }
+        assert_eq!(
+            state.liked_index_builds(),
+            builds,
+            "no rebuild while unchanged"
+        );
+    }
+
+    /// A like/unlike arriving as a library event must invalidate the cache; a
+    /// stale index would keep the old heart filled (or hide the new one).
+    #[test]
+    fn a_library_event_invalidates_the_liked_index() {
+        let mut state = State::default();
+        state.set_library(Library {
+            liked: vec![liked_track("a")],
+            ..Library::default()
+        });
+        let before = state.liked_index();
+        assert!(before.contains(&liked_track("a")));
+
+        // Like a second song (the backend broadcasts a whole Library snapshot).
+        state.set_library(Library {
+            liked: vec![liked_track("a"), liked_track("b")],
+            ..Library::default()
+        });
+        let after_like = state.liked_index();
+        assert!(!Arc::ptr_eq(&before, &after_like));
+        assert!(after_like.contains(&liked_track("b")));
+        assert_eq!(state.liked_index_builds(), 2);
+
+        // Unlike everything.
+        state.set_library(Library::default());
+        let after_unlike = state.liked_index();
+        assert!(!Arc::ptr_eq(&after_like, &after_unlike));
+        assert!(!after_unlike.contains(&liked_track("a")));
+    }
+
+    /// `set_library` must invalidate even when the caller reuses the same liked
+    /// allocation (move out, edit in place, put back — what the Liked screen's
+    /// `mem::take`/restore does). The allocation key alone would miss that, so
+    /// the explicit invalidation is load-bearing, not just belt-and-braces.
+    #[test]
+    fn set_library_invalidates_even_when_the_liked_allocation_is_reused() {
+        let mut state = State::default();
+        state.set_library(Library {
+            liked: vec![liked_track("a"), liked_track("b")],
+            ..Library::default()
+        });
+        assert!(state.liked_index().contains(&liked_track("a")));
+
+        let mut library = std::mem::take(&mut state.library);
+        library.liked[0] = liked_track("z");
+        state.set_library(library);
+
+        let index = state.liked_index();
+        assert!(
+            !index.contains(&liked_track("a")),
+            "the replaced element must not still be liked"
+        );
+        assert!(index.contains(&liked_track("z")));
+        assert!(index.contains(&liked_track("b")));
+    }
+
+    /// Tests and preview code often write `state.library` directly instead of
+    /// calling `set_library`; the cache key must notice that and rebuild, or a
+    /// liked row would render with an empty heart after data was injected.
+    #[test]
+    fn a_direct_library_assignment_self_heals_the_cache() {
+        let mut state = State::default();
+        // Prime the cache with an empty library first: this is the stale state
+        // that would hide every heart if the key check were missing.
+        assert!(!state.liked_index().contains(&liked_track("x")));
+
+        state.library.liked = vec![liked_track("x")];
+        assert!(
+            state.liked_index().contains(&liked_track("x")),
+            "direct assignment must not leave the old empty index cached"
+        );
+
+        // And the reverse: replace it with something smaller again.
+        state.library.liked = Vec::new();
+        assert!(!state.liked_index().contains(&liked_track("x")));
+        assert_eq!(state.liked_index_builds(), 3);
+    }
+
     #[test]
     fn download_fraction_maps_permille_to_a_clamped_unit_interval() {
         let mut state = State::default();
@@ -685,6 +1030,52 @@ mod tests {
         state.downloads.progress.insert("t2".into(), 500);
         assert_eq!(state.download_fraction("t1"), Some(1.0));
         assert_eq!(state.download_fraction("t2"), Some(0.5));
+    }
+
+    #[test]
+    fn cover_entry_cache_evicts_untextured_urls_but_keeps_live_textures() {
+        let mut state = State::default();
+        // The oldest entry owns a live texture: later eviction must skip it.
+        let live = "https://img.example/live";
+        assert_eq!(state.request_cover(live), None);
+        if let Some(entry) = state.covers.get_mut(live) {
+            entry.texture = Some(1024);
+        }
+
+        // A long offline session: every URL fails and is remembered so it is
+        // not retried every frame. The entry cap must still bound the map.
+        for index in 0..(MAX_CACHED_COVER_ENTRIES * 3) {
+            let url = format!("https://img.example/failed/{index}");
+            assert_eq!(state.request_cover(&url), None);
+            if let Some(entry) = state.covers.get_mut(&url) {
+                entry.failed = true;
+                entry.requested = false;
+            }
+        }
+        assert!(
+            state.covers.len() <= MAX_CACHED_COVER_ENTRIES,
+            "failed cover urls must stay bounded, got {}",
+            state.covers.len()
+        );
+        assert_eq!(
+            state.cover_texture(live),
+            Some(1024),
+            "the entry cap must never evict an entry that owns a live texture"
+        );
+        assert_eq!(
+            state.cover_order.len(),
+            state.covers.len(),
+            "eviction keeps the insertion order in sync"
+        );
+
+        // A cover that loads after all those failures still works.
+        let fresh = "https://img.example/fresh";
+        assert_eq!(state.request_cover(fresh), None);
+        if let Some(entry) = state.covers.get_mut(fresh) {
+            entry.texture = Some(1025);
+        }
+        assert_eq!(state.cover_texture(fresh), Some(1025));
+        assert!(state.covers.len() <= MAX_CACHED_COVER_ENTRIES);
     }
 
     #[test]

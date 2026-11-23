@@ -2,29 +2,47 @@
 <#
 .SYNOPSIS
     Local CI gate for Rift — replicates `.github/workflows/ci.yml` on Windows.
+    A run with skipped steps reports `GATE: INCOMPLETE`, never `GATE: PASSED`.
 
 .DESCRIPTION
     One command that runs the same checks the GitHub Actions CI runs, in the same
     order, on this machine, so the final native acceptance is reproducible
-    locally. Every step prints PASS/FAIL with its command and duration, a summary
-    table is printed at the end, and a timestamped log is written under
-    `artifacts/`.
+    locally. Every step prints PASS/FAIL/SKIP (or WARN for a soft check) with its
+    command and duration, a summary table is printed at the end, and a timestamped
+    log is written under `artifacts/`.
+
+    The exit code is part of the gate (agents.md §8/§10.17): 0 only when every
+    step ran and none failed (warnings are allowed), 1 on a hard failure, and 2
+    when any step was skipped. A skipped step is not a pass, so a run with SKIP
+    rows reports `GATE: INCOMPLETE` and exits 2 unless `-AllowIncomplete` is
+    passed; that switch accepts a deliberately partial run (exit 0) but never
+    turns a failure green.
+
+    POSIX hosts use `tools/ci-local.sh`, which runs the same rows in the same
+    order; keep the two front-ends' step lists in sync (both mirror ci.yml).
 
     Steps (mirroring ci.yml):
       1. toolchain consistency (`.github/scripts/check-toolchain-consistency.sh`
-         via Git Bash; falls back to an equivalent PowerShell check and says so)
+         via Git Bash; falls back to an equivalent PowerShell check and says so).
+         Also fails hard when the active `rustc` is not the
+         `rust-toolchain.toml` channel — the file pins can all agree while
+         `RUSTUP_TOOLCHAIN`/`+toolchain` builds with a different compiler.
       2. `cargo fmt --all -- --check`
-      3. `cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-discord
-         -p rift-desktop --all-targets -- -D warnings`
+      3. `cargo clippy` with `-D warnings` for the default (backend) build and
+         the UI-only `--no-default-features` configuration; they compile
+         different `cfg` branches, so one does not cover the other
       4. `cargo doc -p rift -p rift-types -p rift-ytmusic -p rift-discord
          --no-deps` with `RUSTDOCFLAGS=-D warnings` (the library crates enforce
          missing_docs)
       5. `cargo test` for those packages, plus the app in **both feature
          configurations** (default backend + `--no-default-features` UI-only)
       6. `cargo build --release -p rift-desktop --features backend` (the shipped
-         configuration, + binary size) and check the shipped binary rejects the
-         development-only `--preview`/`--screenshot` flags (preview data is not
-         compiled into release without the explicit `preview` feature)
+         configuration, + binary size), `cargo clippy --release` for the shipped
+         and `backend,preview` acceptance configurations (the debug clippy steps
+         cannot see `not(debug_assertions)` code), and check the shipped binary
+         rejects the development-only `--preview`/`--screenshot` flags (preview
+         data is not compiled into release without the explicit `preview`
+         feature)
       7. Windows executable file icon: `.github/scripts/check-windows-icon.ps1`
          proves `target/release/rift-music.exe` carries the app icon as a PE
          resource — the *file* icon Explorer/Start menu/shortcuts read, not the
@@ -47,11 +65,22 @@
     `-AllowLockUpdate` while dependencies are changing.
 
 .PARAMETER SkipTests
-    Skip the `cargo test` steps (fast iteration).
+    Skip the `cargo test` steps (fast iteration). The run is reported as
+    `GATE: INCOMPLETE` and exits 2 unless `-AllowIncomplete` is also passed.
 
 .PARAMETER SkipRelease
-    Skip the release build, the Windows executable file-icon check and the
-    screenshot acceptance steps.
+    Skip the release build, the release clippy configurations, the Windows
+    executable file-icon check and the screenshot acceptance steps. The run is
+    reported as `GATE: INCOMPLETE` and exits 2 unless `-AllowIncomplete` is also
+    passed.
+
+.PARAMETER AllowIncomplete
+    Accept a run with skipped steps: the verdict is still
+    `GATE: INCOMPLETE (N skipped step(s))`, but the script exits 0 instead of 2.
+    A skipped step is not a pass (agents.md §8/§10.17), so use this only for a
+    deliberately partial run (for example `-SkipRelease` on a host without a
+    Vulkan device), never to claim the full acceptance gate passed. A hard
+    failure still exits 1.
 
 .PARAMETER AllowLockUpdate
     Do not pass `--locked` to cargo (use while Cargo.lock is being regenerated).
@@ -65,16 +94,29 @@
     pwsh tools/ci-local.ps1
     pwsh tools/ci-local.ps1 -SkipTests
     pwsh tools/ci-local.ps1 -SkipRelease -SkipTests
+    pwsh tools/ci-local.ps1 -SkipRelease -AllowIncomplete
 #>
 [CmdletBinding()]
 param(
     [switch]$SkipTests,
     [switch]$SkipRelease,
+    # A skipped step is not a pass (agents.md §8/§10.17): without this switch a
+    # run with any SKIP row prints GATE: INCOMPLETE and exits 2. Pass it only to
+    # accept an intentionally partial run (exit 0); it never overrides a FAIL.
+    [switch]$AllowIncomplete,
     [switch]$AllowLockUpdate,
     [string]$PythonPath = $env:RIFT_PYTHON
 )
 
 $ErrorActionPreference = "Stop"
+
+# This script is the Windows front-end: it knows about .exe paths, the PE icon
+# check and Windows process-launch semantics. POSIX hosts run the same gate
+# through tools/ci-local.sh, which needs only bash and calls the shell guards
+# directly; fail with that pointer instead of tripping over Windows-only setup.
+if (-not $IsWindows) {
+    throw "tools/ci-local.ps1 is the Windows front-end; run ./tools/ci-local.sh on Linux/macOS (same gate, same rows)."
+}
 
 # pwsh's legacy "Windows" native-argument mode mangles arrays of native
 # arguments (`--`/`-D warnings` get split); this repository's gates pass cargo
@@ -135,9 +177,17 @@ function Write-Summary {
     }
     $failed = @($script:results | Where-Object Status -eq "FAIL")
     $warned = @($script:results | Where-Object Status -eq "WARN")
+    $skipped = @($script:results | Where-Object Status -eq "SKIP")
     Write-Log "=========================================" Cyan
     if ($failed.Count -gt 0) {
         Write-Log "GATE: FAILED ($($failed.Count) hard failure(s), $($warned.Count) warning(s))" Red
+    } elseif ($skipped.Count -gt 0) {
+        # A skipped step is not a pass (agents.md §8/§10.17): never print PASSED
+        # for a run that did not execute every step.
+        Write-Log "GATE: INCOMPLETE ($($skipped.Count) skipped step(s))" Yellow
+        if (-not $script:AllowIncomplete) {
+            Write-Log "hint: pass -AllowIncomplete to accept the skipped step(s); the run is still not a full pass" DarkGray
+        }
     } elseif ($warned.Count -gt 0) {
         Write-Log "GATE: PASSED with $($warned.Count) warning(s)" Yellow
     } else {
@@ -206,6 +256,40 @@ function Find-GitBash {
 }
 
 $script:gitBash = Find-GitBash
+
+# A hard check with no `-Skip*` escape hatch: the compiler that actually runs
+# every cargo step below must be the `rust-toolchain.toml` channel.
+# `check-toolchain-consistency.sh` compares the three *declarations* (Cargo.toml,
+# rust-toolchain.toml, the workflow pins) and cannot see a `+toolchain`,
+# `RUSTUP_TOOLCHAIN` or `rustup override` that makes this machine build with a
+# different compiler. Logging `rustc --version` is not a check: the gate could
+# print 1.98 and still report PASSED. A skipped compiler check is not a pass
+# (agents.md §8/§10.17), so a mismatch is a hard failure, not a SKIP or WARN.
+function Assert-ActiveRustcMatchesPin {
+    $toolchainText = Get-Content -LiteralPath "rust-toolchain.toml" -Raw
+    $channel = [regex]::Match($toolchainText, '(?m)^channel\s*=\s*"([^"]+)"').Groups[1].Value
+    if (-not $channel) {
+        throw "could not read 'channel' from rust-toolchain.toml"
+    }
+    $versionOutput = & rustc --version 2>&1
+    $versionExit = $LASTEXITCODE
+    $versionText = ($versionOutput | Out-String).Trim()
+    if ($versionExit -ne 0) {
+        throw "rustc --version failed (exit $versionExit): $versionText. Install the pinned toolchain with 'rustup toolchain install $channel'."
+    }
+    # The lookahead is load-bearing: without it `1.88.0-nightly` parses as
+    # `1.88.0` and the gate would accept an unpinned nightly/beta compiler.
+    $match = [regex]::Match($versionText, '^rustc (\d+\.\d+\.\d+)(?=\s|$)')
+    if (-not $match.Success) {
+        throw "could not parse the active compiler version from '$versionText'"
+    }
+    $active = $match.Groups[1].Value
+    Write-Log "active rustc: $active; rust-toolchain.toml channel: $channel"
+    if ($active -ne $channel) {
+        throw "active rustc $active does not match the rust-toolchain.toml channel $channel. The gate must build with the pinned compiler; run 'rustup override unset' (or remove RUSTUP_TOOLCHAIN) so rustup selects $channel, then re-run."
+    }
+}
+
 # Keep this an array even when empty/enabled: an `if` expression that yields
 # `@("--locked")` enumerates to a scalar string, and splatting a scalar mangles
 # the native command line.
@@ -258,7 +342,7 @@ $rustc = (& rustc --version 2>&1 | Out-String).Trim()
 $cargoVersion = (& cargo --version 2>&1 | Out-String).Trim()
 Write-Log "rustc: $rustc"
 Write-Log "cargo: $cargoVersion"
-Write-Log "locked: $(-not $AllowLockUpdate); skip-tests: $SkipTests; skip-release: $SkipRelease"
+Write-Log "locked: $(-not $AllowLockUpdate); skip-tests: $SkipTests; skip-release: $SkipRelease; allow-incomplete: $AllowIncomplete"
 Write-Log "git bash: $(if ($script:gitBash) { $script:gitBash } else { 'NOT FOUND (shell guards fall back/skip)' })"
 Write-Log "python (image compare): $(if ($script:python) { "$($script:python.Exe) $($script:python.Prefix -join ' ')" } else { 'NOT FOUND (comparison will be skipped)' })"
 $head = (& git rev-parse --short HEAD 2>&1 | Out-String).Trim()
@@ -268,11 +352,13 @@ Write-Log "git HEAD: $head; changed files: $dirty (informational — the gate ch
 # 1. Toolchain consistency ------------------------------------------------
 if ($script:gitBash) {
     Invoke-Step "toolchain consistency" {
+        Assert-ActiveRustcMatchesPin
         & $script:gitBash .github/scripts/check-toolchain-consistency.sh
         if ($LASTEXITCODE -ne 0) { throw "check-toolchain-consistency.sh failed" }
     }
 } else {
     Invoke-Step "toolchain consistency (PowerShell fallback)" {
+        Assert-ActiveRustcMatchesPin
         Write-Log "NOTE: Git Bash unavailable — replicating the toolchain check in PowerShell."
         $cargoText = Get-Content -LiteralPath "Cargo.toml" -Raw
         $msrv = [regex]::Match($cargoText, '(?m)^rust-version\s*=\s*"([^"]+)"').Groups[1].Value
@@ -287,7 +373,12 @@ if ($script:gitBash) {
         foreach ($workflow in Get-ChildItem -Path ".github/workflows" -Filter "*.yml") {
             $wfText = Get-Content -LiteralPath $workflow.FullName -Raw
             $uses = ([regex]::Matches($wfText, '(?m)^\s*(-\s+)?uses:\s+dtolnay/rust-toolchain@')).Count
-            $pins = ([regex]::Matches($wfText, '(?m)^\s*toolchain:\s*(.+)$'))
+            # `[ \t]` rather than `\s`: `\s` spans the newline and would count
+            # the `toolchain:` job key plus its following `name:` line as a
+            # version pin (every workflow here has a job named `toolchain`).
+            # The value/comment/CRLF handling mirrors the shell guard's parsing,
+            # so a Windows checkout with CRLF workflow files reads the same.
+            $pins = ([regex]::Matches($wfText, '(?m)^[ \t]+toolchain:[ \t]*([^\r\n#]+?)[ \t]*(?:#.*)?\r?$'))
             if ($uses -ne $pins.Count) {
                 throw "$($workflow.Name) uses dtolnay/rust-toolchain $uses time(s) but has $($pins.Count) toolchain: pin(s)"
             }
@@ -312,11 +403,22 @@ Invoke-Step "cargo fmt --all -- --check" {
 }
 
 # 3. Clippy ---------------------------------------------------------------
+# Both debug configurations are linted: the default (backend) app and the
+# UI-only `--no-default-features` build compile different `cfg` branches, so
+# one does not cover the other. The release-only branches are linted in the
+# release block below, after the release build has produced its dependency
+# artifacts.
 Invoke-Step "cargo clippy (-D warnings)" {
     $packages = $script:packages
     $locked = $script:lockedArgs
     & cargo clippy @packages @locked --all-targets -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw "clippy reported warnings/errors above" }
+}
+
+Invoke-Step "cargo clippy -p rift-desktop --no-default-features (-D warnings)" {
+    $locked = $script:lockedArgs
+    & cargo clippy -p rift-desktop --no-default-features @locked --all-targets -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw "UI-only clippy reported warnings/errors above" }
 }
 
 # 4. Documentation (library crates; rustdoc warnings are errors) -----------
@@ -364,8 +466,9 @@ if ($SkipTests) {
 # 6. Release build + 7. executable icon + 8. screenshot acceptance --------
 if ($SkipRelease) {
     Write-Log ""
-    Write-Log "SKIP: release build + executable icon + screenshot (-SkipRelease)" Yellow
+    Write-Log "SKIP: release build + release clippy + executable icon + screenshot (-SkipRelease)" Yellow
     Add-Result -Step "release build (skipped)" -Status "SKIP" -Detail "-SkipRelease"
+    Add-Result -Step "cargo clippy (release configurations, skipped)" -Status "SKIP" -Detail "-SkipRelease"
     Add-Result -Step "windows executable file icon (skipped)" -Status "SKIP" -Detail "-SkipRelease"
 } else {
     $releaseBinary = Join-Path $root "target/release/rift-music.exe"
@@ -376,6 +479,19 @@ if ($SkipRelease) {
         if (-not (Test-Path -LiteralPath $releaseBinary)) { throw "release binary missing: $releaseBinary" }
         $size = (Get-Item -LiteralPath $releaseBinary).Length
         Write-Log ("binary: {0} ({1:N0} bytes / {2:N1} MiB)" -f $releaseBinary, $size, ($size / 1MB))
+    }
+
+    # The debug clippy steps above cannot see `not(debug_assertions)` code: the
+    # shipped CLI parser lives there, and the `preview` acceptance configuration
+    # is non-default. Lint both against the release artifacts the build above
+    # just produced. Clippy emits metadata only, so the shipped executable stays
+    # in place for the icon and preview-strip checks below.
+    Invoke-Step "cargo clippy (release configurations, -D warnings)" {
+        $locked = $script:lockedArgs
+        & cargo clippy --release -p rift-desktop @locked --all-targets -- -D warnings
+        if ($LASTEXITCODE -ne 0) { throw "release clippy reported warnings/errors above" }
+        & cargo clippy --release -p rift-desktop --features backend,preview @locked --all-targets -- -D warnings
+        if ($LASTEXITCODE -ne 0) { throw "release preview clippy reported warnings/errors above" }
     }
 
     # 7. Windows executable file icon -------------------------------------
@@ -506,6 +622,9 @@ Invoke-Step "no legacy webview/WASM manifests in the workspace" {
             ForEach-Object { Join-Path $root $_ } |
             Where-Object { $_ -notmatch "[\\/]ui[\\/]" } |
             Where-Object { Test-Path -LiteralPath $_ })
+        if ($LASTEXITCODE -ne 0) {
+            throw "git ls-files failed while scanning workspace manifests"
+        }
     } else {
         $manifests = @(Get-ChildItem -Path $root -Filter "Cargo.toml" -Recurse -File | Where-Object {
                 $_.FullName -notmatch "[\\/]target[^\\/]*[\\/]" -and
@@ -570,9 +689,16 @@ if (-not (Get-Command cargo-deny -ErrorAction SilentlyContinue)) {
 }
 
 # Final summary / exit code ----------------------------------------------
+# 0 = every step ran and passed (warnings allowed), 1 = hard failure, 2 = a step
+# was skipped. Skipped work is not a pass, so exit 2 unless the caller explicitly
+# accepted the incomplete run with -AllowIncomplete (agents.md §8/§10.17).
 Write-Summary
 $failures = @($script:results | Where-Object Status -eq "FAIL")
 if ($failures.Count -gt 0) {
     exit 1
+}
+$skipped = @($script:results | Where-Object Status -eq "SKIP")
+if ($skipped.Count -gt 0 -and -not $AllowIncomplete) {
+    exit 2
 }
 exit 0

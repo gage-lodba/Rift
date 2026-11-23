@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use crate::gfx::{
     paint::{Color, PaintList, Prim, Rect},
-    Renderer,
+    window_size_changed, Renderer,
 };
 
 /// Where the smoke-test PNGs are written for manual inspection.
@@ -106,11 +106,27 @@ fn build_scene() -> PaintList {
     paint
 }
 
+/// Whether a headless Vulkan device can be created at all.
+///
+/// Only consulted *after* a renderer/screenshot failure: a failure with no
+/// usable device is an environment skip, but a failure while the device exists
+/// is a renderer regression (shader, pipeline, render pass, allocation) and
+/// must fail the suite instead of silently skipping the only GPU coverage.
+fn vulkan_device_available() -> bool {
+    crate::gfx::gpu::GfxContext::headless().is_ok()
+}
+
 fn headless_or_skip(width: u32, height: u32) -> Option<Renderer> {
     init_logging();
     match Renderer::new_headless(width, height, 1.0) {
         Ok(renderer) => Some(renderer),
         Err(error) => {
+            if vulkan_device_available() {
+                panic!(
+                    "a Vulkan device is available, so this is a renderer regression rather than \
+                     a missing driver: {error:#}"
+                );
+            }
             eprintln!("skipping GPU smoke test: no usable Vulkan device\n{error:#}");
             None
         }
@@ -268,6 +284,189 @@ fn updated_texture_replaces_pixels() {
         "updated texture is blue",
     );
 
+    renderer.shutdown();
+}
+
+/// A region update must patch only its rectangle of an existing image. This is
+/// the atlas path: newly rasterised glyphs arrive as a small dirty rect, and the
+/// renderer must neither lose the untouched pixels nor require a full re-upload.
+#[test]
+fn region_texture_update_patches_pixels_in_place() {
+    let Some(mut renderer) = headless_or_skip(64, 64) else {
+        return;
+    };
+
+    // 4x4 texture: left half red, right half green.
+    let mut rgba = Vec::with_capacity(4 * 4 * 4);
+    for _y in 0..4 {
+        for x in 0..4 {
+            if x < 2 {
+                rgba.extend_from_slice(&[255, 0, 0, 255]);
+            } else {
+                rgba.extend_from_slice(&[0, 255, 0, 255]);
+            }
+        }
+    }
+    let mut paint = PaintList::new(Color::BLACK);
+    paint.add_texture(crate::gfx::paint::TextureUpload::new(7, 4, 4, rgba));
+    paint.push(Prim::image(
+        Rect::new(0.0, 0.0, 64.0, 64.0),
+        7,
+        Rect::new(0.0, 0.0, 1.0, 1.0),
+        Color::WHITE,
+    ));
+    let first = renderer.render_offscreen(&paint).expect("first render");
+    assert_near(pixel(&first, 64, 8, 32), [255, 0, 0, 255], 3, "left red");
+    assert_near(
+        pixel(&first, 64, 56, 32),
+        [0, 255, 0, 255],
+        3,
+        "right green",
+    );
+    paint.created.clear();
+
+    // Patch the right half only.
+    paint.update_texture_region(crate::gfx::paint::TextureRegion::new(
+        7,
+        2,
+        0,
+        2,
+        4,
+        [0u8, 0, 255, 255].repeat(2 * 4),
+    ));
+    let second = renderer.render_offscreen(&paint).expect("region render");
+    assert_near(
+        pixel(&second, 64, 8, 32),
+        [255, 0, 0, 255],
+        3,
+        "region update must not clear the untouched left half",
+    );
+    assert_near(
+        pixel(&second, 64, 56, 32),
+        [0, 0, 255, 255],
+        3,
+        "region update is blue on the right half",
+    );
+
+    renderer.shutdown();
+}
+
+/// End-to-end proof that the incremental glyph path reaches the GPU: the first
+/// frame creates the atlas, the second adds one glyph as a region update, and
+/// the second render shows the extra ink. This would fail if the renderer
+/// ignored region updates (frame 2 would render the first glyph only).
+#[test]
+fn incremental_glyph_region_update_reaches_the_gpu() {
+    use crate::text::{TextStyle, Weight};
+    use crate::ui::{InputState, TextureUpdate, Ui};
+
+    let Some(mut renderer) = headless_or_skip(240, 80) else {
+        return;
+    };
+    let viewport = Rect::new(0.0, 0.0, 240.0, 80.0);
+    let text_rect = Rect::new(10.0, 10.0, 220.0, 34.0);
+    let style = TextStyle::new(26.0, Weight::Regular, Color::WHITE);
+    let input = |time: f64| InputState {
+        viewport,
+        time,
+        delta_time: 0.016,
+        mouse_pos: (-10.0, -10.0),
+        ..InputState::default()
+    };
+    let bright_pixels = |rgba: &[u8]| {
+        (0..80u32)
+            .flat_map(|y| (0..240u32).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                let p = pixel(rgba, 240, *x, *y);
+                p[0] > 140 && p[1] > 140 && p[2] > 140
+            })
+            .count()
+    };
+
+    let mut ui = Ui::new();
+    ui.begin_frame(input(0.0), viewport);
+    ui.text(text_rect, "A", &style);
+    let paint = ui.end_frame();
+    assert_eq!(
+        paint.created.iter().filter(|t| t.id == 1).count(),
+        1,
+        "the first frame creates the glyph atlas"
+    );
+    let first = renderer.render_offscreen(&paint).expect("first text frame");
+    let first_ink = bright_pixels(&first);
+
+    ui.begin_frame(input(0.016), viewport);
+    ui.text(text_rect, "AB", &style);
+    let paint = ui.end_frame();
+    let region = paint
+        .updated
+        .iter()
+        .find_map(|update| match update {
+            TextureUpdate::Region(region) if region.id == 1 => Some(region),
+            _ => None,
+        })
+        .expect("a newly rasterised glyph must upload a region");
+    assert!(
+        region.rgba.len()
+            < (crate::text::ATLAS_INITIAL_SIZE * crate::text::ATLAS_INITIAL_SIZE * 4) as usize,
+        "the second frame must not re-upload the whole atlas"
+    );
+    let second = renderer
+        .render_offscreen(&paint)
+        .expect("second text frame");
+    let second_ink = bright_pixels(&second);
+    assert!(
+        second_ink > first_ink + 10,
+        "the incremental glyph must add ink on the GPU (first {first_ink}, second {second_ink})"
+    );
+
+    renderer.shutdown();
+}
+
+/// A whole update supersedes a region for the same id in one frame. This can
+/// happen if a caller patches a texture and also replaces it this frame; the
+/// documented rule is whole-wins, and the renderer must not apply the stale
+/// region to the new image (which could be a different size).
+#[test]
+fn a_whole_update_supersedes_a_region_for_the_same_id() {
+    let Some(mut renderer) = headless_or_skip(64, 64) else {
+        return;
+    };
+    let mut paint = PaintList::new(Color::BLACK);
+    paint.add_texture(crate::gfx::paint::TextureUpload::new(
+        7,
+        1,
+        1,
+        vec![255, 0, 0, 255],
+    ));
+    paint.push(Prim::image(
+        Rect::new(0.0, 0.0, 64.0, 64.0),
+        7,
+        Rect::new(0.0, 0.0, 1.0, 1.0),
+        Color::WHITE,
+    ));
+    // Both operations for id 7 in the same frame: the region must be ignored.
+    paint.update_texture_region(crate::gfx::paint::TextureRegion::new(
+        7,
+        0,
+        0,
+        1,
+        1,
+        vec![0, 0, 255, 255],
+    ));
+    paint.update_texture(crate::gfx::paint::TextureUpload::new(
+        7,
+        1,
+        1,
+        vec![0, 255, 0, 255],
+    ));
+    let image = renderer.render_offscreen(&paint).expect("render");
+    assert_near(
+        pixel(&image, 64, 32, 32),
+        [0, 255, 0, 255],
+        3,
+        "the whole update wins over the same-frame region",
+    );
     renderer.shutdown();
 }
 
@@ -430,6 +629,12 @@ fn png_screenshot_helper_writes_readable_png() {
     let path = artifact_path("screenshot-helper.png");
     let paint = build_scene();
     if let Err(error) = crate::gfx::screenshot(320, 200, 1.0, &paint, &path) {
+        if vulkan_device_available() {
+            panic!(
+                "a Vulkan device is available, so a failing screenshot() is a renderer \
+                 regression rather than a missing driver: {error:#}"
+            );
+        }
         eprintln!("skipping screenshot() test: {error:#}");
         return;
     }
@@ -625,6 +830,121 @@ fn stress_10k_prims_many_clips_and_atlas_growth() {
     renderer.shutdown();
 }
 
+/// Headless rendering must advance the frame counter and drain retired rings;
+/// before this it reused slot 0 forever and never called `drain_retired`, so a
+/// long screenshot/test run could accumulate every grown vertex/uniform ring.
+#[test]
+fn headless_frames_advance_and_drain_retired_rings() {
+    use super::RETIRE_FRAMES;
+    let Some(mut renderer) = headless_or_skip(64, 64) else {
+        return;
+    };
+    // Force a ring replacement so there is something to retire.
+    let grown = renderer.vertex_capacity + 1024;
+    renderer
+        .grow_vertex_buffers(grown)
+        .expect("grow the vertex ring");
+    assert!(
+        !renderer.retired_vertex_buffers.is_empty(),
+        "the old ring is retired, not freed while a frame may use it"
+    );
+
+    let paint = PaintList::new(Color::BLACK);
+    for _ in 0..=RETIRE_FRAMES {
+        renderer.render_offscreen(&paint).expect("headless frame");
+    }
+    assert!(
+        renderer.retired_vertex_buffers.is_empty(),
+        "headless frames must drain retired vertex rings"
+    );
+    assert!(
+        renderer.frame_index > RETIRE_FRAMES,
+        "headless frames must advance the frame counter (got {})",
+        renderer.frame_index
+    );
+    renderer.shutdown();
+}
+
+/// Vulkano retires a swapchain *before* `vkCreateSwapchainKHR` and keeps it
+/// retired when creation fails (`vulkano-0.35.2/src/swapchain/mod.rs:452-493`).
+/// This pins the recovery policy: the first rebuild may reuse the stored
+/// swapchain, but after a failed `recreate` every following frame must create a
+/// fresh swapchain with `Swapchain::new` — never call `recreate` on the retired
+/// one again — until a replacement has actually been committed. Before the fix a
+/// single transient failure retried `recreate` forever and froze the window.
+///
+/// Pure control-flow test (no Vulkan device needed): the closures stand in for
+/// `Swapchain::recreate`/`create_swapchain_surface`.
+#[test]
+fn failed_swapchain_rebuild_recovers_with_a_fresh_swapchain() {
+    use std::cell::Cell;
+
+    use anyhow::anyhow;
+
+    use super::{rebuild_window_swapchain, RebuiltSwapchain, SwapchainRetirement};
+
+    let mut retirement = SwapchainRetirement::default();
+
+    // First rebuild: `recreate` fails (e.g. a transient vkCreateSwapchainKHR
+    // failure). The helper must still produce a result via a fresh swapchain.
+    let recreate_called = Cell::new(false);
+    let fresh_called = Cell::new(false);
+    let rebuilt = rebuild_window_swapchain(
+        &mut retirement,
+        || {
+            recreate_called.set(true);
+            Err::<&str, _>(anyhow!("simulated vkCreateSwapchainKHR failure"))
+        },
+        || {
+            fresh_called.set(true);
+            Ok("fresh")
+        },
+    )
+    .expect("a failed recreate must fall back to fresh creation");
+    assert!(recreate_called.get());
+    assert!(fresh_called.get());
+    assert!(matches!(rebuilt, RebuiltSwapchain::Fresh("fresh")));
+
+    // Next frame, still failing: `recreate` must not be called on the retired
+    // swapchain, even though fresh creation fails again.
+    let recreate_called = Cell::new(false);
+    let result = rebuild_window_swapchain(
+        &mut retirement,
+        || {
+            recreate_called.set(true);
+            Ok("recreated")
+        },
+        || Err::<&str, _>(anyhow!("simulated surface failure")),
+    );
+    assert!(
+        !recreate_called.get(),
+        "a retired swapchain must never be passed to recreate() again"
+    );
+    assert!(result.is_err());
+
+    // The failed fresh attempt must leave the next attempt on the fresh path.
+    let recreate_called = Cell::new(false);
+    let rebuilt = rebuild_window_swapchain(
+        &mut retirement,
+        || {
+            recreate_called.set(true);
+            Ok("recreated")
+        },
+        || Ok("fresh"),
+    )
+    .expect("the fresh retry succeeds");
+    assert!(!recreate_called.get());
+    assert!(matches!(rebuilt, RebuiltSwapchain::Fresh("fresh")));
+
+    // Once the replacement has been committed to the target, its swapchain has
+    // never been used for a recreation, so `recreate` is allowed again.
+    retirement.commit();
+    let rebuilt = rebuild_window_swapchain(&mut retirement, || Ok("recreated"), || Ok("fresh"))
+        .expect("recreate succeeds on the committed swapchain");
+    assert!(matches!(rebuilt, RebuiltSwapchain::Recreated("recreated")));
+    retirement.commit();
+}
+
 /// resizing a headless renderer must reallocate the offscreen image, not just
 /// update the bookkeeping size: before the fix the readback buffer used the new
 /// dimensions while the render target was still the old one.
@@ -652,4 +972,30 @@ fn headless_resize_reallocates_the_offscreen_target() {
         "clear colour after resize",
     );
     renderer.shutdown();
+}
+
+/// A surface may clamp the swapchain extent below the window size (fixed
+/// `currentExtent`, or a driver maximum). The renderer must compare the window
+/// against the size it last *requested*, not against the clamped extent, or
+/// every frame looks like a resize and the swapchain is recreated continuously.
+#[test]
+fn a_clamped_swapchain_extent_does_not_keep_requesting_a_resize() {
+    let mut requested = [1160, 740];
+    // A clamped extent (e.g. 1000x600) never enters this decision at all.
+    for _ in 0..16 {
+        assert!(
+            !window_size_changed(&mut requested, [1160, 740]),
+            "an unchanged window must not request a rebuild, however the surface clamped it"
+        );
+    }
+    assert_eq!(requested, [1160, 740]);
+
+    // A real window resize does, once; the next frame at the same size is quiet.
+    assert!(window_size_changed(&mut requested, [1200, 800]));
+    assert!(!window_size_changed(&mut requested, [1200, 800]));
+    assert_eq!(requested, [1200, 800]);
+
+    // Zero-sized window events are normalized to one pixel, never stored as 0.
+    assert!(window_size_changed(&mut requested, [0, 0]));
+    assert_eq!(requested, [1, 1], "a zero size must not become the extent");
 }

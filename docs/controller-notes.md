@@ -1,6 +1,6 @@
 # Controller notes — backend bridge, event pump, cover art, page generations
 
-Owner: `controller`. Files: `crates/rift-desktop/src/controller.rs`, `crates/rift-desktop/src/cover.rs`,
+Owner: `controller`. Files: `crates/rift-desktop/src/controller/**`, `crates/rift-desktop/src/cover.rs`,
 `crates/rift-desktop/src/state.rs` (additions only), `crates/rift-desktop/tests/ui_flow.rs` (headless
 interaction suite, §14), this document. `app.rs` / `main.rs` stay Lead-owned; the
 controller is wired by the Lead through the contract in §2.
@@ -38,15 +38,33 @@ and `new()` returns an explanatory error, which `main.rs` handles by falling
 back to the preview controller with a warning toast. Public signatures are
 identical in both configurations.
 
+### Module layout
+
+`controller/` is split by seam; the public path stays `crate::controller::…`:
+
+| File | Owns |
+|---|---|
+| `mod.rs` | Module docs/re-exports, `ControllerEvent`, `PageKind`/`PageRequest`, `TrackCache`, the `Controller` struct, and the core impl: construction, `bootstrap`, `poll`, `dispatch`, navigation/search generations, action helpers, backend-event mapping, online probe |
+| `commands.rs` | The `BackendCommands` trait, `InertCommands`, and the feature-gated `live` module with `LiveCommands` |
+| `tasks.rs` | The private `TaskResult` completions and `Controller::apply_task` (stale-generation filters, cover/probe bookkeeping) |
+| `cover.rs` | `Controller::request_cover`'s de-duplication path; `CoverImage`/`CoverTracker`/decoding stay in `src/cover.rs` |
+| `tests.rs`, `backend_event_tests.rs` | The controller unit tests, with their original `controller::tests::*` / `controller::backend_event_tests::*` paths |
+
+`app.rs`/`main.rs` still import the same `crate::controller::{Controller,
+ControllerEvent, BackendCommands, CoverImage}` paths; the split changed no public
+surface.
+
 ### Seam: `BackendCommands`
 
 All commands go through a trait (`BackendCommands`), so the mapping is testable
 without a live backend, a window or a network:
 
-* `live::LiveCommands` — production implementation over `rift::BackendHandle`.
+* `commands::live::LiveCommands` (`controller/commands.rs`) — production
+  implementation over `rift::BackendHandle`.
 * `InertCommands` — preview/screenshot mode; accepts and ignores everything.
 * test `RecordingCommands` — records a typed `Call` per command and can inject
-  async completions, used by the tests in `controller.rs`.
+  async completions; used by `controller/tests.rs` and
+  `controller/backend_event_tests.rs`.
 
 ---
 
@@ -69,25 +87,36 @@ Additions the Lead integrates in `app.rs` (§8 has the full apply code):
    `self.controller.navigate_view(&view)` after setting `state.view`. This
    issues `get_artist` / `get_artist_songs` / `get_album` for page views, and
    bumps the page generation on every navigation so a reply for a view the user
-   has left is dropped (the old `page_gen` rule). `Action::RetryPage` falls
-   through the `other => controller.dispatch(other)` arm and re-issues the last
-   page request.
-2. **Search sub-tabs** — the `SetSearchTab(tab)` arm forwards
+   has left is dropped (the old `page_gen` rule). A failed page reply now carries
+   `Err(message)` for that request instead of a bare toast: `app.rs` stores it in
+   `State::page_error` when the failed id still matches the view, and the page
+   screens render a compact error state with a **Retry** button
+   (`page-error/retry`) emitting `Action::RetryPage`, which re-issues the last
+   page request with a new generation.
+2. **Search debounce** — the titlebar edit emits only `SearchQueryChanged`;
+   `App` holds a 300 ms debounce (`SEARCH_DEBOUNCE_SECS`) keyed to
+   `InputState::time`, dispatches `Action::Search` after the query is stable,
+   cancels it immediately when the box is cleared, and bypasses it on Enter/the
+   Search button. `App::navigate` drops a pending debounce so a live search
+   cannot yank the user back, and the box emits `Action::SearchBlur` when it
+   loses focus (the user clicked another control) so the pending search is
+   cancelled instead of switching views ~300 ms later.
+3. **Search sub-tabs** — the `SetSearchTab(tab)` arm forwards
    `self.controller.dispatch(Action::SetSearchTab(tab))`; the controller lazily
-   fetches artists/albums once per submitted query (old UI behaviour) and clears
-   those flags on every new search.
-3. **Clearing the search box** — when the query becomes empty,
+   fetches artists/albums once per submitted query (old UI behaviour), remembers
+   the active tab, and clears the lazy flags on every new search.
+4. **Clearing the search box** — when the query becomes empty,
    `self.controller.cancel_search()` bumps the search generation so a late reply
    for the cleared query can't repopulate the results (old `on_search_clear`).
-4. **New `ControllerEvent` arms** — during drain (§8).
-5. **Launch update banner** — the existing `UpdateStatus` arm should also set
+5. **New `ControllerEvent` arms** — during drain (§8).
+6. **Launch update banner** — the existing `UpdateStatus` arm should also set
    `state.update_banner = Some(status.clone())` when `status.update_available`,
    as the old app did from its launch check. The controller already triggers the
    check itself after bootstrap, so no extra call is needed.
 
 `Action`s that `app.rs` applies locally and never needs to forward to the
 controller: `Navigate`, `SearchQueryChanged` (except the empty-box
-`cancel_search` above), `ToggleQueuePanel`/`ToggleQueueCollapsed`,
+`cancel_search` above), `SearchBlur`, `ToggleQueuePanel`/`ToggleQueueCollapsed`,
 `BeginRenamePlaylist`/`BeginNewPlaylist`/`PlaylistDraftChanged`/
 `ClosePlaylistEditor`, `DismissUpdateBanner`, `Toast`/`ToastError`,
 `Window*` (winit), `SetOnline` (test hook). The controller also ignores them if
@@ -119,10 +148,12 @@ and knows it is current.
 
 ## 4. Action → backend command mapping
 
-All 46 commands the old desktop shell registered are covered (the migration brief
-said 55; `backend-api.md` §7 checked the checked-in `invoke_handler` and the
-generated permission set: 46 registered, 43 preserved 1:1 as methods, 3 window
-commands moved to winit). The table is exhaustive for `Action`:
+The old desktop shell registered 46 commands (the migration brief said 55;
+`backend-api.md` §7 checked the checked-in `invoke_handler` and the generated
+permission set). Native streaming removed the three yt-dlp management commands;
+of the remaining 43, 40 are preserved 1:1 as backend methods and the 3 window
+commands moved to winit. The backend also gained `fetch_image` and `is_online`
+(controller-driven, not `Action`s). The table is exhaustive for `Action`:
 
 ### 4.1 Playback / transport / settings
 
@@ -169,7 +200,7 @@ commands moved to winit). The table is exhaustive for `Action`:
 | `ImportYtPlaylistUrl(url)` | `import_yt_playlist(url)` | async → `TaskResult::ImportYtPlaylist` | new Action variant; trims and ignores blank. Success → `OpenPlaylist(id)` + `Notice("Imported “name” (N songs)")`, failure → `Error`; backend emits `Library` |
 | `ImportPlaylistFile` | `import_playlist()` | fire-and-forget | native `rfd` Open dialog on the backend blocking pool; reports via backend events (`Library` + `OpenPlaylist` + `Notice`, or `Error`, nothing on cancel) |
 | `ExportPlaylist(id)` | `export_playlist(id)` | fire-and-forget | native `rfd` Save dialog; `Notice`/`Error` events, nothing on cancel |
-| `BeginRenamePlaylist`, `BeginNewPlaylist`, `PlaylistDraftChanged`, `ClosePlaylistEditor` | — | UI-local | |
+| `BeginRenamePlaylist`, `BeginNewPlaylist`, `PlaylistDraftChanged`, `ClosePlaylistEditor` | — | UI-local | `BeginRenamePlaylist` first navigates to `View::Playlist(id)` (the editor lives in that view's header) |
 
 ### 4.4 Downloads
 
@@ -188,7 +219,7 @@ commands moved to winit). The table is exhaustive for `Action`:
 | `OpenCurrentArtist` | — (derived) | local | resolves the current track's first linkable artist from the `Track` mirror → `ControllerEvent::OpenArtist(id)`; app clears + navigates |
 | `DismissUpdateBanner`, `Toast`, `ToastError`, `SetOnline` | — | UI-local | |
 | `WindowDrag`, `WindowMinimize`, `WindowToggleMaximize`, `WindowClose`, `WindowBeginResize` | — | winit/`main.rs` | the three former `window_*` commands are the app's job now |
-| `Navigate`, `SearchQueryChanged`, `ToggleQueuePanel`, `ToggleQueueCollapsed` | — | UI-local (see §2 for exceptions) | |
+| `Navigate`, `SearchQueryChanged`, `SearchBlur`, `ToggleQueuePanel`, `ToggleQueueCollapsed` | — | UI-local (see §2 for exceptions) | |
 
 `navigate_view`-only Actions (`OpenArtist`, `OpenArtistSongs`, `OpenAlbum`) are
 also handled in `dispatch()` for completeness, but `app.rs` intercepts them for
@@ -238,7 +269,17 @@ receives replies):
 
 Search sub-tabs keep the old lazy behaviour: `SetSearchTab(Artists|Albums)`
 fetches that list once per submitted query (the old UI fetched on first tab
-open, not with the songs search). Flags reset on every new search/cancel.
+open, not with the songs search). The controller also tracks the active tab
+(`active_search_tab`, default `Songs`, updated by every `SetSearchTab`): a new
+`Action::Search` resets the lazy flags and the app's `artists`/`albums` lists to
+`None`, then issues the songs request **and** the active tab's request (if it is
+not `Songs`) with the new generation. Without that, submitting a new query
+while Artists/Albums was open left the visible tab on "Searching..." until the
+user switched tabs. The flags still prevent duplicate requests, and `Songs`
+never gets a second request; the active tab survives `cancel_search` so
+re-submitting on that tab loads it again. A completed sub-search with zero
+matches (including the `Err → Some([])` path in `app.rs`, which also toasts the
+error) renders "No results." rather than "Searching...".
 
 ---
 
@@ -247,13 +288,13 @@ open, not with the songs search). Flags reset on every new search/cancel.
 `State::request_cover(url)` (unchanged) pushes into `state.cover_requests`;
 `app.tick()` hands each URL to `Controller::request_cover(url)`. Then:
 
-1. **De-dupe** — `CoverTracker` (`cover.rs`) keeps the controller-authoritative
+1. **De-dupe** — `CoverTracker` (`src/cover.rs`) keeps the controller-authoritative
    set of in-flight URLs and known-failed URLs (bounded to 1024 remembered
    failures, FIFO). A URL is fetched at most once while in flight; a known-bad
    URL is never retried this session and immediately yields
    `ControllerEvent::CoverFailed(url)` so the UI renders its fallback tile.
    Preview mode has no HTTP client, so requests fail immediately the same way.
-2. **Fetch** — `live::LiveCommands::fetch_cover` spawns a task on the backend
+2. **Fetch** — `commands::live::LiveCommands::fetch_cover` spawns a task on the backend
    runtime that calls `BackendHandle::fetch_image(url)` (the backend's shared
    `reqwest::Client`, 16 MiB cap, http(s)-only). No second HTTP client is built
    in the app.
@@ -314,24 +355,25 @@ fn apply_controller_event(&mut self, event: ControllerEvent) {
                 }
             }
         }
-        ControllerEvent::ArtistPage { generation, page } => {
-            if generation >= self.state.page_generation {
+        ControllerEvent::ArtistPage { generation, artist_id, result } => {
+            if generation >= self.state.page_generation
+                && matches!(self.state.view, View::Artist(ref id) if *id == artist_id)
+            {
                 self.state.page_generation = generation;
-                self.state.artist_page = Some(page);
+                match result {
+                    Ok(page) => {
+                        self.state.page_error = None;
+                        self.state.artist_page = Some(page);
+                    }
+                    Err(message) => {
+                        self.state.artist_page = None;
+                        self.state.page_error = Some(message);
+                    }
+                }
             }
         }
-        ControllerEvent::ArtistSongs { generation, artist_id, tracks } => {
-            if generation >= self.state.page_generation {
-                self.state.page_generation = generation;
-                self.state.artist_songs = Some((artist_id, tracks));
-            }
-        }
-        ControllerEvent::AlbumPage { generation, page } => {
-            if generation >= self.state.page_generation {
-                self.state.page_generation = generation;
-                self.state.album_page = Some(page);
-            }
-        }
+        // ArtistSongs/AlbumPage follow the same stale-generation + view-id +
+        // Ok/Err rule; a matching Err clears the cache and sets `page_error`.
         ControllerEvent::Online(online) => self.state.online = online,
         ControllerEvent::OpenArtist(id) => {
             self.state.artist_page = None;
@@ -341,9 +383,9 @@ fn apply_controller_event(&mut self, event: ControllerEvent) {
 }
 ```
 
-Page error replies are emitted as `ControllerEvent::Error` (toast) and leave the
-page empty; `Action::RetryPage` re-issues the load, matching the old UI's
-toast-and-stay-put behaviour.
+Page replies carry `Result` (plus the page id) and a matching `Err` sets
+`State::page_error`; the screens render a Retry control instead of a permanent
+“Loading…”. `App::navigate` and a successful reply clear the error.
 
 ---
 
@@ -358,7 +400,8 @@ toast-and-stay-put behaviour.
 | `Queue(QueueSnapshot)` (`rift://queue`) | `Queue(snapshot)`; tracks cached |
 | `Progress(Progress)` (`rift://progress`) | `Progress(progress)` |
 | `Library(Library)` (`rift://library`) | `Library(library)`; updates the library mirror + track cache |
-| `Downloads(DownloadState)` (`rift://downloads`) | `Downloads(state)` |
+| `Downloads(DownloadState)` (`rift://downloads`) | `Downloads(state)` (lifecycle snapshot) |
+| `DownloadProgress { id, permille }` (`rift://download_progress`) | `DownloadProgress { id, permille }` (mirror updated; no state clone) |
 | `Error(String)` (`rift://error`) | `Error(message)` (toast) |
 | `Notice(String)` (`rift://notice`) | `Notice(message)` (toast) |
 | `OpenPlaylist(String)` (`rift://open_playlist`) | `OpenPlaylist(id)` (navigate) |
@@ -386,6 +429,9 @@ Failure is graceful: a probe that cannot run just leaves the previous value.
 
 `crates/rift-desktop/src/state.rs` (extend-only):
 
+* `State::page_error: Option<String>` — the failed page load for the current
+  view; cleared on navigation, a new request and success. Rendered by the page
+  screens with a Retry button.
 * `State::page_generation: u64` — monotonic generation of the newest artist/album
   page result applied; `app.rs` guards page events with it (§8).
   `SearchState::generation` keeps its existing app-side role; the authoritative
@@ -430,7 +476,7 @@ Failure is graceful: a probe that cannot run just leaves the previous value.
 
 Feature-independent (no live backend, no network, no window):
 
-| Test (in `crates/rift-desktop/src/controller.rs` unless noted) | What it pins |
+| Test (in `crates/rift-desktop/src/controller/` unless noted) | What it pins |
 |---|---|
 | `dispatch_maps_transport_and_volume_to_the_backend` | play/pause/next/prev/seek/volume/save-volume/shuffle/repeat |
 | `dispatch_maps_playback_and_queue_commands` | play_tracks/play_track/queue add/next/move/remove/jump/clear |
@@ -440,6 +486,7 @@ Feature-independent (no live backend, no network, no window):
 | `dispatch_maps_downloads_and_resolves_ids_through_the_track_cache` | id→Track resolution for downloads |
 | `dispatch_keeps_ui_local_actions_off_the_backend` | navigation/window/toast/online/dev actions never reach the backend |
 | `fallible_commands_surface_their_error_on_the_next_poll` | `open_url` refusal → `Error` |
+| `a_rejected_playlist_name_is_toasted_instead_of_silently_dropped` | backend `create_playlist` refusal → `Error` event, no silent drop |
 | `open_current_artist_resolves_the_playing_tracks_first_linkable_artist` | `OpenCurrentArtist` → `OpenArtist` |
 | `search_results_for_a_superseded_query_are_dropped` | oldest search reply never reaches the UI |
 | `clearing_the_search_box_cancels_the_in_flight_search` | `cancel_search` invalidation |
@@ -448,7 +495,7 @@ Feature-independent (no live backend, no network, no window):
 | `a_page_reply_for_an_abandoned_view_is_dropped` | leave-view invalidation, refetch on return |
 | `a_duplicate_navigation_to_the_loading_page_does_not_refetch` | in-flight de-dupe |
 | `retry_page_reissues_the_last_page_request` | `RetryPage` |
-| `a_failed_page_reports_an_error_and_retry_works` | page error → toast, retry with fresh token |
+| `a_failed_page_emits_a_page_error_and_retry_reissues_it` | page failure carried in the page reply (not a bare toast); Retry re-issues with a fresh generation |
 | `cover_requests_are_deduplicated_while_in_flight` | one fetch per URL while loading |
 | `a_failed_cover_is_not_requested_again` | known-failed URL → `CoverFailed`, no refetch |
 | `a_decoded_cover_is_emitted_and_a_later_request_may_refetch` | `Cover` event + tracker release |
@@ -459,13 +506,13 @@ Feature-independent (no live backend, no network, no window):
 | `bootstrap_seeds_the_mirrors_and_runs_the_launch_update_check` | bootstrap mirrors, launch check |
 | `the_reachability_probe_runs_on_the_interval_and_reports_transitions` | probe interval, no probe storm |
 | `a_track_cache_insert_updates_metadata_in_place` | cache update semantics |
-| `cover.rs`: 8 tests | 256 px cap (landscape/portrait/panorama), no upscale, RGBA/alpha preservation, garbage bytes → `Err`, tracker dedupe/failure/bound |
+| `src/cover.rs`: 10 tests | 256 px cap (landscape/portrait/panorama), no upscale, RGBA/alpha preservation, garbage bytes → `Err`, tracker dedupe/failure/bound |
 | `backend_event_tests::every_backend_event_maps_one_to_one` (feature-gated) | all 9 backend event payloads → their `ControllerEvent`; library/current mirrors |
 
 ### Test commands
 
 Run from the repository root (Rust 1.88 pinned). The app crate's default
-features include ackend; --no-default-features builds the inert-controller
+features include `backend`; --no-default-features builds the inert-controller
 UI used for renderer/immediate-mode work.
 
 `powershell
@@ -480,7 +527,7 @@ cargo fmt --check
 
 ## 14. Headless interaction tests (acceptance proof, `crates/rift-desktop/tests/ui_flow.rs`)
 
-Ten end-to-end tests drive the **real** `App` exactly like `main.rs` does —
+Seventeen end-to-end tests drive the **real** `App` exactly like `main.rs` does —
 `App::tick()` then `App::frame(InputState)` with synthetic input — and assert the
 resulting app state, paint list and controller commands:
 
@@ -490,7 +537,8 @@ resulting app state, paint list and controller commands:
 2. `sidebar_rows_navigate` — clicking the Liked Songs row → `View::Liked`;
    clicking Home → `View::Home`.
 3. `titlebar_search_types_submits_and_clears` — click focuses the box, typing
-   updates `search.query` and issues the search command, Enter submits
+   updates `search.query` and schedules the 300 ms debounce; advancing frame
+   time dispatches the search command, Enter submits immediately
    (`view == Search`, `shown_query`, busy), Escape clears + cancels (busy false,
    keyboard released).
 4. `player_bar_clicks_reach_the_backend_bridge` — play/pause → `TogglePlay`,
@@ -516,6 +564,25 @@ resulting app state, paint list and controller commands:
     clear; navigate to a playlist, open Rename from the header kebab, click the
     inline editor, type, Enter → `RenamePlaylist(id, "Playlist 1 2")` and the
     editor closes.
+11. `update_banner_buttons_win_over_the_queue_panel_underneath` — the update
+    banner floats over the queue panel; its Download button receives the click
+    and the queue row underneath must not also act (overlays interact first,
+    paint last).
+12. `sidebar_playlist_rows_with_duplicate_names_are_distinct` — two playlists may
+    share a name; each row's interaction id is derived from the playlist id, so a
+    row click navigates to that row's playlist.
+13. `sidebar_playlist_list_scrolls_to_reach_hidden_rows` — the sidebar playlist
+    list scrolls so a row below the fold can still be clicked.
+14. `titlebar_search_keeps_typed_spaces` — a space typed as the last character of
+    its frame survives the live-search dispatch (see the fourth defect below).
+15. `titlebar_search_debounces_quick_typing_but_enter_searches_immediately` —
+    three keystrokes inside the window produce one `SearchSongs`; Enter bypasses
+    the wait.
+16. `clearing_the_search_box_cancels_a_pending_debounce` — emptying the box
+    before the deadline emits no search and cancels the generation.
+17. `a_failed_page_renders_retry_and_retry_reissues_the_last_page` — the page
+    error state renders a Retry button; clicking it re-issues the page with a
+    new generation.
 
 **Seam used:** `Controller::with_commands(Box<dyn BackendCommands>)`
 (`#[doc(hidden)]`, non-live: no runtime, event bus, probe or backend is built) so
@@ -557,6 +624,26 @@ The acceptance suite's first run passed 6/10 flows and exposed these defects
 
 These are exactly the classes of bug screenshots cannot catch (an action never
 emitted, focus stealing), which is why this suite exists.
+
+### A fourth defect the suite missed: the search box deleted typed spaces
+
+The app's own debug log showed the user typing `sign of the time` while the search
+commands received `signofthetime` — one word. The titlebar used to emit
+`Action::SearchQueryChanged(raw)` and `Action::Search(trimmed)` on the same edit
+frame (`screens/chrome/titlebar.rs`; it now emits only `SearchQueryChanged` and
+`App` debounces), and `App::dispatch_ui`'s `Search` arm wrote the **trimmed**
+payload back into `state.search.query` — the field's live edit buffer. A space typed as the last character of its frame was therefore deleted in
+the frame it arrived, before the next frame drew the field from that buffer; a
+keystroke batched with the following character in the same frame survived (trim
+keeps interior whitespace), which is what made the defect look intermittent. The
+box is now the only writer of its own buffer: the `Search` arm records the
+submitted query for the results header (`SearchState::shown_query`) and forwards
+it to the controller, but never rewrites `search.query`.
+
+The suite missed this because its text injection (`Harness::type_text`) delivers a
+whole string in one frame — `"daft punk"` has no *trailing* space, so `trim` was a
+no-op. `titlebar_search_keeps_typed_spaces` now types one key per frame, like the
+live app, and fails if the `Search` arm writes the buffer again.
 
 ---
 

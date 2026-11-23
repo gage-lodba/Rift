@@ -206,6 +206,108 @@ fn outside_press_closes_and_consumes_the_frame() {
     assert!(!is_open());
 }
 
+/// Regression for the dismissing click leaking into the content: the press that
+/// closes the menu belongs to the menu, so the control under the pointer must
+/// not latch it and must not fire on the following release. A fresh gesture
+/// after the release frame works normally.
+///
+/// The old code only covered the press frame (`outside_press_closes_and_
+/// consumes_the_frame`): the row under the pointer called `ui.track_row` (which
+/// interacts before it checks `menu::is_open()`), latched `active` on the press,
+/// and fired on the release frame when the menu was already closed.
+#[test]
+fn dismissing_an_open_menu_does_not_activate_the_control_under_the_press() {
+    let _guard = lock();
+    let mut ui = Ui::new();
+    let anchor = Rect::new(300.0, 100.0, 28.0, 28.0);
+    let menu_id = Id::from_str("test-menu-dismiss-activation");
+    frame(&mut ui, 1.0, (0.0, 0.0), false, false);
+    open(
+        &mut ui,
+        menu_id,
+        anchor,
+        vec![Entry::inert(Item::new("Inert", None))],
+    );
+    let mut actions = Vec::new();
+    let _ = layer(&mut ui, &mut actions);
+    let _ = ui.end_frame();
+    assert!(is_open());
+
+    // A button under the pointer, far from the menu card. Production ordering:
+    // the menu layer runs before the content, then the content draws.
+    let target = Rect::new(820.0, 520.0, 160.0, 40.0);
+    let target_id = Id::from_str("test/dismiss-target");
+    let (tx, ty) = target.center();
+    let mut clicks = 0;
+
+    // Frame 2: outside press. It closes the menu and is *consumed*: the button
+    // must not hover, latch the press or take focus.
+    frame(&mut ui, 2.0, (tx, ty), true, false);
+    let mut actions = Vec::new();
+    assert!(
+        !layer(&mut ui, &mut actions),
+        "outside press closed the menu"
+    );
+    let resp = cards::secondary_button(&mut ui, target, target_id, "Under");
+    assert!(
+        !resp.hovered,
+        "the dismissed gesture does not hover content"
+    );
+    assert!(
+        !resp.pressed,
+        "the dismissing press must not latch the button"
+    );
+    assert!(!resp.active);
+    assert!(!resp.clicked);
+    clicks += usize::from(resp.clicked);
+    let _ = ui.end_frame();
+    assert!(actions.is_empty());
+    assert!(open_id().is_none());
+
+    // Frame 3: release on the same point. The gesture still belongs to the
+    // menu, so there is no click even though the menu closed last frame.
+    frame(&mut ui, 3.0, (tx, ty), false, true);
+    let mut actions = Vec::new();
+    assert!(!layer(&mut ui, &mut actions));
+    let resp = cards::secondary_button(&mut ui, target, target_id, "Under");
+    assert!(
+        !resp.clicked,
+        "release after a dismissing press must not click the control"
+    );
+    assert!(
+        !resp.hovered,
+        "the consumed gesture stays inert through release"
+    );
+    clicks += usize::from(resp.clicked);
+    let _ = ui.end_frame();
+    assert_eq!(
+        clicks, 0,
+        "dismissing the menu must not activate the button"
+    );
+    assert!(actions.is_empty());
+
+    // Frame 4: a fresh press+release now behaves like any other click.
+    frame(&mut ui, 4.0, (tx, ty), true, false);
+    let mut actions = Vec::new();
+    assert!(!layer(&mut ui, &mut actions));
+    let resp = cards::secondary_button(&mut ui, target, target_id, "Under");
+    assert!(resp.hovered);
+    assert!(resp.pressed, "the next gesture starts normally");
+    let _ = ui.end_frame();
+
+    // Frame 5: release over the button → exactly one click.
+    frame(&mut ui, 5.0, (tx, ty), false, true);
+    let mut actions = Vec::new();
+    assert!(!layer(&mut ui, &mut actions));
+    let resp = cards::secondary_button(&mut ui, target, target_id, "Under");
+    assert!(resp.clicked, "a fresh press+release still clicks");
+    assert!(!resp.keyboard_activated);
+    clicks += usize::from(resp.clicked);
+    let _ = ui.end_frame();
+    assert_eq!(clicks, 1);
+    assert!(actions.is_empty());
+}
+
 #[test]
 fn opening_and_closing_tracks_state() {
     let _guard = lock();

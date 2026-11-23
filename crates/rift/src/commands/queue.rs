@@ -13,7 +13,7 @@ impl BackendHandle {
             let mut core = self.inner.player.core.lock_safe();
             player::append_tracks(&mut core, vec![track])
         };
-        self.apply_add(outcome);
+        self.apply_add(outcome, false);
     }
 
     /// Insert tracks right after the current one so they play next.
@@ -22,7 +22,7 @@ impl BackendHandle {
             let mut core = self.inner.player.core.lock_safe();
             player::insert_next(&mut core, tracks)
         };
-        self.apply_add(outcome);
+        self.apply_add(outcome, true);
     }
 
     /// Reorder the queue, moving the track at `from` to `to`.
@@ -46,7 +46,9 @@ impl BackendHandle {
         match outcome {
             player::RemoveOutcome::None => {}
             player::RemoveOutcome::EmitOnly => player::emit_queue(&self.inner, &self.inner.player),
-            player::RemoveOutcome::PlayIndex(i) => player::play_index(&self.inner, i),
+            player::RemoveOutcome::PlayIndex(i) => {
+                let _ = player::play_index(&self.inner, i, None);
+            }
             player::RemoveOutcome::Stop => {
                 player::stop(&self.inner);
                 player::emit_queue(&self.inner, &self.inner.player);
@@ -56,7 +58,7 @@ impl BackendHandle {
 
     /// Jump playback to the track at `index`.
     pub fn queue_jump(&self, index: usize) {
-        player::play_index(&self.inner, index);
+        let _ = player::play_index(&self.inner, index, None);
     }
 
     /// Clear the queue and stop playback.
@@ -75,11 +77,21 @@ impl BackendHandle {
     }
 
     /// Apply the result of a queue add: start playback if nothing was playing,
-    /// otherwise just re-broadcast the queue.
-    fn apply_add(&self, outcome: player::AddOutcome) {
+    /// otherwise just re-broadcast the queue. `invalidate_crossfade` is false for
+    /// an append, which cannot move the pinned next track (and would otherwise
+    /// turn a sent crossfade into a silent hard cut).
+    fn apply_add(&self, outcome: player::AddOutcome, invalidate_crossfade: bool) {
         match outcome {
-            player::AddOutcome::EmitOnly => player::emit_queue(&self.inner, &self.inner.player),
-            player::AddOutcome::PlayIndex(i) => player::play_index(&self.inner, i),
+            player::AddOutcome::EmitOnly => {
+                if invalidate_crossfade {
+                    player::emit_queue(&self.inner, &self.inner.player);
+                } else {
+                    player::emit_queue_quiet(&self.inner, &self.inner.player);
+                }
+            }
+            player::AddOutcome::PlayIndex(i) => {
+                let _ = player::play_index(&self.inner, i, None);
+            }
         }
     }
 }

@@ -6,8 +6,6 @@ use crate::state::{Action, State};
 use crate::theme::Theme;
 use crate::ui::{Color, Icon, Id, Rect, Response, Sense, Ui};
 
-use super::row::side_row_id;
-
 /// Style of the inline sidebar editors (`.side-new-input`): raised fill, 1px
 /// accent border, 6px radius, 13px text, 7x12 padding. The border/background are
 /// painted by the caller on the full row so the in-field buttons can sit on top.
@@ -51,34 +49,36 @@ pub(super) fn paint_inline_icon(
 
 /// Focus bookkeeping for the inline sidebar editors.
 ///
-/// The editor closes when focus moves *outside* it. Its own controls (text
-/// field, confirm, cancel) keep it open: clicking a button focuses it on the
-/// press frame, so treating that as "moved on" would close the editor before
-/// the release frame delivers the button's click. The text field is focused
-/// when the editor first appears (nothing focused, or focus still on the row
-/// that opened it).
+/// The editor autofocuses on its **opening frame only** via
+/// [`Ui::request_focus_on_open`]: on every later frame the field is part of the
+/// previous frame's focus order, so the helper is a no-op. That is what stops
+/// the old behaviour where `focused_id() == None` re-grabbed the field every
+/// frame, so clicking empty space could never close "New playlist" / "Import
+/// playlist".
+///
+/// After the opening frame the editor lives only while one of its own controls
+/// (text field, confirm, cancel) holds keyboard focus. A click on empty space
+/// blurs focus in `Ui::end_frame` (after this check ran), so the editor closes
+/// on the following frame. The confirm/cancel buttons keep it open while they
+/// hold focus, preserving their press-then-release click.
+///
+/// Returns `true` while the editor should stay open. Callers must keep drawing
+/// the editor on the closing frame too: that keeps the field id in the focus
+/// order, so the one-shot focus helper cannot mistake a not-drawn closing frame
+/// for a fresh opening.
 pub(super) fn inline_editor_keep_open(
     ui: &mut Ui,
     input_id: Id,
-    opener: Id,
     confirm_id: Id,
     cancel_id: Id,
 ) -> bool {
-    if ui.is_focused(input_id) {
+    if ui.request_focus_on_open(input_id) {
         return true;
     }
-    match ui.focused_id() {
-        None => {
-            ui.request_focus(input_id);
-            true
-        }
-        Some(focused) if focused == opener => {
-            ui.request_focus(input_id);
-            true
-        }
-        Some(focused) if focused == confirm_id || focused == cancel_id => true,
-        Some(_) => false,
-    }
+    matches!(
+        ui.focused_id(),
+        Some(focused) if focused == input_id || focused == confirm_id || focused == cancel_id
+    )
 }
 
 /// In-field button geometry for the sidebar inline editors (old CSS:
@@ -107,11 +107,9 @@ pub(super) fn new_playlist_input(
     let input_id = Id::from_str("sidebar/new-playlist-input");
     let confirm_id = Id::from_str("sidebar/confirm");
     let cancel_id = Id::from_str("sidebar/cancel");
-    let opener = side_row_id("New playlist", false);
-    if !inline_editor_keep_open(ui, input_id, opener, confirm_id, cancel_id) {
-        actions.push(Action::ClosePlaylistEditor);
-        return;
-    }
+    // `false` once focus moved outside the editor (click-away / another widget).
+    // The editor is still drawn on that frame, see `inline_editor_keep_open`.
+    let closing = !inline_editor_keep_open(ui, input_id, confirm_id, cancel_id);
     // In-field buttons: 22 px wide, old CSS `.side-new-btn.confirm { right: 34px }`
     // and `.side-new-btn.cancel { right: 6px }`. The confirm sits 22 px further
     // left so the two hit rects never overlap (they used to be at right-34 and
@@ -146,7 +144,7 @@ pub(super) fn new_playlist_input(
             actions.push(Action::CreatePlaylist(trimmed));
             actions.push(Action::ClosePlaylistEditor);
         }
-    } else if resp.cancelled || no.clicked {
+    } else if resp.cancelled || no.clicked || closing {
         actions.push(Action::ClosePlaylistEditor);
     }
 }
@@ -166,11 +164,9 @@ pub(super) fn import_playlist_input(
     let input_id = Id::from_str("sidebar/import-input");
     let confirm_id = Id::from_str("sidebar/import-confirm");
     let cancel_id = Id::from_str("sidebar/import-cancel");
-    let opener = side_row_id("Import playlist", false);
-    if !inline_editor_keep_open(ui, input_id, opener, confirm_id, cancel_id) {
-        state.import_playlist = None;
-        return;
-    }
+    // See `inline_editor_keep_open` / `new_playlist_input`: the editor is drawn
+    // once more on the frame it notices the focus loss.
+    let closing = !inline_editor_keep_open(ui, input_id, confirm_id, cancel_id);
     // Same in-field layout as the new-playlist editor: confirm at right 34,
     // cancel at right 6, each 22 px wide (no overlap).
     let (confirm, cancel) = inline_editor_buttons(row);
@@ -206,7 +202,7 @@ pub(super) fn import_playlist_input(
             actions.push(Action::ImportYtPlaylistUrl(trimmed));
             state.import_playlist = None;
         }
-    } else if resp.cancelled || no.clicked {
+    } else if resp.cancelled || no.clicked || closing {
         state.import_playlist = None;
     }
 }

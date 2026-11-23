@@ -1,8 +1,6 @@
 //! Generated app textures: the fallback cover gradient, the real-SVG Rift logo
 //! mark (prerasterized PNG) and the old UI's music-note glyph.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::gfx::paint::TextureId;
 use crate::ui::Ui;
 
@@ -27,12 +25,14 @@ pub const NOTE_TEX: TextureId = 1_000_002;
 pub const LOGO_DRAW_SIZE: f32 = 32.0;
 pub const LOGO_TILE_INSET: f32 = 5.0;
 
-static TEXTS_UPLOADED: AtomicBool = AtomicBool::new(false);
-
-/// Make sure the app's generated textures exist in the renderer. Called by every
-/// cover/logo draw; the upload happens on the first frame only.
+/// Make sure the app's generated textures exist in this UI context's renderer.
+///
+/// Called by every cover/logo draw; the upload happens on the first frame only.
+/// The one-shot flag lives on [`Ui`] (not a process static) so a second `Ui` in
+/// the same process — a test, or a future second window — still receives the
+/// logo/fallback/note textures instead of rendering white tiles.
 pub fn ensure_textures(ui: &mut Ui) {
-    if TEXTS_UPLOADED.swap(true, Ordering::Relaxed) {
+    if !ui.claim_generated_textures() {
         return;
     }
     let cover = fallback_cover_rgba(64);
@@ -209,6 +209,53 @@ fn point_in_polygon(px: f32, py: f32, contour: &[(f32, f32)]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for the process-wide `AtomicBool`: the first `Ui` used to
+    /// consume the upload slot for every later `Ui` in the process, which left
+    /// tests/multi-window renderers with white fallbacks. Each context must get
+    /// its own copy, and each context must still upload exactly once.
+    #[test]
+    fn generated_textures_are_uploaded_once_per_ui() {
+        let mut first = Ui::new();
+        ensure_textures(&mut first);
+        let paint = first.end_frame();
+        for id in [COVER_FALLBACK_TEX, NOTE_TEX] {
+            assert_eq!(
+                paint
+                    .created
+                    .iter()
+                    .filter(|upload| upload.id == id)
+                    .count(),
+                1,
+                "the first Ui uploads texture {id}"
+            );
+        }
+        assert!(
+            paint.created.iter().any(|upload| upload.id == LOGO_TEX),
+            "the embedded logo uploads on the first Ui"
+        );
+
+        // Asking again in the same context must not re-upload.
+        ensure_textures(&mut first);
+        let paint = first.end_frame();
+        assert!(paint.created.is_empty(), "same Ui uploads only once");
+
+        // A second context owns its own GPU texture set and must upload again.
+        let mut second = Ui::new();
+        ensure_textures(&mut second);
+        let paint = second.end_frame();
+        for id in [COVER_FALLBACK_TEX, LOGO_TEX, NOTE_TEX] {
+            assert_eq!(
+                paint
+                    .created
+                    .iter()
+                    .filter(|upload| upload.id == id)
+                    .count(),
+                1,
+                "a second Ui must receive texture {id}"
+            );
+        }
+    }
 
     #[test]
     fn generated_textures_have_the_right_shape() {

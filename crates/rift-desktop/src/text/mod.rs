@@ -31,7 +31,7 @@ use std::ops::Range;
 
 use fontdue::{Font, FontSettings};
 
-use crate::gfx::paint::{Color, TextureId, TextureUpload};
+use crate::gfx::paint::{Color, TextureId, TextureRegion, TextureUpdate, TextureUpload};
 
 /// Reserved texture id for the glyph atlas (ids below 1024 are reserved for
 /// framework textures; cover art starts at 1024).
@@ -309,8 +309,9 @@ const REF_DESCENT_RATIO: f32 = 514.0 / 2048.0;
 ///
 /// One instance lives for the lifetime of the UI (inside the
 /// [`Ui`](crate::ui::Ui) context). It is deliberately independent of any GPU
-/// object: the only thing it produces for the renderer is a [`TextureUpload`]
-/// for the atlas.
+/// object: the only thing it produces for the renderer is a [`TextureUpdate`]
+/// for the atlas (a whole upload on creation/growth, a dirty-rect region for
+/// newly rasterised glyphs).
 pub struct Fonts {
     /// One optional face per weight/icon slot; `None` if it failed to parse.
     faces: [Option<Font>; 6],
@@ -397,13 +398,32 @@ impl Fonts {
         self.overflowed = false;
     }
 
-    /// Build the atlas upload for the renderer if its pixels changed. The caller
-    /// (`Ui`) turns this into `PaintList::add_texture` / `update_texture`.
-    pub fn take_atlas_update(&mut self, id: TextureId) -> Option<TextureUpload> {
-        self.atlas.dirty()?;
+    /// Build the atlas update for the renderer if its pixels changed.
+    ///
+    /// A dirty rectangle covering the whole atlas (first frame, growth after a
+    /// `begin_frame` grow, atlas re-creation after a scale change) produces a
+    /// whole [`TextureUpload`]; one or two newly rasterised glyphs produce only
+    /// their dirty [`TextureRegion`]. This is the difference between copying
+    /// 4–16 MiB per keystroke and copying a few KiB.
+    pub fn take_atlas_update(&mut self, id: TextureId) -> Option<TextureUpdate> {
+        let dirty = self.atlas.dirty()?;
         self.atlas.take_dirty();
         let (w, h) = self.atlas.size();
-        Some(TextureUpload::new(id, w, h, self.atlas.pixels().to_vec()))
+        if dirty.x == 0 && dirty.y == 0 && dirty.w == w && dirty.h == h {
+            return Some(TextureUpdate::Whole(TextureUpload::new(
+                id,
+                w,
+                h,
+                self.atlas.pixels().to_vec(),
+            )));
+        }
+        let (rect, rgba) = self.atlas.copy_region(dirty);
+        if rect.is_empty() {
+            return None;
+        }
+        Some(TextureUpdate::Region(TextureRegion::new(
+            id, rect.x, rect.y, rect.w, rect.h, rgba,
+        )))
     }
 
     // ------------------------------------------------------------ metrics

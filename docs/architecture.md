@@ -33,7 +33,7 @@ tools/                    local CI gate + screenshot / compare scripts
 
 | Path | Responsibility |
 |---|---|
-| `crates/rift-desktop/src/main.rs`, `crates/rift-desktop/src/app.rs`, `crates/rift-desktop/src/theme.rs`, `crates/rift-desktop/src/state.rs`, `crates/rift-desktop/src/controller.rs`, `crates/rift-desktop/src/preview.rs` | entry point, winit event loop, root frame composition, app/UI state model, backend bridge |
+| `crates/rift-desktop/src/main.rs`, `crates/rift-desktop/src/app.rs`, `crates/rift-desktop/src/theme.rs`, `crates/rift-desktop/src/state.rs`, `crates/rift-desktop/src/controller/**`, `crates/rift-desktop/src/preview.rs` | entry point, winit event loop, root frame composition, app/UI state model, backend bridge |
 | `crates/rift-desktop/src/gfx/**`, `crates/rift-desktop/shaders/**` | Vulkano renderer, swapchain, pipelines, textures, screenshot mode |
 | `crates/rift-desktop/src/ui/**`, `crates/rift-desktop/src/text/**` | immediate-mode framework, layout, input, widgets, fonts/atlas, icons |
 | `crates/rift-desktop/src/screens/**` | application screens |
@@ -48,8 +48,8 @@ One frame:
 
 1. `main.rs` translates winit events into `ui::InputState` (mouse pos/buttons,
    wheel, key presses, text, modifiers, time delta).
-2. `state.rs` drains backend events (`controller.poll_events()`) and applies them
-   to `State`.
+2. `app.rs`'s `App::tick()` drains controller events (`controller.poll()`) and
+   applies them to `State`.
 3. `app.rs` calls `ui.begin_frame(input, viewport)`, then runs the root screen
    (`screens::root`) which lays the UI out **from scratch this frame** and
    returns an `Vec<Action>`.
@@ -90,7 +90,22 @@ See `crates/rift-desktop/src/gfx/paint.rs` for the authoritative definitions:
 * `TextureId` is allocated by the UI (monotonic); `0 = NO_TEXTURE`.
   The UI reports `PaintList::created` / `updated` / `dropped`; the renderer owns
   the `VkImage`s, keeps a `HashMap<TextureId, GpuTexture>`, and reclaims after
-  the frame. Cover art and the font atlas use exactly this path.
+  the frame. Cover art and the font atlas use exactly this path. A
+  `TextureUpdate` is either `Whole` (creation, atlas growth, atlas re-creation
+  after a scale change — the image may change size) or `Region` (a dirty
+  sub-rectangle copied into the existing image). The atlas emits regions for
+  newly rasterised glyphs, so typing copies the glyph's dirty rect (a few KiB)
+  instead of the whole 4–16 MiB image; a whole update supersedes a region for
+  the same id in one frame.
+* The texture create/update/drop queue is applied **before** any early return
+  in the windowed frame (minimised window, swapchain-rebuild failure). The diff
+  exists exactly once in that `PaintList`, and `app.rs` has already recorded the
+  new ids in state: dropping it would leave a permanent white cover for the
+  cached id and leak every dropped texture.
+* The swapchain extent may be clamped below the window size (fixed
+  `currentExtent`, driver maximum). The renderer tracks the window size it last
+  *requested* separately from the extent, so a clamp never looks like a resize
+  and cannot recreate the swapchain every frame.
 * `PaintList::clear` is the attachment clear color.
 
 Text is drawn as one `Prim::Image` per glyph from a white-glyph alpha atlas,
@@ -152,12 +167,14 @@ driver accepts":
   fence signals; `wait_idle` runs before resize/drop (and in `Drop`), so no object
   is destroyed while in flight. The `Surface` is kept alive alongside the window
   it was created from. Textures follow the `PaintList` created/updated/dropped
-  contract, with descriptor-set rebuild on a surface-format change.
+  contract, with descriptor-set rebuild on a surface-format change. Offscreen
+  (`screenshot`/test) frames wait for readback and then advance the same frame
+  counter, so grown vertex/uniform rings are drained there too.
 * **Allocators.** Vulkano's standard memory/command-buffer/descriptor-set
   allocators; per-frame vertex and uniform data live in persistent host-visible
   ring buffers (streaming data that is rewritten every frame) instead of a
   staging round trip. Texture uploads are batched into one command buffer per
-  frame.
+  frame and waited once (whole images and dirty regions share the batch).
 
 Deliberate gaps, kept because their cost/benefit does not justify them here: no
 persistent `VkPipelineCache` (drivers keep their own on-disk shader cache; the
@@ -194,10 +211,10 @@ cache.
 Screens never call the backend directly. They mutate nothing outside their local
 `Ui` id-space; instead they push `Action` values (navigation, playback, library,
 settings, download, window control, …) into a `Vec<Action>`. `app.rs` drains the
-vec after `ui.end_frame()` and calls `controller.dispatch(action)`, which either
-applies UI-local state immediately (navigation, dialog open) or hands an async
-command to the backend. Backend events come back through
-`controller.poll_events()` and update `State` for the next frame.
+vec after `ui.end_frame()`; `App::dispatch_ui` applies UI-local actions and routes
+the rest through `controller.dispatch(action)`, which hands commands to the
+backend. Backend events come back through
+`controller.poll()` and update `State` for the next frame.
 
 ## Backend bridge
 

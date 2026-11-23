@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -29,15 +31,42 @@ const SOCKET_COUNT: u32 = 10;
 /// from spinning forever; 8 is far more than a healthy client interleaves.
 const MAX_SKIPPED_FRAMES: usize = 8;
 
+/// Read and write deadline applied to the Unix IPC socket.
+///
+/// The Discord socket is a blocking stream, so a peer that accepts the
+/// connection and then sends nothing — a hung or forged `discord-ipc-N` socket —
+/// would otherwise park the presence worker in `read_exact` until the process
+/// exits. Setting both deadlines makes such a read return a would-block/
+/// timed-out [`std::io::Error`] (surfaced as [`Error::Io`]) instead.
+///
+/// 250 ms is deliberately half the presence worker's 500 ms per-request deadline
+/// (`crates/rift/src/discord.rs`'s `IPC_TIMEOUT`): the transport failure must
+/// reach `run_request` while the worker's caller is still waiting, so the client
+/// can close itself and keep serving the next request rather than the caller
+/// timing out and abandoning the worker. Discord answers over the local socket
+/// in microseconds when healthy, so this only fires on a stalled socket.
+///
+/// Windows cannot use this: its transport is a `std::fs::File` named pipe whose
+/// blocking read has no std timeout and cannot be interrupted without unsafe
+/// Win32 calls, which this crate forbids. There the caller's 500 ms deadline and
+/// its bounded worker abandonment are the only defence (see `IpcWorker` in
+/// `crates/rift/src/discord.rs`).
+#[cfg(unix)]
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// A Discord Rich Presence IPC client.
 ///
 /// One client owns one socket. It connects lazily, sends `SET_ACTIVITY`
 /// commands, and can be dropped at any time; dropping closes the socket without
 /// the close handshake, which Discord treats the same way as a crashed client.
 ///
-/// [`Client::connect`] is blocking and has no timeout of its own, matching the
-/// blocking local socket API; callers that cannot block (the backend's UI/event
-/// loops) should own the client on a dedicated thread.
+/// [`Client::connect`] and the activity calls block. On Unix the transport sets
+/// `SOCKET_IO_TIMEOUT` read/write deadlines, so a peer that stops answering
+/// surfaces as [`Error::Io`] after a fraction of a second instead of a permanent
+/// hang. On Windows the transport is a named-pipe `File` with no std timeout, so
+/// a call can block until the peer closes; callers that cannot block (the
+/// backend's UI/event loops) own the client on a dedicated thread and bound
+/// their own wait for each request.
 pub struct Client {
     client_id: String,
     transport: Option<Transport>,
@@ -72,7 +101,10 @@ impl Client {
     /// Returns [`Error::IpcUnavailable`] when no Discord socket is found (Discord
     /// is not running, or uses an unexpected location), [`Error::Io`] or
     /// [`Error::Json`] for a broken/undecodable handshake exchange, and
-    /// [`Error::Handshake`] when Discord rejects or does not acknowledge it.
+    /// [`Error::Handshake`] when Discord rejects or does not acknowledge it. On
+    /// Unix a peer that accepts the socket and then stops answering surfaces as
+    /// [`Error::Io`] after the transport's read timeout rather than blocking
+    /// indefinitely.
     pub fn connect(&mut self) -> Result<(), Error> {
         if self.transport.is_some() {
             return Ok(());
@@ -122,9 +154,9 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`Error::NotConnected`] if [`Client::connect`] has not completed,
-    /// [`Error::Io`] when the socket read/write fails (the caller should drop the
-    /// client and reconnect), and [`Error::Protocol`]/[`Error::Json`] for a
-    /// malformed reply.
+    /// [`Error::Io`] when the socket read/write fails or a Unix read exceeds the
+    /// transport's read timeout (the caller should drop the client and
+    /// reconnect), and [`Error::Protocol`]/[`Error::Json`] for a malformed reply.
     pub fn set_activity(&mut self, activity: &Activity) -> Result<Value, Error> {
         self.set_activity_argument(Some(activity))
     }
@@ -249,7 +281,8 @@ fn set_activity_command(activity: Option<&Activity>, nonce: &str) -> Value {
 /// Windows uses the documented named-pipe path `\\?\pipe\discord-ipc-{n}`. Unix
 /// uses `discord-ipc-{n}` under the first directory that has one, in the
 /// documented search order (`XDG_RUNTIME_DIR`, `TMPDIR`, `TMP`, `TEMP`, then
-/// `/tmp`).
+/// `/tmp`); on Unix the opened stream carries `SOCKET_IO_TIMEOUT` read/write
+/// deadlines so a peer that never answers cannot park a caller forever.
 fn open_transport() -> Result<Transport, Error> {
     let mut last_error = None;
     for path in socket_paths() {
@@ -306,10 +339,23 @@ fn open_socket(path: &std::path::Path) -> std::io::Result<Transport> {
         .open(path)
 }
 
-/// Connect to one candidate Unix socket path.
+/// Connect to one candidate Unix socket path and apply the socket deadlines.
 #[cfg(unix)]
 fn open_socket(path: &std::path::Path) -> std::io::Result<Transport> {
-    std::os::unix::net::UnixStream::connect(path)
+    let stream = std::os::unix::net::UnixStream::connect(path)?;
+    apply_socket_timeouts(&stream)?;
+    Ok(stream)
+}
+
+/// Apply [`SOCKET_IO_TIMEOUT`] to both directions of a Unix IPC stream.
+///
+/// Split out of [`open_socket`] so the deadline is unit-testable: a test can
+/// apply it to a `UnixStream::pair()` whose peer never replies and observe the
+/// read fail instead of blocking forever.
+#[cfg(unix)]
+fn apply_socket_timeouts(stream: &std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))
 }
 
 /// A unique UUID-shaped nonce, as the RPC reference's payloads use.
@@ -444,6 +490,124 @@ mod tests {
             format!("{json}").to_lowercase().contains("json"),
             "unexpected rendering: {json}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_unix_transport_sets_read_and_write_deadlines() {
+        use std::os::unix::net::UnixStream;
+
+        let (stream, _peer) = UnixStream::pair().expect("create a Unix socket pair");
+        apply_socket_timeouts(&stream).expect("apply the transport deadlines");
+        assert_eq!(
+            stream.read_timeout().expect("read timeout"),
+            Some(SOCKET_IO_TIMEOUT),
+            "a silent peer must not park a read forever"
+        );
+        assert_eq!(
+            stream.write_timeout().expect("write timeout"),
+            Some(SOCKET_IO_TIMEOUT),
+            "a peer that stops draining must not park a write forever"
+        );
+    }
+
+    /// `open_socket` itself must configure the deadlines (the pair-based helper
+    /// test above would still pass if the production call site stopped applying
+    /// them). A real listener on a unique temp path is cheap and needs no peer.
+    #[test]
+    #[cfg(unix)]
+    fn opening_a_socket_applies_the_transport_deadlines() {
+        use std::os::unix::net::UnixListener;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rift-discord-open-socket-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the socket directory");
+        let path = dir.join("ipc.sock");
+        let _listener = UnixListener::bind(&path).expect("bind the test socket");
+
+        let stream = open_socket(&path).expect("open the test socket");
+        assert_eq!(
+            stream.read_timeout().expect("read timeout"),
+            Some(SOCKET_IO_TIMEOUT),
+            "open_socket must apply the read deadline in production"
+        );
+        assert_eq!(
+            stream.write_timeout().expect("write timeout"),
+            Some(SOCKET_IO_TIMEOUT),
+            "open_socket must apply the write deadline in production"
+        );
+
+        drop(stream);
+        drop(_listener);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A real local socket whose peer never replies: `set_activity` must return
+    /// an I/O error once the transport deadline passes, and `close` must drop the
+    /// stream (the peer sees buffered frames and then EOF). Without the deadline
+    /// the read blocks for the rest of the process — exactly the stall the
+    /// presence worker used to abandon.
+    #[test]
+    #[cfg(unix)]
+    fn a_silent_peer_times_out_and_close_drops_the_socket() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let (stream, mut peer) = UnixStream::pair().expect("create a Unix socket pair");
+        apply_socket_timeouts(&stream).expect("apply the transport deadlines");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound the peer's read");
+        let mut client = Client {
+            client_id: "0".to_owned(),
+            transport: Some(stream),
+        };
+
+        let started = std::time::Instant::now();
+        let error = client
+            .set_activity(&Activity::listening().details("stalled"))
+            .expect_err("a peer that never replies must not answer");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(error, Error::Io(_)),
+            "a stalled read is an I/O error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "set_activity blocked for {elapsed:?}; the transport deadline must end it"
+        );
+
+        client.close();
+        assert!(
+            !client.is_connected() && client.transport.is_none(),
+            "close() must take and drop the transport"
+        );
+        // Buffered frames, then EOF: proof the socket itself was released rather
+        // than the field merely being cleared.
+        let mut buf = [0u8; 256];
+        let mut received = 0usize;
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    panic!("the peer saw no EOF after close(): {e}");
+                }
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+        }
+        assert!(received > 0, "the peer should receive the written frames");
     }
 
     /// In-memory transport: frames to read, plus the bytes the client writes.

@@ -107,9 +107,15 @@ pub fn banner_text_room(download_w: f32, silence_w: f32) -> f32 {
         .max(40.0)
 }
 
+/// The width the version text actually occupies: its measured width, capped at
+/// the room [`banner_text_room`] leaves between the padding and the buttons.
+pub fn banner_text_width(text_w: f32, download_w: f32, silence_w: f32) -> f32 {
+    text_w.max(0.0).min(banner_text_room(download_w, silence_w))
+}
+
 /// Banner card size from the measured text and button widths.
 pub fn banner_size(text_w: f32, download_w: f32, silence_w: f32) -> (f32, f32) {
-    let text_w = text_w.max(0.0).min(banner_text_room(download_w, silence_w));
+    let text_w = banner_text_width(text_w, download_w, silence_w);
     let w = (BANNER_PAD_L
         + text_w
         + BANNER_TEXT_MARGIN
@@ -123,6 +129,50 @@ pub fn banner_size(text_w: f32, download_w: f32, silence_w: f32) -> (f32, f32) {
         .min(BANNER_MAX_W);
     let h = BANNER_PAD_Y * 2.0 + BANNER_BTN_H.max(BANNER_CLOSE).max(BANNER_LINE);
     (w, h)
+}
+
+/// Child rectangles of the banner card, in window coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BannerLayout {
+    pub text: Rect,
+    pub download: Rect,
+    pub silence: Rect,
+    pub close: Rect,
+}
+
+/// Lay out the banner children inside a card at `rect`.
+///
+/// The rule is **the text advances the row by its measured width**, not by the
+/// maximum room: `banner_size` shrinks the card to the same width, so a short
+/// version string produces a narrow card with the buttons immediately after the
+/// text. Laying out against `banner_text_room` instead would push every child
+/// to the right of a shrunk card and off the window.
+pub fn banner_layout(rect: Rect, text_w: f32, download_w: f32, silence_w: f32) -> BannerLayout {
+    let text_w = banner_text_width(text_w, download_w, silence_w);
+    let mid_y = rect.y + (rect.h - BANNER_BTN_H) * 0.5;
+    let mut x = rect.x + BANNER_PAD_L;
+
+    let text = Rect::new(x, rect.y, text_w, rect.h);
+    x += text_w + BANNER_TEXT_MARGIN + BANNER_GAP;
+
+    let download = Rect::new(x, mid_y, download_w, BANNER_BTN_H);
+    x += download_w + BANNER_GAP;
+
+    let silence = Rect::new(x, mid_y, silence_w, BANNER_BTN_H);
+    x += silence_w + BANNER_GAP;
+
+    let close = Rect::new(
+        x,
+        rect.y + (rect.h - BANNER_CLOSE) * 0.5,
+        BANNER_CLOSE,
+        BANNER_CLOSE,
+    );
+    BannerLayout {
+        text,
+        download,
+        silence,
+        close,
+    }
 }
 
 /// Top-left corner of the banner card in window coordinates.
@@ -201,26 +251,24 @@ pub fn update_banner(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, 
     let button_style = cards::style(13.0, Weight::SemiBold, Color::WHITE);
     let download_w = ui.text_width("Download", &button_style) + BANNER_BTN_PAD_X * 2.0;
     let silence_w = ui.text_width("Don't ask again", &button_style) + BANNER_BTN_PAD_X * 2.0;
-    let room = banner_text_room(download_w, silence_w);
-    let text_w = ui.text_width(&text, &text_style).min(room);
-    let (w, h) = banner_size(text_w, download_w, silence_w);
+    let measured_w = ui.text_width(&text, &text_style);
+    let (w, h) = banner_size(measured_w, download_w, silence_w);
     let rect = banner_origin(viewport, (w, h));
+    // Advance by the measured text width (capped at the room), never by the
+    // maximum room: `banner_size` shrinks the card to the text, so laying out
+    // against `room` would push the buttons outside the card.
+    let layout = banner_layout(rect, measured_w, download_w, silence_w);
 
     ui.deferred(|ui| {
         ui.shadow(rect, BANNER_RADIUS, 0.4);
         ui.rounded_rect(rect, theme.banner_bg, BANNER_RADIUS);
         ui.bordered_rect(rect, Color::TRANSPARENT, BANNER_RADIUS, 1.0, theme.border);
 
-        let mid_y = rect.y + (rect.h - BANNER_BTN_H) * 0.5;
-        let mut x = rect.x + BANNER_PAD_L;
-        let text_rect = Rect::new(x, rect.y, room, rect.h);
-        ui.text(text_rect, &text, &text_style);
-        x += room + BANNER_TEXT_MARGIN + BANNER_GAP;
+        ui.text(layout.text, &text, &text_style);
 
-        let download_rect = Rect::new(x, mid_y, download_w, BANNER_BTN_H);
         if cards::primary_button(
             ui,
-            download_rect,
+            layout.download,
             Id::from_str("overlay/update/download"),
             "Download",
             true,
@@ -231,12 +279,10 @@ pub fn update_banner(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, 
                 actions.push(Action::OpenUrl(url.to_string()));
             }
         }
-        x += download_w + BANNER_GAP;
 
-        let silence_rect = Rect::new(x, mid_y, silence_w, BANNER_BTN_H);
         if cards::secondary_button(
             ui,
-            silence_rect,
+            layout.silence,
             Id::from_str("overlay/update/silence"),
             "Don't ask again",
         )
@@ -245,17 +291,10 @@ pub fn update_banner(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, 
             actions.push(Action::SetUpdateNotifications(false));
             actions.push(Action::DismissUpdateBanner);
         }
-        x += silence_w + BANNER_GAP;
 
-        let close_rect = Rect::new(
-            x,
-            rect.y + (rect.h - BANNER_CLOSE) * 0.5,
-            BANNER_CLOSE,
-            BANNER_CLOSE,
-        );
         if cards::icon_button(
             ui,
-            close_rect,
+            layout.close,
             Id::from_str("overlay/update/dismiss"),
             Icon::Close,
             16.0,
@@ -306,6 +345,71 @@ mod tests {
         let (w, _) = banner_size(900.0, 83.0, 113.0);
         assert_eq!(w, BANNER_MAX_W);
         assert!(room > 0.0);
+    }
+
+    /// The banner's production geometry (measured text widths through the real
+    /// font stack) for one version string and viewport.
+    fn banner_parts(version: &str, viewport: Rect) -> (Rect, BannerLayout) {
+        let mut ui = Ui::new();
+        let theme = ui.theme().clone();
+        let text_style = cards::style_lh(13.0, Weight::Regular, theme.text, BANNER_LINE);
+        let button_style = cards::style(13.0, Weight::SemiBold, Color::WHITE);
+        let text = format!("Rift v{version} is available.");
+        let text_w = ui.text_width(&text, &text_style);
+        let download_w = ui.text_width("Download", &button_style) + BANNER_BTN_PAD_X * 2.0;
+        let silence_w = ui.text_width("Don't ask again", &button_style) + BANNER_BTN_PAD_X * 2.0;
+        let size = banner_size(text_w, download_w, silence_w);
+        let rect = banner_origin(viewport, size);
+        (rect, banner_layout(rect, text_w, download_w, silence_w))
+    }
+
+    fn inside(outer: Rect, inner: Rect) -> bool {
+        inner.x >= outer.x - 0.01
+            && inner.y >= outer.y - 0.01
+            && inner.right() <= outer.right() + 0.01
+            && inner.bottom() <= outer.bottom() + 0.01
+    }
+
+    /// Every child (version text, Download, Don't ask again, close) must stay
+    /// inside the card, and the card inside the viewport, for short and long
+    /// versions. Regression: the children used to advance by the *maximum* text
+    /// room while the card was sized from the *measured* text, so a short
+    /// version pushed the buttons past the card's right edge and off the window.
+    #[test]
+    fn banner_children_stay_inside_the_card_and_viewport() {
+        let short = "0.2.0";
+        let long = "9".repeat(400);
+        for viewport in [
+            Rect::new(0.0, 0.0, 1160.0, 740.0),
+            Rect::new(0.0, 0.0, 940.0, 620.0),
+        ] {
+            for version in [short, long.as_str()] {
+                let (rect, layout) = banner_parts(version, viewport);
+                for (name, child) in [
+                    ("text", layout.text),
+                    ("Download", layout.download),
+                    ("Don't ask again", layout.silence),
+                    ("close", layout.close),
+                ] {
+                    assert!(
+                        inside(rect, child),
+                        "{name} {child:?} escapes banner {rect:?} for {version:?}"
+                    );
+                }
+                assert!(
+                    inside(viewport, rect),
+                    "banner {rect:?} escapes viewport {viewport:?} for {version:?}"
+                );
+            }
+        }
+
+        // The short version really does shrink the card; the long one caps it.
+        let viewport = Rect::new(0.0, 0.0, 1160.0, 740.0);
+        let (short_rect, _) = banner_parts(short, viewport);
+        let (long_rect, _) = banner_parts(&long, viewport);
+        assert!(short_rect.w < BANNER_MAX_W);
+        assert!((long_rect.w - BANNER_MAX_W).abs() < 0.01);
+        assert!(short_rect.w < long_rect.w);
     }
 
     fn frame_with(state: &mut crate::state::State) -> crate::gfx::paint::PaintList {

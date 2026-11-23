@@ -1,8 +1,9 @@
 //! Shared player state (`PlayerCore` / `PlayerShared`) and the broadcast +
 //! persistence helpers that operate on it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rift_types::{PlaybackState, QueueSnapshot, RepeatMode, Track};
 use rift_ytmusic::Client;
@@ -50,6 +51,14 @@ pub struct PlayerCore {
     /// end-of-track — so the (possibly random, under shuffle) pick isn't drawn
     /// twice.
     pub pending_next: Option<usize>,
+    /// Bumped by every seek. A crossfade commit that sees a newer value knows a
+    /// seek landed while the audio thread was decoding the target, so the bar
+    /// must show the seek target rather than being reset to zero.
+    pub seek_epoch: u64,
+    /// Absolute position (seconds) of the newest seek. Written only by
+    /// [`crate::commands::playback`]'s seek; read by the crossfade commit only
+    /// when `seek_epoch` changed during its acknowledgement wait.
+    pub seek_target: f64,
 }
 
 impl Default for PlayerCore {
@@ -71,6 +80,8 @@ impl Default for PlayerCore {
             crossfade: 0.0,
             crossfade_armed_for: None,
             pending_next: None,
+            seek_epoch: 0,
+            seek_target: 0.0,
         }
     }
 }
@@ -86,6 +97,12 @@ pub struct PlayerShared {
     /// Background writer for the playback snapshot (keeps disk I/O off the
     /// command/playback threads).
     pub persist: Persister,
+    /// Cancellation token for a crossfade that has been handed to the audio
+    /// thread but not started yet. The audio thread carries the token it was
+    /// sent with and drops the target if this counter moved: a newer command,
+    /// queue edit, stop, or an acknowledgement timeout supersedes it. Lock-free
+    /// because the audio thread must never take the player lock.
+    pub crossfade_epoch: Arc<AtomicU64>,
     /// The snapshot last handed to [`Persister`]. `emit_queue` is a broadcast
     /// that runs after almost every queue mutation *and* from inside the
     /// playback task, so several calls in a row carry an identical snapshot
@@ -118,6 +135,26 @@ pub fn snapshot(core: &PlayerCore) -> QueueSnapshot {
 /// this thread too would put both a large clone and a disk write in the path
 /// of every queue mutation.
 pub(crate) fn emit_queue(backend: &BackendInner, shared: &PlayerShared) {
+    emit_queue_impl(backend, shared, true);
+}
+
+/// [`emit_queue`] for broadcasts that cannot move the pinned crossfade target
+/// (metadata re-announcement, an append at the end). It persists/broadcasts the
+/// same snapshot but leaves `crossfade_epoch` alone, so a crossfade command
+/// already handed to the audio thread is not turned into a silent hard cut by an
+/// unrelated row update.
+pub(crate) fn emit_queue_quiet(backend: &BackendInner, shared: &PlayerShared) {
+    emit_queue_impl(backend, shared, false);
+}
+
+fn emit_queue_impl(backend: &BackendInner, shared: &PlayerShared, invalidate_crossfade: bool) {
+    // A queue/current/mode change that can change which track is next bumps the
+    // token so a command already queued on the audio thread drops the target it
+    // can no longer justify. Broadcasts that leave the pick alone use the quiet
+    // path above.
+    if invalidate_crossfade {
+        shared.crossfade_epoch.fetch_add(1, Ordering::SeqCst);
+    }
     let snap = {
         let core = shared.core.lock_safe();
         snapshot(&core)

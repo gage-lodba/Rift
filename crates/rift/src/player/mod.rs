@@ -26,4 +26,6 @@ pub(crate) use playback::play_index;
 pub(crate) use queue::{
     append_tracks, insert_next, move_in_queue, remove_from_queue, AddOutcome, RemoveOutcome,
 };
-pub(crate) use state::{emit_queue, load_snapshot, snapshot, PlayerCore, PlayerShared};
+pub(crate) use state::{
+    emit_queue, emit_queue_quiet, load_snapshot, snapshot, PlayerCore, PlayerShared,
+};

@@ -14,7 +14,8 @@
 //! [`FIRST_IMAGE_TEXTURE_ID`].
 
 pub use crate::gfx::paint::{
-    Color, Layer, PaintList, Prim, Rect, TextureId, TextureUpload, NO_TEXTURE,
+    Color, Layer, PaintList, Prim, Rect, TextureId, TextureRegion, TextureUpdate, TextureUpload,
+    NO_TEXTURE,
 };
 
 /// Glyph atlas texture id (one texture holds every UI glyph and icon).

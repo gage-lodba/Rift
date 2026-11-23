@@ -134,7 +134,11 @@ pub fn slider(ui: &mut Ui, rect: Rect, id: Id, fraction: f32, theme: &Theme) -> 
     if released_source {
         clear_drag_source();
     }
-    let committed = resp.clicked || released_source || (resp.hovered && released);
+    // `clicked` is also synthesised for Enter/Space on the focused slider. That
+    // keyboard activation has no pointer position, so committing `mouse_pos`
+    // for it would seek to wherever the mouse happens to be parked; only a
+    // pointer click/drag may commit a fraction.
+    let committed = resp.pointer_clicked() || released_source || (resp.hovered && released);
     let committed_fraction = if committed {
         let pointer_x = ui.input().mouse_pos.0;
         let travel = (track_rect.w - THUMB_R * 2.0).max(1.0);
@@ -153,7 +157,7 @@ pub fn slider(ui: &mut Ui, rect: Rect, id: Id, fraction: f32, theme: &Theme) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::InputState;
+    use crate::ui::{InputState, Key, KeyInput, Modifiers};
 
     const VIEWPORT: Rect = Rect::new(0.0, 0.0, 800.0, 200.0);
     const SLIDER: Rect = Rect::new(100.0, 50.0, 200.0, 16.0);
@@ -243,6 +247,37 @@ mod tests {
         assert!(out.committed);
         let fraction = out.committed_fraction.expect("commit fraction");
         assert!((fraction - 0.5).abs() < 0.02, "fraction {fraction}");
+    }
+
+    /// Enter/Space on the focused slider is a keyboard activation, not a
+    /// pointer click: it must not commit the fraction under the parked mouse.
+    #[test]
+    fn keyboard_activation_does_not_commit_the_pointer_fraction() {
+        clear_drag_source();
+        let mut ui = Ui::new();
+        ui.request_focus(Id::from_str("test/slider"));
+        // Park the mouse past the right edge: committing `mouse_pos` would be 1.
+        let at = (SLIDER.right() + 40.0, SLIDER.center().1);
+        for (time, key) in [(0.0, Key::Enter), (0.1, Key::Space)] {
+            let mut state = input(at, time);
+            state.keys = vec![KeyInput {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            }];
+            let out = frame(&mut ui, state);
+            assert!(
+                out.response.keyboard_activated,
+                "{key:?} should be a keyboard activation"
+            );
+            assert!(!out.committed, "{key:?} must not commit a pointer fraction");
+            assert_eq!(out.committed_fraction, None);
+            assert!(
+                DRAG_SOURCE.with(|source| source.get().is_none()),
+                "{key:?} must not start a drag"
+            );
+        }
     }
 
     /// An unrelated press clears the retained source: a stale drag from a

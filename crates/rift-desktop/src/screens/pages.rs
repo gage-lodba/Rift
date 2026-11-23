@@ -25,10 +25,25 @@ use rift_types::{AlbumSummary, ArtistSummary};
 use crate::screens::{album, artist, cards, layout, liked, playlist, search, settings, track_list};
 use crate::state::{Action, State, View};
 use crate::text::Weight;
-use crate::ui::{Color, Id, Rect, Response, Sense, Ui, SCROLLBAR_WIDTH};
+use crate::ui::{ButtonKind, Color, Id, Rect, Response, Sense, Ui, SCROLLBAR_WIDTH};
 
 /// `.empty { padding: 48px 0; font-size: 13px }` line box 17 → 113 px.
 pub const EMPTY_H: f32 = 48.0 * 2.0 + 17.0;
+
+// ---- page-load error state (artist / artist-songs / album) ----------------
+/// Vertical padding above and below the compact page-error state (mirrors
+/// `.empty`'s 48 px).
+pub const PAGE_ERROR_PAD: f32 = 48.0;
+/// Gap between the error message and the Retry button.
+pub const PAGE_ERROR_GAP: f32 = 12.0;
+/// Retry button height (`.btn-secondary` metrics).
+pub const PAGE_ERROR_BTN_H: f32 = 32.0;
+/// Total height of the compact page-error state: 48 + message 17 + gap + button
+/// + 48.
+pub const PAGE_ERROR_H: f32 =
+    PAGE_ERROR_PAD + 17.0 + PAGE_ERROR_GAP + PAGE_ERROR_BTN_H + PAGE_ERROR_PAD;
+/// Stable widget id for the retry control (one page is visible at a time).
+pub const PAGE_ERROR_RETRY_ID: &str = "page-error/retry";
 
 /// `h2` line box (17/700) — the first-child view heading.
 pub const H2_LINE: f32 = 22.0;
@@ -218,6 +233,49 @@ pub fn empty(ui: &mut Ui, x: f32, y: f32, w: f32, text: &str) -> f32 {
     let style = cards::style_lh(13.0, Weight::Regular, theme.text_dim, 17.0);
     ui.text_centered(Rect::new(x, y + 48.0, w, 17.0), text, &style);
     EMPTY_H
+}
+
+/// A compact page-load failure: the controller's message and a **Retry** button
+/// that emits [`Action::RetryPage`] (ui-spec §7.9, "page load failed").
+///
+/// Replaces the loading `.empty` when `State::page_error` is set; without it a
+/// failed artist/album request left the view on "Loading ..." forever (the old
+/// toast disappeared after a few seconds). The button uses a stable id
+/// ([`PAGE_ERROR_RETRY_ID`]) so keyboard focus/active state survives frames.
+/// Returns the height used ([`PAGE_ERROR_H`]).
+pub fn error_state(
+    ui: &mut Ui,
+    actions: &mut Vec<Action>,
+    x: f32,
+    y: f32,
+    w: f32,
+    message: &str,
+) -> f32 {
+    let theme = ui.theme().clone();
+    let style = cards::style_lh(13.0, Weight::Regular, theme.text_dim, 17.0);
+    ui.text_centered(Rect::new(x, y + PAGE_ERROR_PAD, w, 17.0), message, &style);
+
+    let label = "Retry";
+    let label_style = cards::style(13.0, Weight::SemiBold, theme.text);
+    let label_w = ui.text_width(label, &label_style);
+    // `.btn-secondary` padding is 14 px per side; keep a comfortable minimum.
+    let btn_w = (label_w + 28.0).max(80.0);
+    let btn = Rect::new(
+        x + (w - btn_w) * 0.5,
+        y + PAGE_ERROR_PAD + 17.0 + PAGE_ERROR_GAP,
+        btn_w,
+        PAGE_ERROR_BTN_H,
+    );
+    let resp = ui.button_with_id(
+        Id::from_str(PAGE_ERROR_RETRY_ID),
+        btn,
+        label,
+        ButtonKind::Secondary,
+    );
+    if resp.clicked {
+        actions.push(Action::RetryPage);
+    }
+    PAGE_ERROR_H
 }
 
 /// A non-first `h2` section heading (18 px top margin, 22 line, 14 bottom).
@@ -482,6 +540,12 @@ mod tests {
     #[test]
     fn empty_state_is_113_tall() {
         assert_eq!(EMPTY_H, 113.0);
+    }
+
+    #[test]
+    fn page_error_state_fits_message_and_retry_button() {
+        // 48 top pad + 17 message line + 12 gap + 32 button + 48 bottom pad.
+        assert_eq!(PAGE_ERROR_H, 157.0);
     }
 
     #[test]

@@ -58,7 +58,8 @@ which mistakes to avoid.
 7. **Use `artifacts/` for scratch** (screenshots, probe logs, gate logs). It is
    git-ignored and exists exactly for this; never commit it.
 8. **Do not invent dependencies or fallbacks.** No webview/JS/WASM, no external media
-   binary, no second HTTP client (§1.2, §10).
+   binary, no second generalist/metadata HTTP client (the backend owns one dedicated image
+   client, §5.3).
 9. **Prefer evidence.** If you claim behavior, point at a file:line, a test name, or a
    command you ran. Match the repository's comment style: explain *why*.
 
@@ -84,7 +85,7 @@ Rift is an ad-free, minimal desktop music player for YouTube Music. Shipped feat
 - Prebuilt binaries for Windows, macOS (universal), Linux; needs a Vulkan-capable GPU
   driver.
 
-Workspace version **0.6.0**, license **Apache-2.0**, repository
+Workspace version **0.6.1**, license **Apache-2.0**, repository
 `https://github.com/gage-lodba/Rift`, author Gage Lodba. It is an independent project,
 not affiliated with YouTube/Google.
 
@@ -108,8 +109,12 @@ not affiliated with YouTube/Google.
    backend: each frame lays out from scratch, screens emit `Action`s, a controller calls
    `BackendHandle` methods directly and drains one `BackendEvent` channel per frame.
 5. **One `cargo build`, one binary.** The only executable is `rift-music` (package
-   `rift-desktop`). No bundler, installer, Node/npm, or `.cargo/config.toml` runner
-   aliases. `crates/rift`, `rift-types`, `rift-ytmusic`, `rift-discord` are libraries.
+   `rift-desktop`). No bundler, packaging system, Node/npm, or `.cargo/config.toml`
+   runner aliases. The one exception is the optional, source-tree Linux desktop
+   launcher installer (`tools/install-linux-desktop.sh`): it only copies an
+   already-built binary plus a `.desktop` entry/icons into XDG directories, is not
+   part of the build, and is not shipped in release assets.
+   `crates/rift`, `rift-types`, `rift-ytmusic`, `rift-discord` are libraries.
 6. **The application is testable without a window.** `rift-desktop` has a library target
    so UI/renderer/controller logic can be tested headlessly (`App::frame` with synthetic
    `InputState`).
@@ -124,7 +129,9 @@ Do not spend time looking for these; their absence is intentional:
   generation (`docs/native-streaming.md` §1).
 - **No Discord OAuth/voice/chat** — Rich Presence only (`crates/rift-discord`).
 - **No mobile/web/server build, no CLI/TUI, no plugin system, no i18n framework.**
-- **No installers/packages** — releases are bare executables.
+- **No installers/packages** — releases are bare executables. (The optional Linux
+  desktop-entry installer in the source tree is not a packaged release artifact; it
+  just copies a built binary and the menu entry into the user's XDG directories.)
 - **No telemetry/analytics.** Network traffic is YouTube (metadata/audio) plus the
   GitHub releases API (update check) and Discord's local IPC socket.
 
@@ -136,9 +143,9 @@ Do not spend time looking for these; their absence is intentional:
 
 | Platform | Build/run requirements |
 |---|---|
-| **Windows 10/11** | Visual Studio C++ Build Tools (MSVC linker, Windows SDK `rc.exe` for the icon); an up-to-date GPU driver with Vulkan to run |
+| **Windows 10/11** | Visual Studio C++ Build Tools (MSVC linker, Windows SDK `rc.exe` for the icon); an up-to-date GPU driver with Vulkan to run. A missing Vulkan ICD is reported by a native startup-error dialog, not a silent GUI-subsystem exit |
 | **macOS 13+** | Xcode Command Line Tools to build; a Vulkan-capable GPU driver to run. Rift does not bundle a Vulkan loader/MoltenVK — install one if the system lacks it |
-| **Linux** | Vulkan driver, ALSA, X11/Wayland/xkbcommon development headers to build; a Vulkan driver + audio device to run |
+| **Linux** | Vulkan driver, ALSA, X11/Wayland/xkbcommon development headers to build; a Vulkan driver + audio device to run (a PipeWire/PulseAudio sound server is preferred; raw ALSA is the fallback) |
 
 Also required: **Rust 1.88** — pinned by `rust-toolchain.toml`, so `rustup` selects it
 automatically. Build at the pinned toolchain, not "latest stable"; CI and the local gate
@@ -147,7 +154,7 @@ build at exactly 1.88.0 and lint against that floor (§6.2).
 Linux build dependencies (README; CI installs the same):
 
 ```sh
-# CI's exact native build dependencies on Linux (README's list omits pkg-config):
+# CI's exact native build dependencies on Linux (the README list matches):
 sudo apt-get install -y --no-install-recommends pkg-config \
   libasound2-dev libvulkan-dev libxkbcommon-dev libwayland-dev \
   libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
@@ -184,15 +191,22 @@ driver, but no window manager) or runs with placeholder data and no backend.
 # the CI package list is deliberate — copy it rather than using --workspace
 cargo fmt --all -- --check
 cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop --all-targets -- -D warnings
+# the gate also lints the configurations the debug/default run cannot see:
+cargo clippy -p rift-desktop --no-default-features --all-targets -- -D warnings
+cargo clippy --release -p rift-desktop --all-targets -- -D warnings
+cargo clippy --release -p rift-desktop --features backend,preview --all-targets -- -D warnings
 cargo test -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop
 cargo test -p rift-desktop --no-default-features     # UI-only (inert backend) configuration
 $env:RUSTDOCFLAGS = "-D warnings"; cargo doc -p rift -p rift-types -p rift-ytmusic -p rift-discord --no-deps   # PowerShell
 # (POSIX sh equivalent: RUSTDOCFLAGS="-D warnings" cargo doc -p rift -p rift-types -p rift-ytmusic -p rift-discord --no-deps)
 
-# full local acceptance gate (Windows; mirrors ci.yml; §8). Writes a log under artifacts/
-pwsh tools/ci-local.ps1
-pwsh tools/ci-local.ps1 -SkipTests      # fast iteration
-pwsh tools/ci-local.ps1 -SkipRelease    # skip release build + icon + screenshot
+# full local acceptance gate (mirrors ci.yml; §8). Writes a log under artifacts/
+./tools/ci-local.sh                     # Linux/macOS (bash)
+pwsh tools/ci-local.ps1                 # Windows
+./tools/ci-local.sh --skip-tests        # fast iteration (GATE: INCOMPLETE unless --allow-incomplete)
+pwsh tools/ci-local.ps1 -SkipTests
+./tools/ci-local.sh --skip-release      # skip release build + clippy + icon + screenshot (also incomplete)
+pwsh tools/ci-local.ps1 -SkipRelease
 ```
 
 Narrower runs while developing:
@@ -283,12 +297,12 @@ Dependency direction: `rift-desktop` → `rift` → {`rift-types`, `rift-ytmusic
 | Vulkan renderer, paint contract, shaders | `crates/rift-desktop/src/gfx/**`, `crates/rift-desktop/shaders/**` |
 | Screens and their visual spec | `crates/rift-desktop/src/screens/**`, `crates/rift-desktop/src/theme.rs`, `docs/ui-spec.md` |
 | App event loop, per-frame composition | `crates/rift-desktop/src/{main,app}.rs`, `docs/architecture.md` |
-| UI→backend bridge, action mapping, cover pipeline | `crates/rift-desktop/src/controller.rs`, `crates/rift-desktop/src/cover.rs`, `docs/controller-notes.md` |
+| UI→backend bridge, action mapping, cover pipeline | `crates/rift-desktop/src/controller/**`, `crates/rift-desktop/src/cover.rs`, `docs/controller-notes.md` |
 | UI state, `View`/`Action` vocabulary | `crates/rift-desktop/src/state.rs` |
-| Window-state persistence, single-instance guard | `crates/rift-desktop/src/{window_state,single_instance}.rs`, `docs/native-platform.md` |
+| Window-state persistence, single-instance guard, Linux desktop launcher | `crates/rift-desktop/src/{window_state,single_instance}.rs`, `crates/rift-desktop/assets/linux/Rift.desktop`, `tools/install-linux-desktop.sh`, `docs/native-platform.md` |
 | Preview data and screenshot capture | `crates/rift-desktop/src/preview.rs`, `crates/rift-desktop/src/main.rs` (`--screenshot`), `tools/screenshot.ps1` |
 | Build/CI/release and dependency policy | `Cargo.toml`, `rust-toolchain.toml`, `deny.toml`, `.github/`, `tools/` |
-| Local acceptance gate | `tools/ci-local.ps1`, `tools/{screenshot,window_shot,verify}.ps1`, `tools/compare_images.py` |
+| Local acceptance gate | `tools/ci-local.sh` (Linux/macOS), `tools/ci-local.ps1` (Windows), `tools/{screenshot,window_shot,verify}.ps1`, `tools/compare_images.py` |
 
 ---
 
@@ -305,11 +319,11 @@ and owns all other work. Threads (fixed names help in logs/profilers; details §
 |---|---|
 | app/UI thread | backend construction, `bootstrap()`, sync commands, per-frame event drain, layout/paint/present |
 | backend Tokio runtime, 2 workers (`rift-backend`) | async commands (search/browse/playback fetch/download jobs/update check), event pump, `spawn_blocking` pool |
-| `rift-audio` | rodio output device, in-memory decode, seek/volume/crossfade, progress ticker (~4 Hz) |
+| `rift-audio` | rodio output device (Linux: prefers the session's sound server — cpal's PulseAudio host, PipeWire via `pipewire-pulse` — raw ALSA fallback; logs `audio output host:`), in-memory decode, seek/volume/crossfade, progress ticker (~4 Hz) |
 | `rift-media` | souvlaki OS media keys/now-playing |
 | `rift-discord` | Discord Rich Presence IPC loop |
 | `rift-persist` | best-effort `playback.json` writes |
-| `rift-durable` | queued atomic `library.json`/`settings.json` writes + shutdown flush |
+| `rift-durable` | coalesced atomic `library.json`/`settings.json` writes + shutdown flush |
 
 ### 4.2 Crate graph
 
@@ -412,7 +426,10 @@ The subset of Discord's local RPC protocol Rift needs: version-1 handshake, then
 `SET_ACTIVITY` and clear. No OAuth, voice, or chat.
 
 - Transport is a local named pipe (Windows) / Unix socket; frames are
-  `opcode: u32 LE` + `length: u32 LE` + UTF-8 JSON.
+  `opcode: u32 LE` + `length: u32 LE` + UTF-8 JSON. On Unix the socket is opened with a
+  250 ms read/write timeout (`SOCKET_IO_TIMEOUT`) so the blocking worker retires on a
+  stall; the Windows named-pipe `File` has no std timeout (see §5.3 for the bounded
+  fallback in the backend).
 - The client answers `PING` with `PONG`, skips `PONG`/unknown opcodes and frames carrying
   another command's nonce, matches replies by nonce, and reports `CLOSE` codes cleanly.
 - The **worker** (pacing, heartbeat, restart/replay) lives in `crates/rift/src/discord.rs`
@@ -438,7 +455,7 @@ Two independent HTTP clients exist by design:
 search/browse -> rift_ytmusic::Client -> rift_types::{Track, AlbumPage, ArtistPage, Playlist}
 video id -> player::resolve -> AudioStream{url, itag=140, ...} -> rift::stream
             ├── fetch_bytes   (playback: bytes in memory -> rodio decoder)
-            └── fetch_to_path (offline: caller's .part -> rename -> <id>.m4a)
+            └── fetch_to_path (offline: caller's .part -> rename -> <safe_stem>.m4a)
 ```
 
 ```rust
@@ -466,7 +483,7 @@ pub use player::AudioStream;
 | `crates/rift/src/stream.rs` | ranged downloader (`fetch_bytes`, `fetch_to_path`), URL trust, re-resolve on expiry |
 | `crates/rift/src/fetch.rs` | `fetch_track` (offline-copy-first), `fetch_bytes`, `safe_stem` |
 | `crates/rift/src/downloads.rs` | `Downloads` store: downloaded/downloading/failed sets + permille progress map |
-| `crates/rift/src/commands/downloads.rs` | download worker: `.part` + rename, throttled progress snapshots, kept-offline retries |
+| `crates/rift/src/commands/downloads.rs` | download worker: `.part` + `sync_all` + rename, throttled `DownloadProgress` events, kept-offline retries |
 
 #### Metadata path (`WEB_REMIX`)
 
@@ -515,7 +532,9 @@ pub use player::AudioStream;
   loops).
 - Format selection over `streamingData.adaptiveFormats` in response order: skip
   `signatureCipher`-only, missing/unparseable entries; preference `itag` 140 (AAC
-  128 kbps) → 141 → 139 → any `audio/mp4` → any audio-only entry.
+  128 kbps) → 141 → 139 → any other `audio/mp4`. Only `audio/mp4` is directly
+  playable (rodio cannot decode WebM/Opus, and downloads publish `.m4a`); a
+  WebM/Opus-only response is `NoAudioFormat` with the rejected MIME logged.
 - **Today `CHAIN = &[VISIONOS]`** — the single remaining structural risk (§13.3). A new
   client row ships only after a full ranged-GET proof (whole file **and** a non-zero
   offset both return `206` with the right byte count); `ANDROID_VR` is the cautionary
@@ -530,9 +549,10 @@ pub use player::AudioStream;
   bytes**: HTTPS only, host `googlevideo.com` or `*.googlevideo.com`, no embedded
   credentials; redirects are followed at most twice and re-checked per hop
   (`validate_stream_url` / `allowed_stream_url`).
-- The downloader uses **its own** HTTP client (5 s connect, 30 s *read* timeout, no total
-  deadline; gzip/brotli disabled so byte offsets stay exact). Never reuse the backend's
-  JSON/cover client for audio.
+- The downloader uses **its own** HTTP client (5 s connect, 30 s *read* timeout; gzip/
+  brotli disabled so byte offsets stay exact). A rolling **30 s / 1 KiB no-progress
+  window** (bytes, not requests; `progress_window`) fails a drip that the per-read
+  timeout cannot see. Never reuse the backend's JSON/cover client for audio.
 - **Range requests are load-bearing.** A plain GET of a googlevideo URL is throttled to a
   few tens of KB/s; `Range` answers `206` at full speed (measured in
   `docs/native-streaming.md` §2.3). Every request is `Range: bytes=start-end` in
@@ -543,8 +563,10 @@ pub use player::AudioStream;
   the same media (`itag`, MIME, matching length); completion requires a verified total;
   in-memory playback is capped at `MAX_MEMORY_BYTES = 256 MiB`.
 - `fetch_to_path` writes the caller's `.part` path and **never renames** it — the download
-  worker owns publication (`<id>.m4a.part` → `<id>.m4a` on success, delete on failure).
-  Never publish a truncated or empty file.
+  worker owns publication (a per-claim `<safe_stem>.<attempt>.m4a.part` →
+  `<safe_stem>.m4a` on success, delete on failure).
+  After the final verified write it `sync_all`s the file, so a crash cannot publish a
+  non-zero but unsynced (truncated) `.m4a`; never publish a truncated or empty file.
 
 #### Progress contract
 
@@ -644,9 +666,9 @@ before wiring the app; this subsection is orientation plus drift notes.
 | `crates/rift/src/lib.rs` | public surface: `RiftBackend`, `BackendHandle`, `BackendConfig`, `BackendError`, `BackendEvent(s)`, `native_data_dir`, `APP_IDENTIFIER`, `DATA_DIR_ENV`, `MAX_CROSSFADE`, `MAX_IMAGE_BYTES`, `VERSION`, `preview_mode()`; `#![forbid(unsafe_code)]`, `#![warn(missing_docs)]` |
 | `crates/rift/src/backend.rs` | `RiftBackend`, `BackendHandle`, `BackendConfig`, `BackendError`, private `BackendInner`; startup metadata repair (bounded: 20 lookups, stop after 3 consecutive failures) |
 | `crates/rift/src/commands/{bootstrap,search,playback,queue,library,downloads,images,updates,connectivity}.rs` | inherent `BackendHandle` command methods; `commands/convert.rs` audio-only filter (`is_audio_track`) and `MAX_FETCH_TRACKS = 1000` |
-| `crates/rift/src/event.rs` | `BackendEvent` (9 variants), `BackendEvents`, legacy `name()` table |
+| `crates/rift/src/event.rs` | `BackendEvent` (10 variants), `BackendEvents`, legacy `name()` table |
 | `crates/rift/src/player/{state,queue,nav,playback,events}.rs` | `PlayerCore`/`PlayerShared`, pure queue mutations, shuffle/repeat/prev/next, play/fetch/crossfade/announce, audio bridge; `player/tests.rs` is the largest unit suite |
-| `crates/rift/src/audio.rs` | `AudioCmd`/`AudioEvent`; rodio decode/seek/volume/crossfade; owns the output device |
+| `crates/rift/src/audio.rs` + `audio/output.rs` | `AudioCmd`/`AudioEvent`; rodio decode/seek/volume/crossfade. `run` is a thin device-open/dispatch/tick loop; the private `AudioState` in `output.rs` owns the player, fade tails and play identity, with one handler method per command. Logs the selected host as `audio output host:` (Linux: sound server first, raw ALSA fallback) |
 | `crates/rift/src/{library,settings,downloads}.rs` | `LibraryStore` (`library.json`, recents cap 30), `SettingsStore` (`settings.json`, `MAX_CROSSFADE = 12.0`), `Downloads` (on-disk `.m4a` presence is truth) |
 | `crates/rift/src/{stream,fetch}.rs` | native downloader internals + public `rift::fetch` (`fetch_track` offline-first, `fetch_bytes`, `safe_stem`) — see §5.2 |
 | `crates/rift/src/{media,discord}.rs` | `MediaHandle` over the `rift-media` thread (souvlaki); `DiscordHandle` over the `rift-discord` worker |
@@ -683,7 +705,8 @@ See the thread table in §4.1. The rules:
 
 - **Sync** commands are UI-thread safe: short locks, no network, no direct disk I/O. The
   one sanctioned exception is `remove_downloads` (explicit user delete: inline unlinks +
-  `Downloads` event).
+  `Downloads` event); its `.names.json` update is queued to the download-name writer, not
+  fsynced on the UI thread.
 - **Async** commands must be awaited in a spawned task; never `block_on` on the UI thread
   or inside the backend runtime.
 - Locks are `std::sync::Mutex` via `util::LockExt::lock_safe()` (poison recovered). Never
@@ -697,6 +720,7 @@ See the thread table in §4.1. The rules:
 pub enum BackendEvent {           // Debug + Clone + PartialEq; name() = legacy rift://… name
     Track(Track), State(PlaybackState), Queue(QueueSnapshot), Progress(Progress),
     Library(Library), Downloads(DownloadState), Error(String), Notice(String),
+    DownloadProgress { id: String, permille: u16 }, // throttled byte progress
     OpenPlaylist(String),         // playlist id the UI should navigate to
 }
 ```
@@ -714,15 +738,16 @@ pub enum BackendEvent {           // Debug + Clone + PartialEq; name() = legacy 
   play emits `Track` before and after credit enrichment, and `Queue` on change and again
   after enrichment — consumers must be idempotent.
 - Other emitters: `State` on transport transitions, `Library` on any library/recents
-  change, `Downloads` on claims/transitions/throttled byte progress, `Error`/`Notice` for
-  toasts, `OpenPlaylist` after a backend-driven import.
+  change, `Downloads` on claims/transitions (whole snapshots), `DownloadProgress` on
+  throttled byte progress (`id` + permille, no set clone), `Error`/`Notice` for toasts,
+  `OpenPlaylist` after a backend-driven import.
 
 #### Command surface
 
 42 public command methods: the 40 preserved legacy commands plus two new ones,
-`fetch_image` and `is_online`. (Three further legacy window commands are not here: they moved
-to winit and are now `WindowCommand`s in the app crate.) These are the source counts;
-`docs/backend-api.md` §7's 46/43 figures are stale (see §13.4). All live on `BackendHandle`;
+`fetch_image` and `is_online`. (Three legacy window commands moved to winit and are now
+`WindowCommand`s in the app crate; three yt-dlp management commands were removed with native
+streaming.) `docs/backend-api.md` §7 records the same 46 → 43 → 42 accounting. All live on `BackendHandle`;
 parameters/returns are the old IPC commands with
 the injected `app`/`state` removed; errors are human-readable `String`s (legacy strings
 preserved). `async` below means "must run in a spawned task"; the rest are sync and
@@ -750,15 +775,20 @@ UI-thread safe.
   fire-and-forget native `rfd` dialogs on the blocking pool, reporting via
   `Notice`/`Error` (plus `Library`/`OpenPlaylist` on import) and emitting nothing on
   cancel.
-- **Downloads:** `download_tracks(tracks)` spawns a sequential background job;
-  `remove_downloads(ids)` deletes inline and emits `Downloads`.
+- **Downloads:** `download_tracks(tracks)` spawns a sequential background job that emits
+  a `Downloads` snapshot on each claim/finish/fail/remove, `DownloadProgress { id,
+  permille }` at most every 100 ms, and one coalesced `Error` per pass for failed one-off
+  tracks. `remove_downloads(ids)` cancels in-line (tombstone + files) and emits
+  `Downloads`.
 - **Updates:** `check_update()` (**async**, GitHub `releases/latest`; never fails, degrades
   to "no update"), `set_update_notifications(bool)`, `open_url(url)` (sync, fallible:
   absolute `http(s)` only, embedded credentials stripped, platform opener gets one argv
   element, no shell).
-- **Images:** `fetch_image(url)` (**async**; one GET through the backend's shared client,
-  `http(s)` only, hard cap `MAX_IMAGE_BYTES = 16 MiB`; raw encoded bytes). This is the
-  **only** cover-art transport.
+- **Images:** `fetch_image(url)` (**async**; one GET through the backend's dedicated
+  **image** client — HTTPS only, label-boundary host allow-list, redirects re-validated,
+  hard cap `MAX_IMAGE_BYTES = 16 MiB`; raw encoded bytes). Metadata/connectivity keep the
+  separate shared JSON client; the app crate has no HTTP client. This is the **only**
+  cover-art transport.
 - **Connectivity:** `is_online()` (**async**; `HEAD https://www.youtube.com/` with a 2 s
   cap; online iff the final host is `youtube.com`/`*.youtube.com` — any HTTP status
   counts; transport failure or another host = offline). Emits no events; the controller
@@ -777,6 +807,14 @@ UI-thread safe.
   decode acks (10 s bound), and stale fetch/decode results are discarded by generation.
   Failures auto-skip (budget = queue length, then stop with an `Error`); a direct jump
   resets the budget.
+- **Play identity.** Audio events carry the generation the audio was started for
+  (`AudioCmd::Play` sends `core.generation`; a crossfade sends `anchor + 1`, the
+  generation `commit_crossfade` assigns). The manager drops
+  `Position`/`Duration`/`Ended` whose id is not `core.generation`, and drops
+  `Ended` unless still `Playing`, so a queued event from the track the user just
+  left cannot move the bar, correct the length, arm a crossfade or advance the
+  queue. `play_tracks`/`play_track` install the replacement queue and
+  validate/claim the start index in one critical section (`prepare_play_index`).
 - **Crossfade** (0..=12 s, 0 = hard cut) arms once per generation when `Playing`,
   repeat ≠ `One`, the duration is known and the remaining time is inside the window.
   It pins the next index (`pending_next`), prefetches it, and commits only while that
@@ -802,21 +840,32 @@ UI-thread safe.
 - Files: `library.json` (`liked`, `playlists`, `recently_played`), `settings.json`
   (`volume`, `discord_rpc`, `crossfade`, `update_notifications`; unknown legacy keys such
   as `yt_dlp_path` are ignored — **do not add `deny_unknown_fields`**), `playback.json`
-  (last queue snapshot, restored **stopped**, best-effort), `downloads/<safe id>.m4a`,
-  `library.json.pre-collapse` (one-time duplicate-repair backup), `*.json.bad` /
-  `*.json.bad.N` (corrupt quarantine). The app also writes `.window-state.json` there, and
-  on Unix `.single-instance.lock` (Windows uses a named mutex, no file) (§5.4).
+  (last queue snapshot, restored **stopped**, best-effort), `downloads/<safe stem>.m4a`
+  (see "Downloads and offline" for the encoding and legacy readability),
+  `downloads/.names.json` (the `stem -> id` index for names that are not
+  self-identifying), `library.json.pre-collapse[.N]` (numbered pre-repair snapshot),
+  `*.json.bad` / `*.json.bad.N` (corrupt/unreadable quarantine). The app also writes
+  `.window-state.json` there, and on Unix `.single-instance.lock` (Windows uses a named
+  mutex, no file) (§5.4).
 - **Durable files** (`library.json`, `settings.json`): a mutation takes the lock,
-  mutates + clones the snapshot, and queues it to `DurableWriter`; one FIFO thread
-  serializes writes and publishes each atomically (unique temp file in the target
-  directory → write → `sync_all` → rename; Unix also syncs the directory). A UI-thread
-  command never waits on disk; `flush()` is the barrier and shutdown flushes. A failed
-  write is logged, not retried.
-- **Corruption:** a JSON parse failure or invalid UTF-8 renames the file to
-  `<name>.json.bad`, then `.bad.1`, `.bad.2`, … (never overwriting an earlier backup) and
-  loads defaults. A *read* error that is not `NotFound` is logged loudly but does not move
-  the file. (Doc drift: `docs/backend-api.md` §4 says that read error takes the quarantine
-  path; the code does not.)
+  mutates + clones the snapshot, and queues it to `DurableWriter`. Pending snapshots are
+  **coalesced per path** (the queued job keeps its position; its value/serializer is
+  replaced), so N rapid mutations cost one queued snapshot and the newest state still
+  wins. The queue holds one pending snapshot per path plus the in-flight write; a hard
+  64-path cap sends an overflow path's write inline on the caller's thread (durability
+  over latency, logged, never silently dropped). One FIFO thread serializes writes and
+  publishes each atomically (unique temp file in the target directory → write →
+  `sync_all` → rename; Unix also syncs the directory). A UI-thread command never waits on
+  disk in the normal path; `flush()` is the barrier (when it returns true, the newest
+  snapshot for every write queued before it has been attempted) and shutdown flushes. A
+  failed write is logged, recorded (last file/reason + count) and surfaced as one
+  coalesced `Error` toast per burst by a backend watchdog; it is not retried.
+- **Corruption:** a JSON parse failure, invalid UTF-8, or a read error that is not
+  `NotFound` moves the file to `<name>.json.bad`, then `.bad.1`, `.bad.2`, … (never
+  overwriting an earlier backup) and loads defaults; the store stays writable because the
+  original survives as the backup. If the move itself fails, the file is the only copy:
+  the store becomes read-only for the session (refuses to save) and one startup `Error`
+  toast names it. See `docs/backend-api.md` §4 and `util::LoadStatus`.
 - Preview mode (`RIFT_PREVIEW` in a debug build) keeps settings/library in memory only,
   never writes `playback.json`, and no-ops network/playback commands, so placeholder rows
   cannot corrupt real user data.
@@ -826,20 +875,46 @@ UI-thread safe.
 - `Downloads` (`downloads.rs`): `downloaded`/`downloading`/`failed` sets plus the permille
   `progress` map. `state()` takes all locks in a fixed order so a snapshot never shows
   contradictory statuses.
+- **On-disk names are an explicit contract.** `fetch::safe_stem(id)` writes
+  `[a-z0-9_-]` literally and every other byte as `~` + two lowercase hex digits
+  (`a/b` → `a~2fb`, `..` → `~2e~2e`): injective, decodable (`stem_id`), case-insensitively
+  unique (uppercase is escaped), no separators/dots/spaces, Windows device names escaped
+  (`con` → `~63on`), and capped at 120 chars (overlong ids keep a prefix + `!` + FNV-1a
+  hex; `downloads/.names.json` maps those back). A stem containing `_` is also indexed,
+  because the pre-P5 fold could have produced it.
+- **Old files stay readable:** `load` never renames or deletes an existing `.m4a`. It
+  records every non-empty stem; `is_downloaded`/`fetch_track` also consult
+  `fetch::legacy_safe_stem(id)`, so a pre-P5 `<id>.m4a` (and an old `_`-folded
+  `a_b.m4a` for `a/b`) still plays. A folded legacy name is ambiguous without an index
+  entry and is accepted for every id that folds to it (pre-P5 behaviour); new writes never
+  produce one, and publishing refuses to replace a non-empty final file.
 - Transfer: the job claims a track atomically (`begin()`; a second claim returns `false`),
-  `stream::fetch_to_path` writes `<id>.m4a.part` with a `progress(received, total)`
-  callback and never renames, then the worker renames to `<id>.m4a` on success or deletes
-  the `.part` on failure. `set_progress` ignores unclaimed ids; a `total == 0` drops the
-  entry.
+  `stream::fetch_to_path` writes that claim's `<safe_stem>.<attempt>.m4a.part` with a
+  `progress(received, total)` callback and never renames, then the worker records any owned
+  name and renames to
+  `<safe_stem>.m4a` on success (never over a non-empty file, never creating a second name
+  when a legacy copy exists) or deletes the `.part` on failure. Each claim has a token and
+  its own part path; `remove` invalidates the token, so a stale worker cannot move progress,
+  mark the row, delete the retry's part, or publish over it. `set_progress` ignores
+  unclaimed ids; a `total == 0` drops the entry. The completed file is `sync_all`ed before
+  the rename.
+- **Remove cancels.** `Downloads::remove(id)` clears the claim/progress/failed marks,
+  tombstones the id and deletes the current `<safe_stem>.m4a`, its `.part`, any pre-P5
+  legacy name for the id (unless the name index says that `_` name belongs to another id)
+  and the index entry (queued to the name writer; the unlinks are the only inline disk
+  work). `begin` clears the tombstone (a retry is allowed);
+  `finish`/`fail`/`mark_failed`/`set_progress` ignore a tombstoned id; `state()` filters
+  them out. The worker re-checks the tombstone before and after its rename, so a canceled
+  transfer publishes nothing and emits no error.
 - Retry exists only for **kept-offline** playlists (`playlist_fully_downloaded`): up to 5
   passes with 0/30 s/1 m/2 m/4 m delays (capped), one coalesced toast, and an
   `is_online()` short-circuit that gives up while offline. Other failures fail immediately
   with a toast; gave-up ids stay in `failed` so the row offers retry, and re-claiming
   clears that mark.
 - **Playback is offline-first**: `fetch::fetch_track(downloads_dir, id)` serves a
-  non-empty local `<id>.m4a` without network, otherwise falls back to
-  `fetch::fetch_bytes`. The startup scan deletes zero-byte `.m4a` and leftover `.part`
-  files. `safe_stem` sanitizes ids because they can come from imported JSON.
+  non-empty local `<safe_stem>.m4a` (then the pre-P5 name) without network, otherwise
+  falls back to `fetch::fetch_bytes`. The startup scan deletes zero-byte `.m4a` and
+  leftover `.part` files. `safe_stem` encodes ids because they can come from imported JSON.
 
 #### OS media keys and Discord presence
 
@@ -851,7 +926,15 @@ UI-thread safe.
 - `discord.rs` owns presence policy on its own thread: pushes coalesced with
   `MIN_INTERVAL = 15 s`, re-asserted by a `HEARTBEAT = 60 s`; a same-track restart clears
   presence, waits `PRESENCE_REFRESH_GAP = 500 ms`, re-posts (so Discord's elapsed timer
-  resets for repeat-one/replay); each IPC exchange has a 500 ms deadline. `APP_ID`/
+  resets for repeat-one/replay). Each command's caller waits `IPC_TIMEOUT = 500 ms`; on
+  Unix the transport sets a 250 ms socket read/write timeout so a silent peer fails as an
+  I/O error and the worker retires/reconnects instead of being abandoned. The Windows
+  named-pipe `File` has no std timeout (an interruptible read needs unsafe Win32 FFI,
+  which this crate forbids), so the backend bounds that case instead:
+  `MAX_ABANDONED_WORKERS = 3` stalled workers per session, then presence is disabled until
+  restart (logged once) rather than leaking threads/sockets without bound; an activity that
+  was already posted can remain visible until Discord clears it or the app restarts,
+  because clearing it would need one more request. `APP_ID`/
   `LOGO_ASSET` constants live there — **a fork needs its own Discord application id and
   assets**.
 
@@ -868,8 +951,11 @@ UI-thread safe.
   functions need `# Errors` sections.
 - Keep persisted formats additive/serde-default; never change `APP_IDENTIFIER`; preserve
   the atomic temp-file write and corrupt-file quarantine behavior.
-- Do not build a second HTTP client for cover art/JSON; the streaming module owns the only
-  audio client.
+- Do not build a client per fetch: metadata/connectivity share one, cover art uses the
+  dedicated `commands::images` client (HTTPS-only, host allow-list by label-boundary
+  suffix: `ytimg.com`, `ggpht.com`, `googleusercontent.com`, `gstatic.com`; no
+  credentials/non-default ports; `image/*` content type; redirects re-validated per hop,
+  max 3; 16 MiB cap), and audio uses `stream`'s own client.
 
 #### Tests and probes
 
@@ -901,8 +987,8 @@ rift` does not exist (library crate) — the app is `cargo run -p rift-desktop`.
 
 Everything between the OS and the UI/backend: process entry and winit event loop, per-frame
 composition, the UI→backend bridge, UI state/actions, cover decoding, preview data, window
-state/single instance, the Windows icon build script, and the dev/runtime Cargo features.
-The renderer, immediate-mode framework and screens are §5.5.
+state/single instance, the Linux desktop launcher, the Windows icon build script, and the
+dev/runtime Cargo features. The renderer, immediate-mode framework and screens are §5.5.
 
 ```toml
 # crates/rift-desktop/Cargo.toml (comments in the manifest are load-bearing)
@@ -925,16 +1011,17 @@ never `rift`. `lib.rs` modules: `app`, `controller`, `cover`, `gfx`, `preview` (
 | `src/main.rs` | `main()`, dev `Args` parsing, startup order, `NativeApp` (`ApplicationHandler`), window creation, redraw loop, winit→`InputState` translation, `WindowCommand` execution, startup timing logs, screenshot early-return |
 | `src/app.rs` | `pub struct App`: owns `State` + `Ui` + `Controller`; `tick()`, `frame()`, `dispatch_ui()`, `WindowCommand`, cover-texture cache/trimming, toast lifetime |
 | `src/state.rs` | `State` (everything rendered), `View`, `SearchState`, `Action` (the single UI→app vocabulary), `ResizeEdge`, small helpers |
-| `src/controller.rs` | `Controller`, `ControllerEvent`, `BackendCommands` trait, `LiveCommands`/`InertCommands`, generation filters, `TrackCache`, cover request bookkeeping, online probe |
+| `src/controller/**` | `mod.rs` (`Controller`, `ControllerEvent`, poll/dispatch, navigation + generations, `TrackCache`, online probe), `commands.rs` (`BackendCommands`, `LiveCommands`/`InertCommands`), `tasks.rs` (async task results + filters), `cover.rs` (cover request de-dupe), `tests.rs`/`backend_event_tests.rs` |
 | `src/cover.rs` | `decode_cover`, decode limits, `CoverTracker` (in-flight/failed de-dupe), `CoverImage`, `MAX_COVER_DIMENSION` |
 | `src/preview.rs` | deterministic placeholder data (`preview_track`, `preview_library`, `preview_queue`, `preview_state`, `preview_artist_page`, `preview_album_page`, `preview_search_results`) |
 | `src/theme.rs` | design tokens (`Theme::default()`; colours sRGB straight-alpha, metrics logical px) |
 | `src/window_state.rs` | persisted size/position/maximized in the legacy `.window-state.json` |
 | `src/single_instance.rs` | process-wide guard (Windows named mutex / Unix `flock`), raw FFI, no extra dependency |
 | `build.rs` | embeds the Windows PE file icon from `assets/icons/rift.rc`; no-op on other hosts/targets |
-| `assets/**` | embedded fonts, icon set, prerasterised logo, Windows `.rc` |
+| `assets/**` | embedded fonts, icon set, prerasterised logo, Windows `.rc`, and the Linux launcher entry (`linux/Rift.desktop`) |
 | `shaders/**` | GLSL sources + committed `.spv` binaries embedded by `gfx/pipeline.rs` (§5.5) |
 | `tests/ui_flow.rs` | headless end-to-end interaction suite (real `App`, recording backend) |
+| `tests/desktop_entry.rs` | Linux desktop-launcher guard: committed entry fields/identity/categories, icon assets, and (Linux) the installer install→uninstall round-trip |
 | `tests/live_backend.rs` | six `#[ignore]`d live backend/network/audio flows |
 
 #### Process lifecycle (`main.rs`) — the order is load-bearing
@@ -960,7 +1047,9 @@ window/GPU/backend work.
 
 **Window creation** (once, from `resumed`): saved/default logical size (1160x740), min
 940x620, `with_decorations(false)`, `with_resizable(true)`,
-`with_visible(!HIDE_WINDOW_UNTIL_FIRST_FRAME)`. The runtime window icon is loaded from
+`with_visible(!HIDE_WINDOW_UNTIL_FIRST_FRAME)`, and on Linux the launcher identity
+(`with_linux_launcher_identity()`: Wayland `app_id` / X11 `WM_CLASS` from `APP_ID` +
+`BINARY_NAME`). The runtime window icon is loaded from
 `assets/icons/128x128.png` (a different thing from the PE file icon described below). Six embedded
 font faces parse on a scoped `rift-font-init` thread concurrently with
 `gfx::Renderer::new(window)`, then join into `ui::Ui::new_with_fonts(fonts)` (a panicked
@@ -1020,7 +1109,9 @@ bootstraps the controller iff it is live. Two methods are a contract:
   `state.next_texture_id` (starts at 1024; font atlas owns low ids), uploads via
   `ui.upload_texture`, then trims `MAX_CACHED_COVERS = 256` (256 px RGBA8 ≈ 256 KiB each)
   by evicting the lowest texture ids and calling `ui.drop_texture`; a later frame simply
-  re-requests the URL. Replies for URLs no longer in `state.covers` are dropped.
+  re-requests the URL. Replies for URLs no longer in `state.covers` are dropped. The map
+  is also bounded at `MAX_CACHED_COVER_ENTRIES = 512` entries (failed/in-flight URLs,
+  FIFO via `State::cover_order`, never a texture-owning entry).
 
 #### State and actions (`state.rs`)
 
@@ -1031,8 +1122,11 @@ navigation (`view: View`, `search`, `artist_page`, `artist_songs`, `album_page`,
 `page_generation`), transient UI state (`renaming`, `new_playlist`, `import_playlist`,
 `toast`, `sidebar_width`, `window_maximized`) and covers (`covers`, `cover_requests`,
 `next_texture_id`). `State::apply_bootstrap(Bootstrap)` seeds the mirrors. Helpers used by
-screens include `liked_index()`, `download_status()`, `download_fraction()`,
-`request_cover()`, `pinned_ids()`.
+screens include `liked_index()` (a cached `Arc<SongIndex>`, rebuilt when
+`set_library()` is called or when the liked list's allocation changes — replace
+the library through `set_library()`; a direct `library` assignment self-heals via
+the allocation key, but an in-place element edit needs `set_library`),
+`download_status()`, `download_fraction()`, `request_cover()`, `pinned_ids()`.
 
 `View`: `Home`, `Search`, `Liked`, `Settings`, `Playlist(String)`, `Artist(String)`,
 `ArtistSongs(String)`, `Album(String)`. `SearchTab`: `Songs` (default), `Artists`, `Albums`.
@@ -1048,17 +1142,19 @@ change.
 #### Controller: the only backend seam
 
 `ControllerEvent` (drained by `App::tick`): backend broadcasts `Track(Option<Track>)`,
-`PlaybackState`, `Queue`, `Progress`, `Library`, `Downloads`, `Error`, `Notice`,
-`OpenPlaylist`; async replies `SearchResults{…}`, `SearchArtists`, `SearchAlbums`,
-`ArtistPage{generation,page}`, `ArtistSongs{generation,…}`, `AlbumPage{generation,page}`,
+`PlaybackState`, `Queue`, `Progress`, `Library`, `Downloads`, `DownloadProgress { id,
+permille }`, `Error`, `Notice`, `OpenPlaylist`; async replies `SearchResults{…}`,
+`SearchArtists`, `SearchAlbums`, `ArtistPage{generation,artist_id,result}`,
+`ArtistSongs{generation,artist_id,result}`, `AlbumPage{generation,album_id,result}`,
 `UpdateStatus`, `Cover(CoverImage)`, `CoverFailed(String)`, `OpenArtist(String)`,
-`Online(bool)`.
+`Online(bool)`. A page `Err` sets `State::page_error` (never a bare toast), and the page
+screens render a Retry control emitting `Action::RetryPage`.
 
 `BackendCommands` (`Send + Sync + 'static`) is the testable command seam:
-`live::LiveCommands` wraps `rift::BackendHandle`; `InertCommands` (preview/screenshot and
-`--no-default-features`) accepts and ignores everything (`bootstrap` returns
-`Err("no backend attached")`); tests use recording doubles. The compiler forces every
-`BackendCommands` implementation to stay complete.
+`commands::live::LiveCommands` wraps `rift::BackendHandle`; `InertCommands`
+(preview/screenshot and `--no-default-features`) accepts and ignores everything
+(`bootstrap` returns `Err("no backend attached")`); tests use recording doubles.
+The compiler forces every `BackendCommands` implementation to stay complete.
 
 Public surface: `Controller::new(media_hwnd) -> anyhow::Result<Self>` (builds the backend
 once on the UI thread; without the `backend` feature it errors naming `--features
@@ -1087,7 +1183,8 @@ backend`), `new_preview()`, `#[doc(hidden)] with_commands(...)` (test seam),
 - **Cover pipeline**: `State::request_cover` marks a miss and queues the URL →
   `App::tick` → `Controller::request_cover` (`CoverTracker` decides fetch/in-flight/failed;
   failures are remembered for the session and never retried) → `LiveCommands::fetch_cover`
-  on the backend runtime → `BackendHandle::fetch_image` (shared client, 16 MiB cap) →
+  on the backend runtime → `BackendHandle::fetch_image` (dedicated image client, 16 MiB
+  cap; §5.3) →
   `spawn_blocking(decode_cover)` → one `TaskResult` → `ControllerEvent::Cover`/`CoverFailed`.
   `decode_cover` enforces `MAX_SOURCE_EDGE = 4096` / `MAX_SOURCE_ALLOC = 64 MiB` **before
   allocation** (decompression-bomb guard) and downscales the longest edge to
@@ -1127,6 +1224,22 @@ non-blocking exclusive `flock(LOCK_EX | LOCK_NB)` on `<data dir>/.single-instanc
 (RAII; `None` = busy, treated conservatively). Acquire **first**, before window/backend/
 threads. `is_already_running()` is a diagnostic probe only.
 
+**Linux desktop launcher** (`assets/linux/Rift.desktop`, `lib.rs`, `main.rs`,
+`tools/install-linux-desktop.sh`) — optional application-menu integration: the committed
+freedesktop entry plus the `APP_ID = "Rift"` / `BINARY_NAME = "rift-music"` identity that
+`with_linux_launcher_identity()` puts on the window (Wayland `app_id` / X11 `WM_CLASS`) so
+the compositor groups the window under the entry and its icon. The installer copies the
+binary, five hicolor icons (32/64/128/256/512, from `assets/icons/`) and the entry into a
+user prefix (default `~/.local`, no root), rebases the entry's `Exec`, refreshes the
+desktop/icon caches best-effort and removes everything on `--uninstall`; `--dry-run` only
+prints. Publication is transactional: files are staged under temporary names, the entry is
+validated first, previous destinations are backed up, and a failed rename/manifest write
+restores the previous binary/icons/entry/manifest (a first-install failure leaves nothing
+behind). Desktop-entry basename, `APP_ID`, `StartupWMClass` and the WM class have to agree —
+drift means a generic taskbar icon or a window not grouped under the menu entry. Guard:
+`tests/desktop_entry.rs` (entry structure + icon sizes everywhere; installer
+install→uninstall round-trip and mid-publish/manifest-write rollback on Linux). Contract: `docs/native-platform.md` `## Linux desktop launcher`.
+
 **`build.rs` and the two icons**: the *runtime window icon* is set by
 `main.rs::window_icon()` from `assets/icons/128x128.png` (`include_bytes!`) and only affects
 the running window/taskbar button. The *executable file icon* that Explorer/Start
@@ -1149,11 +1262,12 @@ committed SPIR-V (§5.5). `Previews/image.png` is the canonical 1160x740 referen
 
 #### Tests for this area
 
-- Module unit tests: `controller.rs` (dispatch mapping, generation drops, cover de-dupe,
-  online edge-triggering, bootstrap, backend-event mapping behind `cfg(all(test,
-  feature="backend"))`), `cover.rs` (decode caps/no-upscale/alpha/garbage bytes/tracker
-  bound), `app.rs` (cover cache bound, orphan replies), `state.rs`, `main.rs` (focus loss),
-  `window_state.rs` (legacy schema/clamping/off-screen restore), `single_instance.rs`.
+- Module unit tests: `controller/tests.rs` + `controller/backend_event_tests.rs` (dispatch
+  mapping, generation drops, cover de-dupe, online edge-triggering, bootstrap,
+  backend-event mapping behind `cfg(all(test, feature="backend"))`), `src/cover.rs` (decode
+  caps/no-upscale/alpha/garbage bytes/tracker bound), `app.rs` (cover cache bound, orphan
+  replies), `state.rs`, `main.rs` (focus loss), `window_state.rs` (legacy
+  schema/clamping/off-screen restore), `single_instance.rs`.
 - `tests/ui_flow.rs` — headless acceptance suite: the **real** `App` driven exactly like
   `main.rs` (`App::tick()` then `App::frame(InputState)`), preview state at 1160x740
   scale 1.0 with `Controller::with_commands(Recorder)`; asserts app state, paint list,
@@ -1162,6 +1276,12 @@ committed SPIR-V (§5.5). `Previews/image.png` is the canonical 1160x740 referen
 - `tests/live_backend.rs` — six `#[ignore]`d live flows; real backend + network + audio
   device; each points `RIFT_DATA_DIR` at an empty temp dir and removes `RIFT_PREVIEW`,
   restoring/deleting on `Drop`, so real user data is never touched.
+- `tests/desktop_entry.rs` — desktop-launcher guard: strict entry parse + required
+  fields/identity/categories, bare `Exec` (no `%U`/`%F`), ASCII/LF, icon assets are square
+  PNGs of their hicolor size; on Linux only it also runs `tools/install-linux-desktop.sh`
+  into a throwaway `--prefix` and asserts the install → `--uninstall` round-trip plus the
+  transactional rollback cases (mid-publish failure, manifest-write failure, first-install
+  failure).
 
 #### Invariants and traps
 
@@ -1186,9 +1306,9 @@ committed SPIR-V (§5.5). `Previews/image.png` is the canonical 1160x740 referen
   a separate controller channel.
 - **Ids vs metadata**: `ToggleLikeId`/`DownloadTracks` carry ids and resolve via
   `TrackCache`; a miss toasts. New actions that need a `Track` should carry it.
-- **Only one HTTP client and one cover decode path** exist: backend `fetch_image` +
-  `cover.rs::decode_cover`. Do not add a second HTTP client in the app crate (`image` is
-  otherwise only used for the window icon).
+- **Only one image-fetch path and one cover decode path** exist: backend `fetch_image`
+  (its dedicated image client) + `src/cover.rs::decode_cover`. The app crate has no HTTP
+  client; do not add one (`image` is otherwise only used for the window icon).
 - Data files are user data: `.window-state.json` keeps the legacy keys; keep
   `RIFT_DATA_DIR` working (live tests depend on it).
 - Assets are hard-coded by path in `include_bytes!`/`build.rs`; renaming/moving one breaks
@@ -1201,10 +1321,13 @@ committed SPIR-V (§5.5). `Previews/image.png` is the canonical 1160x740 referen
 - `docs/controller-notes.md` — full controller contract: threading, Action→command mapping
   (§4), `TrackCache` (§5), generations (§6), cover pipeline (§7), event mapping (§9),
   online (§10), tests (§13–§15).
-- `docs/native-platform.md` — window-state and single-instance contracts.
+- `docs/native-platform.md` — window-state, single-instance and Linux desktop-launcher
+  contracts.
 - `docs/backend-api.md` — the backend side of the seam.
-- Gates/scripts: `.github/workflows/{ci,release}.yml`, `.github/scripts/check-windows-icon.ps1`,
-  `tools/{ci-local,screenshot,window_shot,verify}.ps1`, `tools/compare_images.py`.
+- Gates/scripts: `.github/workflows/{ci,release}.yml`,
+  `.github/scripts/{check-local-gates,check-toolchain-consistency,check-duplicate-deps}.sh`,
+  `.github/scripts/check-windows-icon.ps1`, `tools/ci-local.sh`,
+  `tools/{screenshot,window_shot,verify}.ps1`, `tools/compare_images.py`.
 
 ### 5.5 `rift-desktop` — immediate-mode UI, text, renderer, screens
 
@@ -1220,7 +1343,7 @@ frame.
 |---|---|
 | `src/ui/mod.rs` | `Ui` context, frame lifecycle, ids, `interact` state machine, clip stack, deferred layer, primitives, text/icon draw calls |
 | `src/ui/widgets.rs` | styled widgets (`ButtonKind`, switch, checkbox, slider, badge, cover, progress, spinner, equalizer, panel, `format_duration`) |
-| `src/ui/{text_input,scroll,popup}.rs` | single-line editor + clipboard; scroll containers; menus/tooltips/toasts |
+| `src/ui/text_input/{mod,edit,state}.rs`, `src/ui/{scroll,popup}.rs` | single-line editor + clipboard (`mod` = widget/paint, `edit` = keyboard/clipboard editing, `state` = retained caret/selection + click mapping); scroll containers; menus/tooltips/toasts |
 | `src/ui/{id,input,layout,paint,icons,clipboard}.rs` | hashed ids; winit-agnostic `InputState`; `Rect`/`Row`/`Column`/`Padding`; paint-contract re-exports + texture-id rules; `Icon` enum; `Clipboard` backends |
 | `src/text/{mod,atlas,embedded}.rs` | fontdue shaping/measuring/wrapping, glyph cache, shelf atlas, `include_bytes!` faces |
 | `src/gfx/paint.rs` | **frozen** paint contract: `Rect`, `Color`, `Prim`, `Layer`, `TextureUpload`, `PaintList` |
@@ -1253,9 +1376,9 @@ renderer.frame(&paint)?;                        // uploads textures, draws, pres
   art decoded between frames survives into this frame's `PaintList`.
 - `end_frame` paints deferred tooltip/toasts, auto-closes a popup that no screen drew this
   frame, commits interaction bookkeeping, flattens base then deferred prims into
-  painter-ordered `Layer`s, builds the atlas upload (created on first frame, whole-atlas
-  `updated` afterwards), drains created/updated/dropped, and returns a **fresh**
-  `PaintList`. Calling it without `begin_frame` drains textures and returns an empty list.
+  painter-ordered `Layer`s, builds the atlas upload (whole-image `created` on the first
+  frame/growth/scale change, dirty-rectangle `updated` regions for newly rasterised
+  glyphs), drains created/updated/dropped, and returns a **fresh** `PaintList`. Calling it without `begin_frame` drains textures and returns an empty list.
 - Screens never append to a `PaintList`; only `end_frame()` produces it, and it must not be
   retained across frames.
 - `PaintList` invariants: everything in **logical px**, straight-alpha sRGB `Color`;
@@ -1327,6 +1450,18 @@ recompute absolute coordinates in a screen.
   rings via `ui.focus_ring(rect, radius)` (offset +2, buttons) /
   `focus_ring_inset` (offset −2, rows/cards/menu items). Also `keyboard_mode()`,
   `focused_id()`, `request_focus(id)`, `clear_focus()`, `is_focused(id)`.
+- **IME:** `main.rs` enables IME once at window creation and routes
+  `WindowEvent::Ime(Ime::Commit)` through `ui::push_ime_text`; `KeyEvent::text` uses the
+  same helper (control characters stripped, multi-byte preserved). Preedit is not
+  previewed. The focused text field records its caret rectangle (`Ui::ime_cursor_area`)
+  and `main.rs` calls `Window::set_ime_cursor_area` when it changes, so the candidate
+  window opens at the field instead of the window origin. The paths are complementary per
+  winit's contract; no dedupe guard.
+- **Focus loss is one frame later:** `end_frame` compares the frame's starting focus with
+  the final focus (click-away, another widget, Tab, vanished widget) and records it; a text
+  field/editor reports `lost_focus` on its next call. `Ui::request_focus_on_open(id)` is the
+  one-shot autofocus for inline editors (true only on the opening frame; a later
+  `focused_id() == None` means the user clicked away and the editor closes).
 - **`ui.wants_keyboard()` is frame-lagging**: cleared in `begin_frame`, recomputed in
   `end_frame`; `app.rs` checks it *before* `begin_frame` to skip global shortcuts. Any new
   global shortcut must gate the same way, and screens must not consume keys while a text
@@ -1405,7 +1540,9 @@ framework paints them deferred. Static helpers: `format_duration`, `format_posit
   `TextInputResponse { changed, submitted, cancelled, lost_focus, response }`; per-field
   caret/selection lives in `Ui` keyed by id. Clipboard is the real OS clipboard by default
   (`arboard`, lazy, no-op when unavailable) with injectable memory/disabled backends for
-  tests.
+  tests. On Linux the `arboard` dependency enables `wayland-data-control`, so a Wayland
+  session uses the compositor's clipboard and only falls back to X11 without Wayland or
+  without that protocol (see the `ui::clipboard` module docs).
 
 #### Renderer (`src/gfx`)
 
@@ -1414,7 +1551,8 @@ framework paints them deferred. Static helpers: `format_duration`, `format_posit
   `frame(&PaintList) -> Result<()>`, `shutdown()`, `wait_idle()`, and
   `gfx::screenshot(width, height, scale_factor, &paint, &path) -> Result<()>` (headless
   Vulkan → PNG; used by `--screenshot` and GPU tests).
-- `frame` = texture sync (created/updated via staging; dropped retired 4 frames) →
+- `frame` = texture sync (whole `created`/`updated` via staging; incremental glyphs as
+  sub-rectangle `updated` regions; dropped retired 4 frames) →
   `FrameBatch::build` converts each prim to 6 vertices in device px (one scissor per clip
   layer, one draw per consecutive same-texture run, CPU-culls prims outside their clip) →
   record one command buffer → present. Three frames in flight (`FRAMES_IN_FLIGHT = 3`)
@@ -1477,9 +1615,11 @@ grid `grid_metrics`, cover tile, track row, slider, generated textures), `chrome
 queue panel wrapper, overlays), `menu/` (`Entry` carries an `Action`; `menu::open`, `layer`,
 `is_open`, `kebab`; wraps `Ui::popup`), `overlays.rs`.
 
-Screens keep a few **session-scoped statics by design**: queue collapse (thread-local),
-open-menu identity (`menu/state.rs`), and the one-shot generated-texture upload guard
-(`cards/textures.rs` `AtomicBool`). Tests must serialise and reset them.
+Screens keep a few **session-scoped statics by design**: queue collapse (thread-local)
+and open-menu identity (`menu/state.rs`). The one-shot generated-texture upload guard is
+**not** a process static: it lives on `Ui` (`Ui::claim_generated_textures`), so a second
+`Ui` in the same process (tests, a future second window) still uploads its own logo/
+fallback/note textures. Tests must serialise and reset the remaining statics.
 
 Scroll only through `scroll_area` / `scroll_area_stable` / `scroll_area_dynamic` /
 `scroll_area_stable_dynamic`: the container clips its own paint, offsets content, draws the
@@ -1509,9 +1649,9 @@ state colours, §3 icons, §4 typography/line boxes, §5 assets, §6 chrome, §7
 interactions, §14 acceptance checklist). Reference captures: `Previews/image.png`
 (1160×740) and `tools/reference-old-ui.png`.
 
-**Known prose drift**: `docs/imgui-api.md` lists `player_height 92`, while `theme.rs`,
-`ui-spec.md` §6.3 and the pinned layout tests say **84**; its test counts are also stale.
-Code + tests + ui-spec win; fix the prose when you touch it.
+When prose and code disagree, code + tests + `docs/ui-spec.md` win; fix the prose when you
+touch it (the 2026-11-22 hardening pass cleared the last known values — `player_height` is
+84 and the test-count tables were refreshed).
 
 #### Tests: pure logic vs GPU vs headless flows
 
@@ -1524,14 +1664,14 @@ tables.
 | `ui::fuzz` | pure logic | deterministic xorshift over random frames (clicks/drags/wheel/Tab/typing/Escape/resizes/scale changes); finite non-negative rects, valid clips, texture payload sizes, clamped scroll, UTF-8, no double-created textures/popup leaks |
 | `ui::gallery` | 1 pure + 2 `#[ignore]` GPU | builds the widget gallery paint list; ignored tests render gallery/HiDPI/image-check PNGs through the real renderer |
 | `text::tests` + atlas tests | pure logic | embedded faces; measure vs layout (measure never rasterises); cache hits; atlas allocation/upload; line boxes + half-leading baseline; wrap regressions; ellipsis fit; randomized Unicode fuzz; HiDPI bitmap-vs-logical quads + cache invalidation |
-| `gfx::tests` | **GPU, not `#[ignore]`** | headless render of hand-built `PaintList`s asserting pixels: rounded/bordered/UV/clip scene, replaced texture, multi-frame texture lifecycle, `screenshot()` PNG, clear colour, 10k prims + atlas growth, headless resize. Self-skips with a message when no Vulkan device exists |
+| `gfx::tests` | **GPU, not `#[ignore]`** | headless render of hand-built `PaintList`s asserting pixels: rounded/bordered/UV/clip scene, replaced texture, multi-frame texture lifecycle, `screenshot()` PNG, clear colour, 10k prims + atlas growth, headless resize. Skips only when no Vulkan device can be created; a renderer failure while a device is available **fails** the suite (it is a regression, not a missing driver) |
 | screen module tests | pure logic except 4 ignored GPU | each view's geometry/height/state machines and scripted interactions; `screens/mod.rs` pins the reference bands (`reference_layout_bands`, `home_preview_paints_the_reference_geometry`); 4 ignored visual-PNG tests write to `artifacts/screens/` |
-| `ui::clipboard` | pure + OS path | memory round-trip; native round-trip when available (restores contents, skips headless); Windows-only serialised OS paste/copy |
+| `ui::clipboard` | pure + opt-in OS path | memory round-trip always; the OS round-trip/paste/copy/Wayland-selection tests are opt-in with `RIFT_TEST_OS_CLIPBOARD=1` (they write the real clipboard, restore best-effort — a Wayland selection dies with the test process — and skip headless); write-then-read assertions poll because Wayland commits `set_selection` asynchronously; Linux/Wayland checks a real `wl-clipboard-rs` data-control copy (regression for the `wayland-data-control` feature; skips without Wayland/data-control); unavailable-backend no-op path |
 | `tests/ui_flow.rs` | headless end-to-end | real `App` + recording backend; boot bands, sidebar nav, search, player/queue/settings controls, keyboard shortcuts, context menus, text editing, overlay precedence, duplicate playlist names, scroll. Serialised by a process lock (screens keep session statics) |
 | `tests/live_backend.rs` | manual `#[ignore]` | live backend/network/audio — not needed for UI work |
 
 ```powershell
-cargo test -p rift-desktop                                  # everything runnable; GPU self-skips without a device
+cargo test -p rift-desktop                                  # everything runnable; GPU skips only without a device
 cargo test -p rift-desktop --lib                            # unit tests only
 cargo test -p rift-desktop --test ui_flow                   # headless interaction flows
 cargo test -p rift-desktop --lib ui::gallery -- --ignored --nocapture   # GPU visual QA (needs Vulkan)
@@ -1548,8 +1688,16 @@ render owns process-wide GPU state; never assume ignored GPU tests can run concu
   (logged once), degenerate rects are skipped. Assert on `PaintList` in tests instead of
   eyeballing.
 - `end_frame` auto-closes a popup not drawn that frame — a menu opened mid-frame must be
-  drawn before it (that is why `root` calls `menu::layer` twice).
+  drawn before it (that is why `root` calls `menu::layer` twice). `App::navigate` also
+  closes an open menu explicitly, so a backend-driven jump cannot leave the old view's
+  menu floating over the new page.
 - `wants_keyboard()` is only meaningful between frames; inside a screen it is still false.
+- On Linux, clipboard paste from other apps only works with `arboard`'s
+  `wayland-data-control` feature: an X11-only connection sees the XWayland clipboard, and
+  on Wayland desktops selections copied by Wayland apps (browsers) are not mirrored into
+  it — Ctrl+V then silently no-ops. That was the "cannot paste a YouTube Music link into
+  the import box" bug; `ui::clipboard`'s opt-in native round-trip and
+  `wl-clipboard-rs` tests (`RIFT_TEST_OS_CLIPBOARD=1`) guard the path.
 - `ui.text(...)` ellipsizes single lines and vertically centres; `text_raw` can overflow.
   `line_height = 0.0` gives Inter's default line box — use `cards::style`/`cards::line_box`
   for spec line boxes.
@@ -1582,7 +1730,7 @@ render owns process-wide GPU state; never assume ignored GPU tests can run concu
 ### 6.1 Workspace and profiles (root `Cargo.toml`)
 
 - `[workspace] resolver = "2"`, five members under `crates/`. `[workspace.package]` is the
-  single source of `version = "0.6.0"`, `edition = "2021"`, `license = "Apache-2.0"`,
+  single source of `version = "0.6.1"`, `edition = "2021"`, `license = "Apache-2.0"`,
   `authors`, `repository`, `rust-version = "1.88"`; members inherit via
   `version.workspace = true` etc. **A version bump is one root line** — never edit a
   member's version.
@@ -1601,8 +1749,9 @@ render owns process-wide GPU state; never assume ignored GPU tests can run concu
   speed up `cargo run`/`cargo test` without rebuilding every dependency.
 - `Cargo.lock` is committed, never hand-edited, and every gate/CI/release
   build/check/test/clippy/doc/tree command passes `--locked` (`cargo fmt` takes no lock flag). While intentionally changing dependencies, use
-  `pwsh tools/ci-local.ps1 -AllowLockUpdate` for intermediate passes, then one final run
-  **without** it; commit `Cargo.toml` + `Cargo.lock` together.
+  `./tools/ci-local.sh --allow-lock-update` (Linux/macOS) or
+  `pwsh tools/ci-local.ps1 -AllowLockUpdate` (Windows) for intermediate passes, then one
+  final run **without** it; commit `Cargo.toml` + `Cargo.lock` together.
 
 ### 6.2 The toolchain pin is stated in exactly three places
 
@@ -1623,6 +1772,11 @@ prose mentions in `README.md`/`docs/*.md` must be updated by hand. Don't add tar
 `rust-toolchain.toml`; `release.yml`
 installs the two macOS slices it needs explicitly.
 
+The local gate adds a check the file comparison cannot make: step 1 compares the active
+`rustc --version` against the `rust-toolchain.toml` channel and fails hard on a mismatch
+(no `-Skip*` bypass, §8.1). A `+toolchain`, `RUSTUP_TOOLCHAIN` or `rustup override` therefore
+cannot build every step below with a newer compiler and still report `GATE: PASSED`.
+
 ### 6.3 Cargo features, preview mode and screenshots
 
 `crates/rift-desktop` features:
@@ -1630,13 +1784,16 @@ installs the two macOS slices it needs explicitly.
 | Feature | Meaning |
 |---|---|
 | `backend` (**default**) | the real app: links `rift` and constructs `RiftBackend` |
-| `preview` (non-default) | dev-only placeholder data + dev CLI in **release** builds; the local gate builds an acceptance-only `--features backend,preview` binary. **Never add it to `default`** |
+| `preview` (non-default) | dev-only placeholder data + dev CLI in **release** builds; the local gate builds an acceptance-only `--features backend,preview` binary, and CI clippy-lints that configuration in release (`cargo clippy --release -p rift-desktop --features backend,preview --all-targets --locked -- -D warnings`). **Never add it to `default`** |
 | `--no-default-features` | same UI/renderer with an inert controller; skips audio/network/platform stack. Compiles the same public signatures, window still opens (toast explains the backend error). CI and the local gate test this configuration too |
 
 `cfg(any(debug_assertions, feature = "preview", test))` gates preview support: debug builds
 always have it, release builds only with the explicit feature. The shipped release binary
 **rejects every dev flag** with a message containing `development-only`; CI, the release
-workflow and `tools/ci-local.ps1` assert the `--preview` case (same rejection path).
+workflow and the local gate (`tools/ci-local.sh` / `tools/ci-local.ps1`) assert the
+`--preview` case (same rejection path). CI also compiles the acceptance-only release
+configuration, so a break behind
+`#[cfg(feature = "preview")]` fails on every OS rather than only in the local gate.
 
 Preview/screenshot commands:
 
@@ -1674,7 +1831,7 @@ determinate bar can be captured.
 | `RIFT_VK_VALIDATION` | debug auto-enables the Khronos validation layer when installed; `0` opts out, `1` forces in release |
 | `RIFT_GFX_STATS` | `1` logs per-300-frame frame-time/vertex/draw/texture stats |
 | `RIFT_DISCORD_APP_ID` | application id for the ignored live Discord RPC test |
-| `RIFT_PYTHON` | Python for `tools/ci-local.ps1`'s image comparison (`-PythonPath` overrides) |
+| `RIFT_PYTHON` | Python for the local gate's image comparison (`--python-path`/`-PythonPath` overrides) |
 | `PRUNE_TRACE` / `PRUNE_DEBUG` / `PRUNE_KEEP` / `PRUNE_REPORT` | fixture-regeneration debug/keep/report switches read by `crates/rift-ytmusic/examples/prune_fixture.rs` (§11.G) |
 | `CARGO_TARGET_DIR` | point at a `target-*` scratch dir when `target/` is locked by a running process |
 
@@ -1692,21 +1849,28 @@ Platform build prerequisites:
   `macos-latest` rolled to a toolchain whose linker segfaults host proc-macro dylibs).
 - **Linux:** ALSA is the only hard link dependency; Vulkan is loaded at runtime and winit's
   X11/Wayland backends are dlopen'd. The apt list in §2.1 is the complete set (it includes
-  `pkg-config`, which the `-sys` crates need).
+  `pkg-config`, which the `-sys` crates need). At runtime the audio thread prefers the
+  session's sound server — cpal's PulseAudio host, which PipeWire also serves through
+  `pipewire-pulse` — and falls back to raw ALSA only when no server is reachable. That host
+  is a pure-Rust protocol client: no extra system package and no new native link, and the
+  selected host is logged as `audio output host:` at startup.
 
 Helper scripts in `tools/`:
 
 | Script | Purpose |
 |---|---|
-| `tools/ci-local.ps1` | the local acceptance gate (Windows), mirrors `ci.yml`; parameters `-SkipTests`, `-SkipRelease`, `-AllowLockUpdate`, `-PythonPath`; writes `artifacts/ci-local-<timestamp>.log`; prints a PASS/FAIL/WARN/SKIP row per step and ends in `GATE: PASSED`, `GATE: PASSED with N warning(s)` or `GATE: FAILED` |
+| `tools/ci-local.sh` | the local acceptance gate on Linux/macOS (bash), mirrors `ci.yml` and `tools/ci-local.ps1`; options `--skip-tests`, `--skip-release`, `--allow-incomplete`, `--allow-lock-update`, `--python-path`; same log path, rows and verdict as `ci-local.ps1` |
+| `tools/ci-local.ps1` | the local acceptance gate on Windows, mirrors `ci.yml` and `tools/ci-local.sh`; parameters `-SkipTests`, `-SkipRelease`, `-AllowIncomplete`, `-AllowLockUpdate`, `-PythonPath`; writes `artifacts/ci-local-<timestamp>.log`; prints a PASS/FAIL/WARN/SKIP row per step and ends in `GATE: PASSED`, `GATE: PASSED with N warning(s)`, `GATE: INCOMPLETE (N skipped step(s))` or `GATE: FAILED`; exits 0 only when nothing was skipped or failed, 1 on failure, 2 when incomplete unless `-AllowIncomplete` |
 | `tools/screenshot.ps1` | offscreen preview capture per view (`-View`, `-Live`, `-Window`) → `artifacts/screens/<view>.png`; prints the comparison command |
 | `tools/window_shot.ps1` | launches the real window (swapchain proof) and captures the desktop region; Windows-only, manual, never a gate |
-| `tools/verify.ps1` | lighter older suite: fmt, both feature-config checks, `cargo test -p rift`/`-p rift-desktop`, screenshots of 8 views, reference comparison. Not the acceptance gate (`ci-local.ps1` is) but keep it working |
+| `tools/verify.ps1` | lighter older suite: fmt, both feature-config checks, `cargo test -p rift`/`-p rift-desktop`, screenshots of 8 views, reference comparison. Not the acceptance gate (`ci-local.sh`/`ci-local.ps1` are) but keep it working |
 | `tools/compare_images.py` | `REFERENCE NEW [--out DIR] [--label NAME]`; needs Pillow+numpy; writes side-by-side/diff/overlay PNGs under `artifacts/compare/`; prints mean/max channel delta and % pixels differing by >16; **always exits 0** (reports, doesn't judge). References: `tools/reference-old-ui.png` (the gate's archived old-UI target; small expected deltas) and `Previews/image.png` (native render; expected pixel-identical for the acceptance screen) |
+| `tools/install-linux-desktop.sh` | Linux desktop-launcher installer: copies the built (or `--binary PATH`) `rift-music`, hicolor icons and `Rift.desktop` into `--prefix DIR` (default `~/.local`, no root needed), rewrites `Exec`, refreshes the desktop/icon caches best-effort; `--uninstall` removes it, `--dry-run` prints only, `--no-cache-refresh` skips the cache refresh |
 
 `tools/verify.ps1`/`screenshot.ps1`/`window_shot.ps1` write only under `artifacts/`; all are
 Windows-oriented (the app still builds and runs on the other platforms — only these helper
-automations are Windows scripts).
+automations are Windows scripts). `tools/install-linux-desktop.sh` is the Linux-oriented
+one: a bash script, run it on the Linux host (its guard test also runs it from `cargo test`).
 
 ---
 
@@ -1723,11 +1887,12 @@ automations are Windows scripts).
 - **Pure logic is preferred.** The player's decisions, layout math, renderer batching and
   UI interaction are testable without a window/GPU because they are separate from the
   event loop. Add the pure test first; use GPU/window tests only when pixels are the subject.
-- Counts drift — run the commands, don't trust prose tables. Rough sizes at 0.6.0: backends
-  (`rift` ~200+ tests incl. 55 in `player/tests.rs` / 60 in the player module, `rift-ytmusic`
-  ~86 incl. fixtures, `rift-types`
-  unit matrix, `rift-discord` unit + 1 ignored live), `rift-desktop` lib ~320 + 13
-  `ui_flow`, 6 ignored `live_backend`.
+- Counts drift — run the commands, don't trust prose tables. Sizes after the 2026-11-22
+  hardening + review + polish pass: `rift` 308 tests incl. 60 in `player/tests.rs` / 79 in
+  the player module, `rift-ytmusic` 96 (81 lib + 15 fixtures), `rift-types` 16,
+  `rift-discord` 18 + 1 ignored live, `rift-desktop` 375 lib + 1 bin + 14 `desktop_entry` +
+  17 `ui_flow`, 6 ignored `live_backend` (+10 ignored doc-tests). **844 runnable test
+  functions** in the default five-package gate.
 
 ### 7.2 Test inventory by crate
 
@@ -1735,10 +1900,11 @@ automations are Windows scripts).
 |---|---|---|
 | `rift-types` unit tests | pure | `same_song`/`SongIndex`/`fill_missing_from` matrix, model helpers |
 | `rift-ytmusic` lib + `tests/fixtures.rs` | offline | parser tolerance on sanitized recorded responses; loopback transport (403 rotation, caps, client chain, resolver); fixture cleanliness |
-| `rift` unit + inline loopback tests | offline | player/queue/shuffle/crossfade decisions (60 tests in the player module), library/settings/downloads stores, durable writes/corruption, streaming downloader against loopback servers, backend construction |
+| `rift` unit + inline loopback tests | offline | player/queue/shuffle/crossfade decisions (79 tests in the player module), library/settings/downloads stores, durable writes/corruption, streaming downloader against loopback servers, backend construction |
 | `rift-discord` unit + `--ignored` | unit/offline + live | frame codec/handshake/nonce/CLOSE; live smoke needs Discord running |
-| `rift-desktop` lib | offline | UI framework/fuzz/gallery (pure), text/atlas, gfx GPU tests (self-skip), every screen's geometry/interactions, controller dispatch/generations/cover/online (backend feature), app cover cache, window-state, single-instance |
-| `rift-desktop --test ui_flow` | offline, headless | real `App` frame-by-frame interactions against a recording backend (13 flows) |
+| `rift-desktop` lib | offline | UI framework/fuzz/gallery (pure), text/atlas, gfx GPU tests (skip only when no Vulkan device can be created; a renderer failure with a device present fails), every screen's geometry/interactions, controller dispatch/generations/cover/online (backend feature), app cover cache, window-state, single-instance |
+| `rift-desktop --test desktop_entry` | offline | committed Linux launcher entry: required fields/identity/categories, bare `Exec`, ASCII/LF, icon assets/sizes; installer install→uninstall round-trip plus transactional rollback cases (Linux only) |
+| `rift-desktop --test ui_flow` | offline, headless | real `App` frame-by-frame interactions against a recording backend (17 flows) |
 | `rift-desktop --test live_backend` | **live, `#[ignore]`** | 6 real backend/network/audio flows (playback, download progress, offline restart, etc.) |
 
 ### 7.3 Running subsets
@@ -1800,50 +1966,81 @@ never make a normal test depend on them.
 
 ## 8. Quality gates and "done"
 
-### 8.1 The local acceptance gate — `pwsh tools/ci-local.ps1`
+### 8.1 The local acceptance gate — `tools/ci-local.sh` / `pwsh tools/ci-local.ps1`
 
-Requires `pwsh` 7+ (sets `$PSNativeCommandArgumentPassing = "Standard"` on 7.3+ so `--`/
-`-D warnings` survive), runs from the repo root, and writes
-`artifacts/ci-local-<yyyyMMdd-HHmmss>.log`. Parameters: `-SkipTests`, `-SkipRelease`,
-`-AllowLockUpdate`, `-PythonPath` (defaults to `$env:RIFT_PYTHON`). A full run prints 15
+Two front-ends, one gate. `tools/ci-local.sh` is the POSIX (Linux/macOS) front-end; it
+needs bash and the usual POSIX tools it invokes, not PowerShell. `pwsh tools/ci-local.ps1`
+is the Windows one and requires `pwsh` 7+ (it sets
+`$PSNativeCommandArgumentPassing = "Standard"` on 7.3+ so `--`/`-D warnings` survive).
+Both run from any directory in the repository, write
+`artifacts/ci-local-<yyyyMMdd-HHmmss>.log`, print the same 17 rows
+(PASS/FAIL/SKIP/N/A/WARN) in the same order, and share the verdict contract below. Each
+refuses the other host type with a pointer to the right script. Keep the two step lists in
+sync with each other and with `ci.yml`; CI's
+`.github/scripts/check-local-gates.sh` enforces it (`bash -n`, a 17-row set comparison, and
+the four clippy configurations in both gates and `ci.yml`).
+
+Options: `--skip-tests`/`-SkipTests`, `--skip-release`/`-SkipRelease`,
+`--allow-incomplete`/`-AllowIncomplete`, `--allow-lock-update`/`-AllowLockUpdate`, and
+`--python-path PATH`/`-PythonPath PATH` (defaults to `$RIFT_PYTHON`). A full run prints 17
 rows in this order:
 
 | # | Step | Notes |
 |---|---|---|
-| 1 | toolchain consistency | `.github/scripts/check-toolchain-consistency.sh` via Git Bash; PowerShell fallback check if absent |
+| 1 | toolchain consistency | `.github/scripts/check-toolchain-consistency.sh` (run directly by the bash front-end; via Git Bash with a PowerShell fallback on Windows). Also **fails hard unless the active `rustc --version` equals the `rust-toolchain.toml` channel** (no bypass; catches `+toolchain`/`RUSTUP_TOOLCHAIN` overrides) |
 | 2 | `cargo fmt --all -- --check` | |
-| 3 | `cargo clippy` (`-D warnings`) | explicit package list, `--all-targets` |
-| 4 | `cargo doc` | 4 library crates, `RUSTDOCFLAGS=-D warnings` |
-| 5 | `cargo test` | five packages, `--locked` |
-| 6 | `cargo test -p rift-desktop --no-default-features` | UI-only configuration |
-| 7 | release build | `-p rift-desktop --features backend`, prints binary size |
-| 8 | windows executable file icon | `.github/scripts/check-windows-icon.ps1` (Windows only) |
-| 9 | preview stripped from release | shipped binary must reject `--preview` with the `development-only` message |
-| 10 | offscreen release screenshot | builds `--features backend,preview`, captures `artifacts/screens/ci-home.png` at 1160x740, then restores the shipped configuration. **Needs a working Vulkan driver/device** (headless, no window manager); on a GPU-less host use `-SkipRelease` |
-| 11 | screenshot vs reference | compares against `tools/reference-old-ui.png` via `tools/compare_images.py`; metrics only — **soft: WARN, never FAIL** |
-| 12 | no legacy webview crates in the app dependency tree | `cargo tree -p rift-desktop` guard |
-| 13 | no legacy webview/WASM manifests in the workspace | scans workspace Cargo.toml files |
-| 14 | duplicate dependency baseline | `.github/scripts/check-duplicate-deps.sh` via Git Bash |
-| 15 | `cargo deny check all` | skipped when `cargo-deny` is not installed |
+| 3 | `cargo clippy` (`-D warnings`) | explicit package list, `--all-targets`, debug/default features |
+| 4 | `cargo clippy -p rift-desktop --no-default-features` (`-D warnings`) | UI-only configuration; compiles different `cfg` branches than step 3 |
+| 5 | `cargo doc` | 4 library crates, `RUSTDOCFLAGS=-D warnings` |
+| 6 | `cargo test` | five packages, `--locked` |
+| 7 | `cargo test -p rift-desktop --no-default-features` | UI-only configuration |
+| 8 | release build | `-p rift-desktop --features backend`, prints binary size |
+| 9 | `cargo clippy --release` (`-D warnings`) | shipped configuration, then `--features backend,preview` (acceptance-only). The debug clippy rows cannot see `not(debug_assertions)` code |
+| 10 | windows executable file icon | `.github/scripts/check-windows-icon.ps1` (Windows only; the POSIX front-end reports N/A, and CI's Windows job checks it) |
+| 11 | preview stripped from release | shipped binary must reject `--preview` with the `development-only` message |
+| 12 | offscreen release screenshot | builds `--features backend,preview`, captures `artifacts/screens/ci-home.png` at 1160x740, then restores the shipped configuration. **Needs a working Vulkan driver/device** (headless, no window manager); on a GPU-less host use `--skip-release`/`-SkipRelease` (the run is then `GATE: INCOMPLETE` unless the incomplete-run switch is passed) |
+| 13 | screenshot vs reference | compares against `tools/reference-old-ui.png` via `tools/compare_images.py`; metrics only — **soft: WARN, never FAIL**, skipped when no Python has Pillow+numpy |
+| 14 | no legacy webview crates in the app dependency tree | `cargo tree -p rift-desktop` guard |
+| 15 | no legacy webview/WASM manifests in the workspace | scans workspace Cargo.toml files |
+| 16 | duplicate dependency baseline | `.github/scripts/check-duplicate-deps.sh` (direct on POSIX, via Git Bash on Windows); per-host baseline records exact `<crate> <version>` pairs, so a third version of an already-baselined crate fails |
+| 17 | `cargo deny check all` | skipped when `cargo-deny` is not installed |
 
-`-SkipTests`/`-SkipRelease` print fewer rows: the release block collapses to two SKIP rows and
-rows 9–11 disappear entirely. Only environment degradations get their own SKIP row.
+**The verdict is part of the contract.** A full run with no SKIP rows prints `GATE: PASSED`
+(or `GATE: PASSED with N warning(s)`) and exits 0; only step 13 can warn. A hard failure
+prints `GATE: FAILED` and exits 1. Any SKIP row prints `GATE: INCOMPLETE (N skipped
+step(s))` and exits 2 — a skipped step is not a pass (§10.17). `N/A` marks a check that
+cannot exist on this host (the Windows PE icon); it is not a SKIP and does not affect the
+verdict, because CI's Windows job is its proof. The incomplete-run switch
+(`--allow-incomplete`/`-AllowIncomplete`) keeps the INCOMPLETE line but exits 0 for a
+deliberately partial run (e.g. `--skip-release` on a host without Vulkan); it never turns a
+FAIL green.
 
-- Only step 11 is soft. Degradations are explicit **SKIP** rows, not passes: no Git Bash →
-  step 14 skipped (step 1 falls back); no Python+Pillow+numpy → comparison skipped; no
-  `cargo-deny` → supply-chain step skipped. **CI enforces the toolchain guard, duplicate
-  baseline, cargo-deny and the build/test matrix; the screenshot comparison is local-only.**
-  A green run with skips is not full proof.
-- Every build/check/test/clippy/doc/tree command gets `--locked` unless `-AllowLockUpdate`;
-  `cargo fmt` takes no lock flag and the local `cargo deny` invocation omits it (CI's deny
-  action passes it).
+`--skip-tests`/`-SkipTests` and `--skip-release`/`-SkipRelease` print fewer rows: the tests
+switch replaces the two test rows with one SKIP row, the release switch collapses the release
+block to three SKIP rows, and rows 11–13 disappear entirely. Environment degradations also
+get their own SKIP rows: no Git Bash on Windows → step 16 skipped (step 1 falls back); no
+Python+Pillow+numpy → comparison skipped; no `cargo-deny` → supply-chain step skipped; a
+non-Windows host → the PE icon check is N/A (not a skip; CI's Windows job covers it).
+
+- Only step 13 is soft (WARN, never FAIL). **CI enforces the toolchain guard, clippy in every
+  configuration, duplicate baseline, cargo-deny and the build/test matrix; the screenshot
+  comparison is local-only.** A run with SKIP rows is `GATE: INCOMPLETE`, not full proof.
+- The POSIX front-end reports the PE-icon row as N/A, not SKIP: the icon is a Windows PE
+  resource and CI's Windows job is its proof. N/A is platform scoping, not a skipped check,
+  so a fully provisioned POSIX run can reach `GATE: PASSED`; the environment SKIPs
+  (`cargo-deny`, Pillow+numpy) still make it INCOMPLETE until installed, and
+  `--allow-incomplete` never turns those into a pass.
+- Every build/check/test/clippy/doc/tree command gets `--locked` unless
+  `--allow-lock-update`/`-AllowLockUpdate`; `cargo fmt` takes no lock flag and the local
+  `cargo deny` invocation omits it (CI's deny action passes it).
 - **Close any running Rift instance before the gate**: the screenshot step pre-checks for a
-  `rift-music` process and throws if one exists (the capture path itself is designed to run
+  `rift-music` process and fails if one exists (the capture path itself is designed to run
   alongside a live app — the gate is just conservative).
 - Warm full run ≈5–6 min on the maintainer's Windows machine; the two release-profile builds
   dominate. On failure, fix and re-run the whole gate — later steps can be affected too.
-- Windows assumptions throughout; on Linux/macOS run the individual cargo commands and the
-  two shell guards directly.
+- The Windows front-end assumes a Windows host; the POSIX front-end runs the same rows on
+  Linux/macOS, calls the shell guards directly, and reports the PE icon check as N/A (not a
+  skip; CI's Windows job checks it). Both need a Vulkan device only for the screenshot row.
 
 ### 8.2 CI — `.github/workflows/ci.yml`
 
@@ -1853,24 +2050,44 @@ cheap first:
 1. **toolchain version is consistent** (ubuntu-22.04) — runs the guard script with
    `shell: bash` explicitly.
 2. **rustfmt** (ubuntu-22.04) — installs 1.88.0 + rustfmt, `cargo fmt --all --check`.
-3. **clippy, test & build (matrix: ubuntu-22.04, macos-15, windows-latest)**,
+3. **local gate scripts are in sync** (ubuntu-22.04) — runs
+   `.github/scripts/check-local-gates.sh`: `bash -n` on the POSIX front-end, the PowerShell
+   parser on the Windows one when `pwsh` is available, a set comparison of the two
+   front-ends' 17 row names, and a check that all four clippy configurations are present in
+   both gates and `ci.yml`. No Rust install needed.
+4. **clippy, test & build (matrix: ubuntu-22.04, macos-15, windows-latest)**,
    `fail-fast: false`. Steps in order: install Linux system deps; Rust 1.88.0 + clippy;
-   `Swatinem/rust-cache`; clippy (`--locked --all-targets -D warnings`); docs
-   (`RUSTDOCFLAGS=-D warnings`, 4 library crates); tests; tests `--no-default-features`;
-   duplicate-dependency check; release build; Windows-only PE icon check; shipped binary
-   rejects dev flags.
-4. **cargo-deny** (ubuntu-22.04) — `check --all-features --locked` via the pinned
+   `Swatinem/rust-cache`; clippy for debug/default and UI-only `--no-default-features`;
+   docs (`RUSTDOCFLAGS=-D warnings`, 4 library crates); tests; tests
+   `--no-default-features`; duplicate-dependency check; release build; Windows-only PE icon
+   check; shipped binary rejects dev flags; two release clippy steps (shipped configuration,
+   then the acceptance-only `--features backend,preview`; separate steps because a Windows
+   multi-command `run` can mask the first native failure with the second command's exit
+   code). The release clippy steps replace the old
+   `cargo check --release --features backend,preview` check: they compile the same graph and
+   deny warnings, so neither a `#[cfg(feature = "preview")]` break nor a warning in
+   `not(debug_assertions)` code can ship unnoticed.
+5. **cargo-deny** (ubuntu-22.04) — `check --all-features --locked` via the pinned
    `EmbarkStudios/cargo-deny-action` (cargo-deny 0.20.x, the version `deny.toml` was
    validated against).
 
 Jobs build at **1.88.0**, not `stable`. Actions are pinned to commit SHAs with a version
 comment; never replace a SHA pin with `@vN` (Dependabot updates both). CI never opens a
-swapchain, so no GPU is needed.
+swapchain, so no GPU is needed. The workflow is `permissions: contents: read` at the top
+level and every `actions/checkout` sets `persist-credentials: false`: the default token is
+not left in `.git/config` for a build script, proc macro or test to read, and no CI job
+needs write access.
 
 ### 8.3 Release — `.github/workflows/release.yml`
 
-- Triggered by pushing a `v*` tag (e.g. `git tag -a v0.6.0 -m "Rift v0.6.0" && git push
-  origin v0.6.0`) or by `workflow_dispatch` (drafts only). `permissions: contents: write`.
+- Triggered by pushing a `v*` tag (e.g. `git tag -a v0.6.1 -m "Rift v0.6.1" && git push
+  origin v0.6.1`) or by `workflow_dispatch` (a manual run from **any** ref, including a tag
+  named with `--ref`, only creates/updates a draft and never publishes: manual mode is
+  derived from `github.event_name`, and `publish` requires `push` + tag). The workflow is `permissions: contents: read`; only the
+  `release`, `checksums` and `publish` jobs raise `contents: write` for `gh release`, the
+  `checksums` job additionally raises `id-token: write` and `attestations: write` for build
+  provenance (no other job does), and every checkout sets `persist-credentials: false`
+  (`GH_TOKEN` is passed explicitly).
 - On a tag run the first step verifies **tag == workspace version** (strips `v`, greps
   `^version` from the root `Cargo.toml`). The tag names the release and is the `tag_name` the in-app
   update checker compares against `env!("CARGO_PKG_VERSION")`; a mismatch means a phantom
@@ -1880,9 +2097,35 @@ swapchain, so no GPU is needed.
   `rift-music-macos-universal` (Rust has no universal target); `windows-latest` →
   `x86_64-pc-windows-msvc` → `rift-music-windows-x86_64.exe`.
 - The staged assets are re-checked before upload (Windows PE icon; shipped binary rejects
-  `--preview`). Publishing uses the preinstalled `gh` CLI + `GITHUB_TOKEN` with retries
-  (the matrix jobs race). Packaging/installers are out of scope; `release-assets/` staging is
-  git-ignored.
+  `--preview`). For a new release, the three matrix jobs create one **draft** release on
+  demand with `--draft` and upload to it via the preinstalled `gh` CLI + `GITHUB_TOKEN` with
+  retries; a concurrent create by a sibling job is accepted only when the release now
+  exists, and a real creation failure fails the job. A tag rerun reuses the existing release
+  (draft or already published) and uploads with `--clobber`, as before.
+  Packaging/installers are out of scope; `release-assets/` staging is git-ignored.
+- A **`checksums`** job (`needs: release`; `contents: write` for the upload plus
+  `id-token: write` and `attestations: write` for provenance) downloads the assets from the
+  release, refuses an incomplete release (all three platform asset names must be present),
+  writes `SHA256SUMS` over the downloaded files (excluding any older manifest), and uploads
+  it with `--clobber`. It runs on manual draft runs too, so that path is exercised. It then
+  attests build provenance for the three platform assets with the SHA-pinned
+  `actions/attest-build-provenance` (three explicit `subject-path` entries — Linux,
+  macOS-universal and Windows — never a glob); the step
+  has no `continue-on-error`, so a failed attestation fails the job and `publish` cannot
+  make a draft public. Checksums are integrity, not provenance: they are not a signature
+  and do not attest who built the artifacts; the attestation is the provenance claim. The
+  binaries are otherwise **unsigned** (no Windows Authenticode, no Apple Developer ID
+  codesign/notarization): both need project-owned certificates and credentials and are
+  deliberately out of scope until those exist. Users verify a download with
+  `gh attestation verify <file> --repo gage-lodba/Rift` (add
+  `--signer-workflow gage-lodba/Rift/.github/workflows/release.yml` to pin the workflow).
+- A final **`publish`** job (`needs: [release, checksums]`,
+  `if: github.event_name == 'push' && github.ref_type == 'tag'`,
+  `permissions: contents: write`) checks that `SHA256SUMS` is attached, then runs
+  `gh release edit "$tag" --draft=false` only after all three matrix jobs and the checksums
+  job succeeded. A failed/expired matrix or checksums job therefore leaves a *new* release
+  draft-only — never a public page missing platform assets or checksums. When the release is
+  already published (a tag rerun), the job is a no-op: it never unpublishes or recreates it.
 
 **Release checklist:**
 
@@ -1893,30 +2136,45 @@ swapchain, so no GPU is needed.
 3. Check hard-coded version mentions across `agents.md`, `README.md` and `docs/*.md` (e.g.
    `docs/backend-api.md`'s package section; the `v0.6.0` fixture in
    `crates/rift/src/commands/updates.rs` can stay).
-4. Run `pwsh tools/ci-local.ps1` (full, **without** `-AllowLockUpdate`) → `GATE: PASSED`;
-   commit.
+4. Run the local gate (`./tools/ci-local.sh` on Linux/macOS, `pwsh tools/ci-local.ps1` on
+   Windows; full, **without** the lock-update switch) → `GATE: PASSED` with **no SKIP rows**
+   (an environment skip makes it `GATE: INCOMPLETE`/exit 2); commit.
 5. Tag the release commit and push (annotated tags, message `Rift vX.Y.Z`; follow
-   `git show v0.6.0`).
-6. Verify the workflow published all three assets and the notes read correctly.
+   `git show v0.6.1`).
+6. Verify the workflow published all three assets, `SHA256SUMS`, and the notes read
+   correctly; the final `publish` job makes the draft public only after every matrix job and
+   the checksums job succeeded, so a partial release stays draft-only. Run
+   `gh attestation verify <asset> --repo gage-lodba/Rift` on each downloaded asset to check
+   the provenance attestation.
 
 ### 8.4 Definition of done
 
 Your change is done when **all** of these are true:
 
 - [ ] `cargo fmt --all -- --check` clean (do not reformat others' files).
-- [ ] `cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop
-      --all-targets -- -D warnings` clean.
+- [ ] `cargo clippy` clean with `-D warnings` in **all four gated configurations**
+      (`--all-targets`): the five-package debug/default command; `-p rift-desktop
+      --no-default-features`; `--release -p rift-desktop`; and `--release -p rift-desktop
+      --features backend,preview`.
 - [ ] `$env:RUSTDOCFLAGS = "-D warnings"; cargo doc -p rift -p rift-types -p rift-ytmusic
       -p rift-discord --no-deps` clean (new public items documented; `# Errors` sections).
 - [ ] Tests pass in **both** configurations: default and `-p rift-desktop
       --no-default-features`.
 - [ ] The narrow tests for your area exist and pass; a bug fix has a regression test.
-- [ ] `pwsh tools/ci-local.ps1` (or the equivalent commands with `--locked`) reaches
-      `GATE: PASSED` (or `GATE: PASSED with N warning(s)`) when the environment allows; no
-      skipped step is reported as a pass.
+- [ ] The local gate has been run on the host(s) available to you and reaches
+      `GATE: PASSED` (or `GATE: PASSED with N warning(s)`) with **no SKIP rows**. On
+      Linux/macOS the Windows-only PE-icon row is N/A (not a skip), and CI's Windows job
+      checks it; install `cargo-deny` and a Pillow+numpy Python so the optional environment
+      rows are PASS rather than SKIP. A skipped step is still not a pass, and
+      `--allow-incomplete` only makes the exit code usable for a deliberately partial run;
+      it does not turn a SKIP into a PASS.
 - [ ] Release build compiles; shipped binary still rejects `--preview`.
-- [ ] No new duplicate dependency versions; `cargo deny check all` clean if a dependency
-      changed; `deny.toml` updated deliberately if a new license appears.
+- [ ] No *unrecorded* duplicate dependency versions: the per-host baseline in
+      `.github/scripts/check-duplicate-deps.sh` is updated deliberately when the dependency
+      set adds **or loses** a pair (a stale pair now fails the guard, so it cannot silently
+      authorize a reintroduction; never prune one to hide a regression); `cargo deny check
+      all` clean if a dependency changed; `deny.toml` updated deliberately if a new license
+      appears.
 - [ ] Every affected `docs/*.md`/`README.md`/`agents.md` sentence is updated in the same
       change; no stale contract.
 - [ ] Nothing from `target*/`, `artifacts/`, `*.log` or other git-ignored paths is staged.
@@ -1979,8 +2237,16 @@ trade-offs and rejected alternatives ("`panic = "abort"` is deliberately NOT set
 - New deps must pass `cargo deny check all` (license allow-list in `deny.toml` — a new
   license is a deliberate review edit, not a CI surprise), the duplicate-version guard, and
   should not pull a new platform/TLS stack. Prefer std + existing deps.
-- Never add: a webview/browser/JS/WASM crate, an external media binary, a second HTTP client
-  for covers/JSON, or a CLI runner alias.
+- The Linux audio device is selected by the Linux-only direct `cpal` dependency in
+  `crates/rift/Cargo.toml` (the `pulseaudio` feature only): cpal's PulseAudio host is a
+  pure-Rust protocol client, so it adds no libpulse/libpipewire link and no
+  libclang/bindgen build dependency. Do not enable cpal's `pipewire` feature — it adds a
+  libpipewire runtime link and a libclang build dependency without changing where the
+  audio goes.
+- Never add: a webview/browser/JS/WASM crate, an external media binary, a second HTTP
+  client in the app crate, or a CLI runner alias. (The backend deliberately has two
+  clients: the shared metadata/connectivity client and one stricter client dedicated to
+  cover images — see §5.3. Do not add a third.)
 - `cargo install --locked cargo-deny` if you want the local supply-chain step; the gate
   SKIPs it when absent but CI enforces it.
 
@@ -2039,7 +2305,8 @@ guard; do not "simplify" them away.
    CLI in a user's binary; the failure is silent otherwise.
 2. **The toolchain version is stated in three places** (`rust-version`, `rust-toolchain.toml`
    channel, CI `toolchain:` pins). Change all three together or the consistency guard fails.
-   CI builds at the MSRV floor on purpose.
+   CI builds at the MSRV floor on purpose. The local gate also fails if the active `rustc` is
+   not the pinned channel, so a `+toolchain`/`RUSTUP_TOOLCHAIN` override cannot pass it.
 3. **`--locked` is part of every gate/CI/release build/check/test/clippy/doc/tree command.** A
    dependency edit without a regenerated `Cargo.lock` fails. Commit manifest + lock together
    (§6.1).
@@ -2061,7 +2328,8 @@ guard; do not "simplify" them away.
    user files, keep persisted formats additive (`#[serde(default)]`-friendly), preserve
    `APP_IDENTIFIER` and the data-dir layout, atomic writes + corrupt-file quarantine, and
    never persist/rename half-written files. Tests use `RIFT_DATA_DIR` + temp dirs and
-   restore prior values.
+   restore prior values. Offline audio names go through `fetch::safe_stem`; `Downloads::load`
+   never renames or deletes a pre-P5 file (it stays readable via `legacy_safe_stem`, §5.3).
 9. **The UI thread never blocks.** No network, disk, image decode, `block_on`, or awaiting a
    future on it. Async work goes through the backend runtime, blocking pool, or a worker.
 10. **The frame contract and stable ids.** `App::tick()` before `App::frame()`; screens emit
@@ -2070,7 +2338,7 @@ guard; do not "simplify" them away.
     `begin_frame`; `end_frame` auto-closes undrawn popups.
 11. **Frozen seams.** `crates/rift-desktop/src/gfx/paint.rs` (`PaintList`/`Prim`/`Layer`),
     `ui/input.rs` (`InputState`), the `Renderer` entry points consumed by `app.rs`/`main.rs`,
-    and the `BackendHandle`/`BackendEvent` surface consumed by `controller.rs`. Changing one
+    and the `BackendHandle`/`BackendEvent` surface consumed by `controller/**`. Changing one
     side requires the other side, its tests and its doc — coordinate instead of editing
     alone.
 12. **The event bus is a broadcast, not a reply.** Unbounded channel, drained every frame;
@@ -2092,8 +2360,10 @@ guard; do not "simplify" them away.
     under `[workspace.package]`. The in-app update checker keys off the tag; a mismatch is a
     phantom update forever.
 17. **Do not weaken a gate.** No `#[allow(...)]` sprinkles for clippy findings (fix the cause
-    or justify narrowly), no deleting entries from `deny.toml`/the duplicate baseline, no
-    reporting a `-Skip*` run as a pass, no disabling CI steps.
+    or justify narrowly), no deleting entries from `deny.toml`/the duplicate baseline (which
+    records exact `<crate> <version>` pairs per host — update all three host lists together
+    with the dependency change, never prune one to make the gate pass), no reporting a
+    `-Skip*` run as a pass, no disabling CI steps.
 18. **Network tests stay out of the default suite.** Fixtures must stay sanitized
     (`example.invalid`, no visitor/signature data); never commit probe output with real URLs
     or ids; never add analytics/telemetry.
@@ -2127,9 +2397,10 @@ apply, and how to verify. Cross-references point at the section that explains th
 1. Add the `Action` variant in `crates/rift-desktop/src/state.rs` (grouped with its peers).
 2. `App::dispatch_ui` handles it if UI-local; otherwise the fall-through
    `other => controller.dispatch(other)` already routes it.
-3. In `controller.rs`: add the dispatch arm and the `BackendCommands` method. Async work
-   needs a private `TaskResult` variant → `ControllerEvent` → `App::apply_controller_event`
-   arm.
+3. In the controller module: add the dispatch arm and the `BackendCommands` method
+   (`controller/mod.rs` + `controller/commands.rs`); an async command also needs a
+   `TaskResult` variant and its `apply_task` arm (`controller/tasks.rs`). Async work
+   surfaces through `ControllerEvent` → `App::apply_controller_event`.
 4. Emit the action from the screen; add the row to `docs/controller-notes.md` §4.
 5. Verify: extend `tests/ui_flow.rs` to assert the recorded call, then
    `cargo test -p rift-desktop --test ui_flow`.
@@ -2226,8 +2497,8 @@ apply, and how to verify. Cross-references point at the section that explains th
    `--preview`).
 
 ### L. Change cover art fetching or decoding
-1. Transport: backend `fetch_image` only (shared client, `MAX_IMAGE_BYTES = 16 MiB`);
-   don't add a second HTTP client.
+1. Transport: backend `fetch_image` only (its dedicated image client,
+   `MAX_IMAGE_BYTES = 16 MiB`); don't add another client.
 2. Decode: `src/cover.rs` — keep `MAX_SOURCE_EDGE`/`MAX_SOURCE_ALLOC` enforced **before**
    allocation, `MAX_COVER_DIMENSION = 256` downscale (never upscale), on `spawn_blocking`.
 3. Caching: `app.rs` owns `MAX_CACHED_COVERS`/texture lifetime; controller owns de-dup
@@ -2236,8 +2507,9 @@ apply, and how to verify. Cross-references point at the section that explains th
 
 ### M. Add or upgrade a dependency
 1. Version floor in `[workspace.dependencies]` if shared; otherwise the member manifest.
-2. Regenerate `Cargo.lock` (`pwsh tools/ci-local.ps1 -AllowLockUpdate` or a plain
-   `cargo build`); commit manifest + lock together.
+2. Regenerate `Cargo.lock` (`./tools/ci-local.sh --allow-lock-update` or
+   `pwsh tools/ci-local.ps1 -AllowLockUpdate`, or a plain `cargo build`); commit manifest +
+   lock together.
 3. License must already be allowed in `deny.toml` (add deliberately in review if not);
    check duplicates (`cargo tree -d` → run the guard from Git Bash); then a final full gate
    without `-AllowLockUpdate`.
@@ -2305,9 +2577,18 @@ push → verify release assets.
   tracked by the connectivity probe and the offline-first playback path.
 - Do not trust "it should work" for playback/streaming: use the probe examples (§7.4) or
   the ignored `live_backend` tests, and read the error variant first (§11.F).
-- Audio device problems (no device, ALSA missing, exclusive-mode conflict) show up in
-  startup/audio logs; on Windows SMTC/media keys require `BackendConfig.media_hwnd` and
-  degrade with a log line, not an error.
+- An intermittent `http2 error: stream error detected` (or a cold-start playback/metadata
+  failure that looks like an outage) is the oversized-header case: `YouTube` occasionally
+  adds a ~6.2 KiB `content-security-policy-report-only` header to the music home page,
+  pushing the response header list past hyper's 16 KiB h2 default. The innertube clients and
+  the backend's shared (metadata/connectivity) client raise the receive limit to 64 KiB
+  (`MAX_H2_RESPONSE_HEADER_LIST_BYTES` — a local constant in both crates; Google's
+  advertised SETTINGS value); a recurrence means the header block has grown past that. The
+  player POST and googlevideo downloads were never affected.
+- Audio device problems (no device, no reachable sound server so raw ALSA is in use,
+  exclusive-mode conflict) show up in startup/audio logs — the `audio output host:` line
+  names the selected backend; on Windows SMTC/media keys require `BackendConfig.media_hwnd`
+  and degrade with a log line, not an error.
 - Discord presence: run `cargo run -p rift --example discord_replay_probe` with Discord
   running and `RUST_LOG=rift=debug`; the worker logs its pacing/retry decisions.
 
@@ -2318,12 +2599,14 @@ push → verify release assets.
 | A second launch exits immediately (window "never appears") | single-instance guard — another `rift-music` is already running (this is by design; no focus IPC). Check Task Manager |
 | No window at all on first launch | no Vulkan device/driver, or a renderer error in the startup log (the window is revealed even if the first present fails, so check stderr) |
 | `--screenshot` writes no PNG (direct debug/release invocation) | the release binary was built **without** the `preview` feature (dev flags rejected), or headless Vulkan failed. A running app does **not** block a capture — `run_screenshot` happens before the single-instance guard |
-| The **gate's** screenshot step throws although the app is not running | a stale `rift-music` process holds the guard — the gate pre-checks and refuses conservatively (`tools/ci-local.ps1`) |
+| The **gate's** screenshot step fails although the app is not running | a stale `rift-music` process holds the guard — the gate pre-checks and refuses conservatively (`tools/ci-local.sh`/`tools/ci-local.ps1`) |
 | Data appears reset / wants to re-download | `RIFT_DATA_DIR` points somewhere else (tests do this), or the data dir could not be resolved/written; check the startup logs and the data directory (§5.3) |
 | `cargo` builds with a different Rust | `rust-toolchain.toml` pin; run from the repo through `rustup`. Consistency is checked by the gate |
 | Gate fails on formatting/clippy after a clean local build | `--all-targets` covers tests/examples/`build.rs`; the gate uses `-D warnings`, and the pinned toolchain may lint differently from a newer one |
 | New dependency fails the gate | missing license in `deny.toml`, duplicate-version baseline, `--locked` lockfile drift, or a new platform/TLS stack (§9.4) |
-| Playback silent/wrong on Linux | missing ALSA/Vulkan runtime libs, no audio device, or exclusive-mode conflict; check the audio-thread logs |
+| Playback silent/wrong on Linux | missing ALSA/Vulkan runtime libs, no audio device, no reachable sound server (raw ALSA fallback in use), or exclusive-mode conflict; the startup `audio output host:` line names the selected backend, and the audio-thread logs show the device/errors |
+| Ctrl+V pastes nothing in a text field on Linux/Wayland (e.g. a link copied from the browser into the import box) | the `arboard` dependency lost its `wayland-data-control` feature, so the native clipboard only sees the XWayland clipboard and selections copied by Wayland apps are invisible (the read fails and paste is a silent no-op). Keep the feature in `crates/rift-desktop/Cargo.toml`; `ui::clipboard`'s `wl-clipboard-rs` test fails on a Wayland session when it is dropped |
+| Rift missing from the application menu, or the taskbar shows a generic icon / an ungrouped window | the launcher was not installed (`tools/install-linux-desktop.sh`), the desktop cached an old entry (re-login / refresh caches), or an identity drift broke the match — entry basename, `APP_ID`/Wayland `app_id`/`WM_CLASS` and `StartupWMClass` must agree (`docs/native-platform.md` §Linux desktop launcher) |
 | Screenshot differs from the reference | compare with `tools/compare_images.py` against `Previews/image.png` (native render; the acceptance screen is expected pixel-identical) or `tools/reference-old-ui.png` (the gate's archived old-UI reference; small deltas expected); inspect the diff/overlay under `artifacts/compare/` |
 
 ### 12.5 Debugging knobs worth remembering
@@ -2335,7 +2618,8 @@ push → verify release assets.
 | `RIFT_VK_VALIDATION=1` | force validation layer in a release build |
 | `RIFT_GFX_STATS=1` | frame-time/vertex/draw/texture statistics |
 | `CARGO_TARGET_DIR=target-verify` | build/test while a running binary holds `target/` open |
-| `pwsh tools/ci-local.ps1 -SkipRelease -SkipTests` | quick fmt/clippy/docs/toolchain/dupe/deny loop |
+| `./tools/ci-local.sh --skip-release --skip-tests --allow-incomplete` | quick fmt/clippy/docs/toolchain/dupe/deny loop on Linux/macOS (deliberately incomplete; exit 0) |
+| `pwsh tools/ci-local.ps1 -SkipRelease -SkipTests -AllowIncomplete` | same quick loop on Windows |
 | `pwsh tools/screenshot.ps1 -View <view>` | deterministic UI capture without a window |
 | `pwsh tools/window_shot.ps1` | prove the real swapchain path renders on this machine |
 
@@ -2343,14 +2627,18 @@ push → verify release assets.
 
 ## 13. Project state, history and known open work
 
-### 13.1 Where the project is (as of the last commit, version 0.6.0)
+### 13.1 Where the project is (current tree: uncommitted 0.6.1 hardening)
 
-- The tree is **post-review and green**: the last recorded full local gate run printed
-  `GATE: PASSED` across formatting, lints, rustdoc, both feature configurations, release
-  build, Windows PE icon, preview-strip, offscreen screenshot, duplicate-deps and
-  `cargo deny check all`. A run can show SKIP rows for environment-only steps (no Git Bash /
-  Python+Pillow / cargo-deny) — CI still enforces those, so re-run in CI-like conditions
-  before claiming completion.
+- The current tree is green on Linux under the full 17-row bash gate. With a
+  Pillow+numpy Python and cargo-deny 0.20.2 on `PATH`, every applicable row passes, the
+  Windows PE-icon row is N/A, and the verdict is `GATE: PASSED`; the lockfile also carries
+  the RUSTSEC-2026-0592 fix (`url` 2.5.9) and replaces the yanked `async-executor` 1.14.0
+  with 1.14.1, so `cargo deny check all` is clean. Without those two local tools the default
+  run is `GATE: INCOMPLETE (2 skipped step(s))` (screenshot comparison and cargo-deny). The
+  Windows PE-icon check, the Windows/macOS CI matrix and a real tag push remain release-time
+  obligations. Do not claim `GATE: PASSED` for a configuration missing those tools or for
+  the Windows-only checks. See `artifacts/reviews/2026-11-22-hardening-pass.md` for the
+  earlier hardening pass.
 - The 2026-10-19 native rewrite replaced the webview shell with a four-crate workspace; the
   fifth crate (`rift-discord`) arrived with the 2026-10-26 change.
   The 2026-10-26 change shipped native streaming (removed yt-dlp), moved Discord Rich
@@ -2358,6 +2646,16 @@ push → verify release assets.
   workspace dependencies/lint policy at version 0.6.0.
 - The last review pass fixed 119 findings across six scopes. Its notes live in the
   git-ignored `artifacts/reviews/` — working notes/evidence, not contracts.
+- The 2026-11-22 hardening pass closed the recorded open items: cached liked `SongIndex`,
+  dirty-region glyph-atlas uploads, a `Ui`-scoped generated-texture guard, bounded Discord
+  IPC stall recovery, collision-safe/legacy-readable offline filenames, coalesced durable
+  writes, transactional launcher publication, and release build-provenance attestations.
+  The follow-up independent review then fixed two playback/download races (a queue edit
+  during an in-flight crossfade no longer disowns already-started audio; each download claim
+  has its own token and `.part` path, so remove-then-retry cannot publish the retry's
+  mid-write bytes), made `workflow_dispatch --ref <tag>` draft-only, and propagated the
+  lightweight `DownloadProgress` event to the manual probe/live test. It also cleared the
+  known doc drift. Evidence: `artifacts/reviews/2026-11-22-*.md` (git-ignored).
 
 ### 13.2 Recent history (why the tree looks like this)
 
@@ -2381,45 +2679,88 @@ the highest-value resilience work (`ANDROID_VR` is closest but offset-gated; `IO
 SABR-only; TV/web need JS signatures). Procedure: `docs/native-streaming.md` §3.1 —
 a candidate counts only after a full ranged-GET proof.
 
-**Recorded follow-ups (streaming/downloads):** no-progress deadline on transfers (a
-slow-dripping server keeps a claim/row alive); `Downloads::remove` does not cancel an
-in-flight claim; failed batches emit one toast per track; progress snapshots clone the whole
-`DownloadState` at ≤10 Hz; `safe_stem` does not neutralize Windows reserved names and can
-collide case-insensitively (needs offline-file migration); a last-resort non-m4a format may
-not decode; test gaps around the download worker, empty-`__Secure-YEC`, oversized player
-bodies, and mid-download `200`/overrun/`416`.
+**Recorded follow-ups (streaming/downloads):** *fixed 2026-11-22:* no-progress deadline
+(rolling 30 s / 1 KiB byte window), `Downloads::remove` cancellation (tombstone + claim/
+`.part` cleanup + pre/post-rename re-check), last-resort non-m4a formats (resolver accepts
+only `audio/mp4`), the publish/cancel unit-test gap (`publish_part`), one-off failure
+coalescing (one summary per pass), the per-tick `DownloadState` clone (lightweight
+`DownloadProgress` now; lifecycle snapshots only), and the `safe_stem` collision/reserved-
+name defect (injective `~xx` encoding, case-insensitive uniqueness, reserved-name
+neutralization, length cap + `.names.json` index; pre-P5 files stay readable through
+`legacy_safe_stem`, never renamed or deleted). Still open: test gaps around empty-
+`__Secure-YEC`, oversized player bodies, and mid-download `200`/overrun/`416`; a pre-P5
+`_`-folded name is inherently ambiguous without an index entry (accepted for every id that
+folds to it, as before the fix), and a corrupt/lost `downloads/.names.json` leaves
+capped-name audio on disk but unrecognized (never deleted).
 
-**Recorded follow-ups (app/UI/perf, from the review):** titlebar search fires one network
-request per keystroke (proposed 300 ms debounce, needs screens + `ui_flow` update); liked
-`SongIndex` rebuilt per list per frame (cache in `State`); strict serde on persisted models
-quarantines a whole partially-corrupt `library.json` (proposed `#[serde(default)]`
-tolerance); cover/texture tracker uses a process-wide `AtomicBool` (fine for one window,
-misleading for multiple `Ui`s in-process); programmatic text-input focus placement missing
-(rename autofocus needs a click); Discord worker leak on repeated IPC stalls is a documented
-recovery trade-off; pause-mid-crossfade tail and stale-tick/`Ended` races are known rough
-edges; deferred structural splits (`controller` complexity, `audio::run`, `text_input` state
-machine).
+**Recorded follow-ups (app/UI/perf, from the review):** *fixed 2026-11-22:* strict serde
+quarantining a partially-corrupt `library.json` (tolerant per-row load + `#[serde(default)]`
+models), pause-mid-crossfade tail (the fade clock freezes while paused), duration adoption
+(preseeded previous length is no longer published or adopted), cover-cache growth (512-entry
+FIFO bound for failed/in-flight URLs), clipboard paste size (64 KiB cap), update-banner
+overflow, GPU tests masking renderer regressions as "no device", the titlebar search
+debounce (`SEARCH_DEBOUNCE_SECS = 0.3` in `app.rs`), the per-frame liked `SongIndex` rebuild
+(cached `Arc<SongIndex>` in `State`, invalidated by `set_library`, self-healing on direct
+`library` assignment), the process-wide generated-texture `AtomicBool` (now a `Ui`-owned
+one-shot guard, tested with two `Ui`s), the whole-atlas glyph upload (dirty-rect
+`TextureUpdate::Region`, one batched fence wait per frame), the Discord IPC stall leak (Unix
+250 ms socket deadlines; Windows bounded to 3 abandoned workers), and the launcher's
+non-transactional publish (staged + validated + backup/rollback publication). The programmatic text-input focus item is closed too: the inline editors and the
+playlist rename field already autofocus with the caret at the end, and a rename started
+from the sidebar/Home card now navigates to the playlist view that owns the editor, so
+there is always a focused field. The deferred structural splits are done as well:
+`controller/` (mod + commands/tasks/cover/tests), `audio.rs` + private `audio/output.rs`
+(a thin `run` over an `AudioState` with per-command handlers), and
+`ui/text_input/` (mod + edit/state/tests) — all pure moves/extractions with the existing
+test suites unchanged.
+
+**Residuals closed in the 2026-11-22 polish pass:** an end that raced a pause now reports
+`Stopped` at the end instead of a frozen `Playing` bar; the IME candidate window is anchored
+to the focused field's caret (`Ui::ime_cursor_area` → `Window::set_ime_cursor_area`); a
+pending debounced search is cancelled when the box loses focus; the seek bar is static with
+an empty duration label when the length is unknown (no synthetic 1 s denominator); backend
+navigation dismisses an open menu; headless frames advance the frame counter and drain
+retired rings; Home no longer adds its bottom padding twice; and `rift-desktop`'s unused
+`bytemuck`/`pollster`/`tokio` dependencies are gone.
+
+**Environment-only verification gaps (recorded, not claimed as passed):**
+
+- **Real swapchain driver failure.** The recovery state machine is pure-tested with
+  injected failures (`gfx::tests::failed_swapchain_rebuild_recovers_with_a_fresh_swapchain`:
+  failed `recreate`, fresh fallback, and no retry of a retired swapchain). A real
+  `vkCreateSwapchainKHR` failure cannot be forced locally, and a `cfg(test)`/env injection
+  hook would be unexercised surface because there is no headless *windowed*-swapchain
+  harness — the residual is driver-specific, so it stays a manual risk rather than dead
+  production code.
+- **Windows/macOS builds and runtime paths.** Only Linux was built here. The Windows-only
+  util test (`a_windows_sharing_violation_is_unreadable_and_refuses_to_overwrite`, real
+  `share_mode(0)`) and the Windows named-pipe Discord path compile/run only on the CI
+  matrix; proving them locally needs an MSVC C toolchain (aws-lc-sys cannot cross-compile
+  here).
+- **Release signing/provenance.** `release.yml` now attaches GitHub build-provenance
+  attestations (`actions/attest-build-provenance`, `id-token`/`attestations: write`) and
+  documents that binaries are unsigned. YAML/structure/SHA-pin checks pass locally, but
+  OIDC issuance, attestation upload and `gh attestation verify` need a real `v*` tag push;
+  so does the draft → checksums → publish transition.
+- **`cargo-deny`** is not installed on this host, so the supply-chain gate remains
+  CI-only. The *uncommitted set* does change dependencies (Linux-only `cpal`/`pulseaudio`
+  and `arboard`'s `wayland-data-control`, which pulls `wl-clipboard-rs`/`nom 7+8`); licenses
+  sampled as MIT/Apache and the duplicate baseline was regenerated, but advisories/bans
+  have not been checked locally.
 
 ### 13.4 Known documentation drift (verify numbers against source)
 
-The docs are contracts, but a few specifics are stale. When a number matters, trust
-code + tests + `docs/ui-spec.md` and fix the prose in the same change.
+As of 2026-11-22 the previously recorded drift is **fixed**: the command accounting
+(46 legacy registered → 3 yt-dlp commands removed → 40 preserved + 3 window moved → 42
+public methods with `fetch_image`/`is_online`), the progress cadence (~4 Hz / 250 ms),
+the quarantine-on-read-error behaviour and `library.json.pre-collapse[.N]` listing in
+`docs/backend-api.md` §4, the historical `#[ignore]` command in
+`docs/native-streaming.md` §4.1.4, and `docs/imgui-api.md`'s `player_height`/test counts.
 
-- `docs/backend-api.md` §7 says "46 former commands / 43 preserved"; its own table lists 40
-  preserved (+3 window commands moved to winit), and the code exposes exactly 40 legacy
-  methods + `fetch_image` + `is_online` = **42**.
-- `docs/backend-api.md` §3 says progress ticks at ~5 Hz; `audio.rs` ticks every 250 ms
-  (~4 Hz).
-- `docs/backend-api.md` §4 says an unreadable file takes the quarantine path; the code only
-  quarantines parse/UTF-8 failures (a non-`NotFound` read error is logged, not moved), and
-  §4's file list omits `library.json.pre-collapse`.
-- `docs/native-streaming.md` §4.1.4 (the explicitly historical pre-removal record) still
-  lists `cargo test -p rift --lib -- --ignored`, but `crates/rift` has no ignored tests (the
-  one ignored RPC live test is in `rift-discord`).
-- `docs/imgui-api.md` says `player_height 92`; `theme.rs`, `ui-spec.md` §6.3 and the pinned
-  layout tests say **84**; its test counts are also stale.
-- Older reports/prose sometimes quote test counts and binary sizes; re-run the command
-  instead of quoting.
+Numbers are still the fragile part: test counts, binary sizes and startup timings drift by
+design and by machine. **Re-run the command before quoting a number**; never "fix" a
+historical verification record (§4.1/§4.2 of `docs/native-streaming.md`) to match today's
+counts — those sections are dated evidence, not current prose.
 
 ---
 
@@ -2443,15 +2784,16 @@ code + tests + `docs/ui-spec.md` and fix the prose in the same change.
 | **crossfade** | Overlap ramp between two tracks; armed once per generation, capped at `MAX_CROSSFADE = 12 s`, falls back to a hard cut on invalidation. |
 | **kept offline / pinned** | A fully downloaded playlist: kept tracks are retried with backoff and re-downloaded when added. |
 | **permille** | Progress unit 0..=1000 used between the downloader and the UI progress bar. |
+| **safe stem** | `fetch::safe_stem(id)`: the injective `~xx` on-disk filename encoding for offline audio. Pre-P5 `_`-folded names remain readable through `fetch::legacy_safe_stem` and are never renamed at load. |
 | **MPRIS / SMTC / MPNowPlayingInfoCenter** | OS now-playing/media-key APIs (Linux / Windows / macOS) via `souvlaki`. |
 | **rodio / cpal** | Rust audio playback/decode stack used by the audio thread. |
 | **vulkano / winit** | Vulkan wrapper and window/event-loop crate used by `rift-desktop`. |
 | **sRGB / linear / premultiplied** | Colour path: UI colours are sRGB straight-alpha; the renderer converts to linear, blends premultiplied `(One, OneMinusSrcAlpha)`, and lets the sRGB target encode. |
 | **preview mode** | Deterministic placeholder-data mode for UI work/screenshots; dev-only, stripped from shipped releases (`preview` feature / debug builds). |
 | **MSRV** | Minimum supported Rust version — here the pinned 1.88.0 floor. |
-| **gate** | The local CI equivalent `pwsh tools/ci-local.ps1`, plus the GitHub Actions jobs it mirrors. |
+| **gate** | The local CI equivalent (`tools/ci-local.sh` on Linux/macOS, `pwsh tools/ci-local.ps1` on Windows), plus the GitHub Actions jobs it mirrors. |
 | **data directory** | OS app-data location for `library.json`, `settings.json`, `playback.json`, downloads, window state; overridable with `RIFT_DATA_DIR`. |
-| **durable writer** | The FIFO background writer that atomically publishes `library.json`/`settings.json`. |
+| **durable writer** | The coalescing background writer that atomically publishes `library.json`/`settings.json` (newest snapshot per path; FIFO one thread). |
 | **quarantine** | Renaming a corrupt JSON file to `*.json.bad[.N]` and loading defaults instead of crashing. |
 
 ---
@@ -2471,7 +2813,7 @@ area before editing, and update it in the same change as the code.
 | [`docs/controller-notes.md`](docs/controller-notes.md) | UI↔backend bridge: threading, full Action→command table, stale generations, `TrackCache`, cover pipeline, event mapping, online status, tests |
 | [`docs/imgui-api.md`](docs/imgui-api.md) | Immediate-mode GUI API: frame flow, ids, layout, text, widgets, text input, scrolling, popups, focus, theme, screen conventions, tests |
 | [`docs/ui-spec.md`](docs/ui-spec.md) | Screen-by-screen visual/behavioural spec: tokens, geometry, states, interactions, acceptance target |
-| [`docs/native-platform.md`](docs/native-platform.md) | Window-state persistence and the single-instance guard (file schema, read rules, FFI, integration) |
+| [`docs/native-platform.md`](docs/native-platform.md) | Window-state persistence, the single-instance guard, and the Linux desktop launcher (entry/identity contract, installer, icon theme, guard tests) |
 | [`docs/innertube-research.md`](docs/innertube-research.md) | **Historical** research that led to the innertube client (pre-native; its "keep yt-dlp" verdict is superseded). Reference only — never current design |
 | [`LICENSE`](LICENSE) | Apache-2.0 |
 
@@ -2482,5 +2824,5 @@ Recommended reading order by task:
 - **Streaming/parsing:** §5.2 → `docs/native-streaming.md` → `rift-ytmusic/src/**`.
 - **App shell/controller/window:** §5.4 → `docs/architecture.md` + `docs/controller-notes.md`.
 - **UI/gfx/screens:** §5.5 → `docs/imgui-api.md` + `docs/ui-spec.md`.
-- **Build/CI/tests/deps:** §6–§8 → `Cargo.toml`, `tools/ci-local.ps1`, `.github/workflows/*`.
+- **Build/CI/tests/deps:** §6–§8 → `Cargo.toml`, `tools/ci-local.{sh,ps1}`, `.github/workflows/*`.
 - **Git/process conventions:** §9 → `git log` for current style.

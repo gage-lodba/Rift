@@ -716,7 +716,10 @@ impl Ui {
         } else {
             min
         };
-        if (response.active && self.input().mouse_left_down) || response.clicked {
+        // A keyboard activation (Enter/Space on the focused slider) is not a
+        // pointer gesture: there is no fraction under the pointer to commit, so
+        // only a real pointer click may move the thumb to `mouse_pos`.
+        if (response.active && self.input().mouse_left_down) || response.pointer_clicked() {
             let mouse_x = self.input().mouse_pos.0;
             let t = ((mouse_x - rect.x - r) / usable).clamp(0.0, 1.0);
             v = min + t * range;

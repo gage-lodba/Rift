@@ -59,8 +59,8 @@ pub fn player_bar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rec
 /// from the pointer while dragging and from `state.progress` otherwise.
 fn seek(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, row: Rect, theme: &Theme) {
     let time_y = row.y + 6.0;
-    let duration = state.progress.duration.max(1.0);
-    let fraction = (state.progress.position / duration).clamp(0.0, 1.0) as f32;
+    let duration = state.progress.duration;
+    let fraction = seek_fraction(state.progress.position, duration);
     let time_style = cards::style_lh(11.0, Weight::Regular, theme.text_dim, 15.0);
 
     let left_time = Rect::new(row.x + 14.0, time_y, TIME_W, 15.0);
@@ -71,29 +71,57 @@ fn seek(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, row: Rect, th
         (right_time.x - SEEK_GAP - (left_time.right() + SEEK_GAP)).max(10.0),
         16.0,
     );
-    let seek = cards::slider(
-        ui,
-        slider_rect,
-        Id::from_str("player/seek"),
-        fraction,
-        theme,
-    );
-    let shown_fraction = seek.dragged_fraction.unwrap_or(fraction);
-    let shown_pos = if seek.dragged_fraction.is_some() {
-        shown_fraction as f64 * duration
+    let shown_pos = if let Some(fraction) = fraction {
+        let seek = cards::slider(
+            ui,
+            slider_rect,
+            Id::from_str("player/seek"),
+            fraction,
+            theme,
+        );
+        let shown = if let Some(f) = seek.dragged_fraction {
+            f as f64 * duration
+        } else {
+            state.progress.position
+        };
+        // Emit the release position: `dragged_fraction` only exists while the
+        // slider is held, so the commit frame carries its own fraction.
+        if let Some(f) = seek.committed_fraction {
+            actions.push(Action::Seek(f as f64 * duration));
+        }
+        shown
     } else {
+        // The length is unknown: paint a static track and refuse to scrub. A
+        // synthetic 1 s duration used to make every drag emit a bogus Seek
+        // (and the thumb jump to the pointer).
+        const TRACK_INSET: f32 = 2.0;
+        let track = Rect::new(
+            slider_rect.x + TRACK_INSET,
+            slider_rect.y + (slider_rect.h - 3.5) * 0.5,
+            (slider_rect.w - TRACK_INSET * 2.0).max(2.0),
+            3.5,
+        );
+        ui.rounded_rect(track, theme.seek_track, 1.75);
         state.progress.position
     };
     ui.text_centered(left_time, &crate::state::fmt_time(shown_pos), &time_style);
-    ui.text_centered(
-        right_time,
-        &crate::state::fmt_time(state.progress.duration),
-        &time_style,
-    );
-    // Emit the release position: `dragged_fraction` only exists while the
-    // slider is held, so the commit frame carries its own fraction.
-    if let Some(f) = seek.committed_fraction {
-        actions.push(Action::Seek(f as f64 * duration));
+    ui.text_centered(right_time, &duration_label(duration), &time_style);
+}
+
+/// The seek fraction for a real length, or `None` when the length is unknown
+/// (0, negative or non-finite). The bar must be static and non-interactive in
+/// that case: a synthetic denominator makes a drag seek to a meaningless time.
+fn seek_fraction(position: f64, duration: f64) -> Option<f32> {
+    (duration.is_finite() && duration > 0.0).then(|| (position / duration).clamp(0.0, 1.0) as f32)
+}
+
+/// The right-hand time label: `m:ss` for a known length, empty when unknown
+/// (matching the track-row duration rule in `ui-spec.md`).
+fn duration_label(duration: f64) -> String {
+    if duration.is_finite() && duration > 0.0 {
+        crate::state::fmt_time(duration)
+    } else {
+        String::new()
     }
 }
 
@@ -179,13 +207,9 @@ fn now_playing(
     // Like button sits right after the text block (`text block` shrinks to its
     // content; it is not pushed toward the controls).
     let like = Rect::new(meta_x + meta_w + NP_GAP, row_center_y - 14.0, 28.0, 28.0);
-    // Same identity rule as `State::liked_index` (id fast path, then `same_song`)
-    // without building the whole index for one row.
-    let liked = state
-        .library
-        .liked
-        .iter()
-        .any(|liked| liked.id == track.id || liked.same_song(&track));
+    // Same identity rule as the track rows, from the cached index: the cache
+    // makes this an `Arc` clone per frame instead of a scan/index rebuild.
+    let liked = state.liked_index().contains(&track);
     let (icon, color) = if liked {
         (Icon::HeartFilled, theme.accent)
     } else {
@@ -416,6 +440,22 @@ mod tests {
     fn controls_block_is_centred() {
         assert_eq!(CTRLS_W, 212.0);
         assert_eq!((1160.0 - CTRLS_W) * 0.5, 474.0);
+    }
+
+    /// Unknown duration: no fraction, no synthetic 1 s denominator, and an empty
+    /// right-hand label (the row duration rule) instead of `0:00`.
+    #[test]
+    fn an_unknown_duration_makes_the_seek_bar_static() {
+        assert_eq!(seek_fraction(12.0, 0.0), None);
+        assert_eq!(seek_fraction(12.0, f64::NAN), None);
+        assert_eq!(seek_fraction(12.0, f64::INFINITY), None);
+        assert_eq!(seek_fraction(12.0, -5.0), None);
+        assert_eq!(duration_label(0.0), "");
+        assert_eq!(duration_label(f64::NAN), "");
+        assert_eq!(seek_fraction(107.0, 214.0), Some(0.5));
+        assert_eq!(duration_label(214.0), "3:34");
+        // Positions beyond the reported length still clamp.
+        assert_eq!(seek_fraction(999.0, 214.0), Some(1.0));
     }
 
     /// The transport block must land on whole pixels at odd window widths too:

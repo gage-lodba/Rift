@@ -46,13 +46,16 @@ pub enum Error {
         /// the playability status itself (`LOGIN_REQUIRED`, `ERROR`, ...).
         reason: String,
     },
-    /// The player response carried no directly downloadable audio format.
+    /// The player response carried no format this build can play.
     ///
-    /// The response either had no `streamingData`, no audio-only entries, or
-    /// only entries that would need JavaScript signature/`n` solving — which
-    /// this clean-room resolver deliberately does not implement. The fetch
-    /// surfaces this as an actionable error rather than retrying another backend.
-    #[error("player response offered no downloadable audio format")]
+    /// The response either had no `streamingData`, no audio-only entries, only
+    /// `audio/mp4` entries needing JavaScript signature/`n` solving (which this
+    /// clean-room resolver deliberately does not implement), or only WebM/Opus
+    /// audio. A WebM/Opus entry may be directly downloadable, but rodio cannot
+    /// decode it and the offline path publishes `.m4a`, so it is rejected here
+    /// rather than downloaded and failing later. The fetch surfaces this as an
+    /// actionable error rather than retrying another backend.
+    #[error("player response offered no audio format this build can decode (audio/mp4)")]
     NoAudioFormat,
 }
 

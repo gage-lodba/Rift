@@ -37,6 +37,14 @@ const MAX_RESPONSE_BYTES: u64 = 16 * 1024;
 /// Longest excerpt of a non-JSON error body copied into an error message.
 const MAX_ERROR_EXCERPT_CHARS: usize = 200;
 
+/// Longest server-provided `error.message` copied into [`Error::Api`].
+///
+/// Innertube error messages are a sentence or two; a broken or hostile endpoint
+/// must not be able to put an arbitrarily large string (or embedded newlines)
+/// into a user-facing error. The cap is deliberately larger than a normal
+/// message so the actionable part survives.
+const MAX_API_MESSAGE_CHARS: usize = 300;
+
 /// Read a response body, refusing to buffer more than [`MAX_RESPONSE_BYTES`].
 ///
 /// The ceiling is enforced by counting the bytes actually received, not by
@@ -63,23 +71,51 @@ fn api_message(parsed: &Value) -> String {
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
+        .map(|message| single_line_excerpt(message, MAX_API_MESSAGE_CHARS))
         .unwrap_or_default()
-        .to_owned()
 }
 
 /// A short, single-line excerpt of a non-JSON response body, for an error
-/// message. Collapses whitespace so an HTML error page cannot put newlines in a
-/// toast, and truncates on a character boundary.
+/// message.
 fn body_excerpt(body: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(body);
-    let flat = lossy.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = flat.chars();
-    let excerpt: String = chars.by_ref().take(MAX_ERROR_EXCERPT_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{excerpt}…")
-    } else {
-        excerpt
+    single_line_excerpt(&String::from_utf8_lossy(body), MAX_ERROR_EXCERPT_CHARS)
+}
+
+/// Collapse whitespace and truncate `text` to `max` characters.
+///
+/// One pass over `chars()` with a `pending_space` flag: no `Vec<&str>` of the
+/// whole body (which would transiently allocate ~250 MB for a 32 MiB body) and
+/// no intermediate flattened `String` either. Output is bounded at
+/// `max + 1` chars (the extra is the ellipsis), and the walk stops as soon as
+/// the bound is reached, so a huge repetitive body costs almost nothing.
+fn single_line_excerpt(text: &str, max: usize) -> String {
+    let mut excerpt = String::with_capacity(max.saturating_add(1).min(text.len()));
+    let mut count = 0usize;
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if count > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            if count == max {
+                excerpt.push('…');
+                return excerpt;
+            }
+            excerpt.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        if count == max {
+            excerpt.push('…');
+            return excerpt;
+        }
+        excerpt.push(ch);
+        count += 1;
     }
+    excerpt
 }
 
 /// A `YouTube` Music innertube client.
@@ -117,6 +153,11 @@ impl Client {
             // small, so a short ceiling costs nothing legitimate.
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
+            // The client-version/visitor scrape hits the same home page as the
+            // resolver, so it needs the same raised h2 receive limit: the
+            // default 16 KiB rejects ~half of the oversized responses (see
+            // [`crate::MAX_H2_RESPONSE_HEADER_LIST_BYTES`]).
+            .http2_max_header_list_size(crate::MAX_H2_RESPONSE_HEADER_LIST_BYTES)
             .build()?;
         Ok(Self {
             inner: Arc::new(Inner { http }),
@@ -1643,6 +1684,46 @@ mod tests {
             .filter(|r| r.endpoint() == "search" && r.query() == ALWAYS_500_HTML)
             .count();
         assert_eq!(attempts, 1, "only a 403 is retried");
+    }
+
+    /// The server-provided `error.message` is user-facing text: a huge or
+    /// multi-line value is capped and flattened instead of being copied whole.
+    #[test]
+    fn a_huge_server_error_message_is_capped_to_one_line() {
+        let huge = format!("first line\n{}", "x".repeat(10_000));
+        let parsed = json!({ "error": { "message": huge } });
+
+        let message = api_message(&parsed);
+        assert_eq!(
+            message.chars().count(),
+            MAX_API_MESSAGE_CHARS + 1,
+            "the message is capped plus the ellipsis"
+        );
+        assert!(message.starts_with("first line x"));
+        assert!(message.ends_with('…'));
+        assert!(!message.contains('\n'), "the message must be one line");
+    }
+
+    /// A huge non-JSON error body must not materialise every word before
+    /// truncating: the excerpt is one bounded pass (see `single_line_excerpt`).
+    #[test]
+    fn body_excerpt_is_bounded_on_a_large_repetitive_body() {
+        let body = vec![b'x'; 8 * 1024 * 1024];
+        let excerpt = body_excerpt(&body);
+        assert_eq!(
+            excerpt.chars().count(),
+            MAX_ERROR_EXCERPT_CHARS + 1,
+            "a repetitive body yields at most the excerpt plus the ellipsis"
+        );
+        assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn single_line_excerpt_collapses_whitespace_at_the_boundary() {
+        assert_eq!(single_line_excerpt("  a \n\t b  ", 8), "a b");
+        assert_eq!(single_line_excerpt("a b c", 3), "a b…");
+        assert_eq!(single_line_excerpt("a b", 3), "a b");
+        assert_eq!(single_line_excerpt("a b", 2), "a …");
     }
 
     /// A body the server *declares* larger than the ceiling is rejected from the

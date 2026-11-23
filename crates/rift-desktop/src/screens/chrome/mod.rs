@@ -19,6 +19,7 @@ pub use overlays::{banner_text, toast, update_banner};
 pub use player_bar::player_bar;
 pub use queue_panel::queue_panel;
 pub use sidebar::sidebar;
+pub(crate) use titlebar::search_input_id;
 pub use titlebar::titlebar;
 
 /// Fixtures shared by the chrome submodules' interaction tests.

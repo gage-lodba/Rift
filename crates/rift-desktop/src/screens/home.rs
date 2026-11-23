@@ -188,8 +188,10 @@ pub fn home(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, content: 
     }
     state.library.recently_played = recent;
 
-    // Content height includes the main area's bottom padding.
-    (y - content.y) + theme.main_padding_v
+    // Height of the content this function drew. The scroll container that calls
+    // it adds the main area's top *and* bottom padding itself; adding the bottom
+    // padding here too made the scroll range 20 px longer than the content.
+    y - content.y
 }
 
 #[cfg(test)]

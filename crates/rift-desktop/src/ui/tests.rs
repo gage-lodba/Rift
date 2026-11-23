@@ -271,6 +271,89 @@ fn clicking_a_focusable_widget_focuses_it_without_visible_ring() {
 }
 
 // ---------------------------------------------------------------------------
+// keyboard vs pointer activation
+// ---------------------------------------------------------------------------
+
+/// Enter/Space on a focused button is still a click; it is just flagged as
+/// keyboard-originated so positional widgets can ignore it.
+#[test]
+fn focused_button_activates_on_enter() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("keyboard-button");
+    let rect = Rect::new(10.0, 10.0, 100.0, 30.0);
+    ui.request_focus(id);
+    let mut i = input_at(0.0);
+    i.keys = vec![key_ev(Key::Enter, false)];
+    let (r, _) = frame(&mut ui, i, |ui| {
+        ui.button_with_id(id, rect, "Play", ButtonKind::Primary)
+    });
+    assert!(r.clicked, "Enter must activate a focused button");
+    assert!(r.keyboard_activated);
+    assert!(!r.pointer_clicked(), "the click is not positional");
+    assert!(r.focused);
+}
+
+/// A focused slider receiving Enter/Space must not commit the fraction at the
+/// parked mouse position: the synthesised keyboard click carries no pointer.
+#[test]
+fn focused_slider_ignores_keyboard_activation() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("keyboard-slider");
+    let rect = Rect::new(10.0, 10.0, 200.0, 20.0);
+    let style = SliderStyle::from_theme(ui.theme());
+    let mut value = 0.0f32;
+    ui.request_focus(id);
+    // Park the mouse at the far right: committing `mouse_pos` would set 1.0.
+    let mut i = mouse(input_at(0.0), 220.0, 20.0);
+    i.keys = vec![key_ev(Key::Enter, false)];
+    let (r, _) = frame(&mut ui, i, |ui| {
+        ui.slider_styled(id, rect, &mut value, 0.0, 1.0, &style)
+    });
+    assert!(r.response.keyboard_activated);
+    assert!(!r.response.pointer_clicked());
+    assert!(!r.changed);
+    assert_eq!(value, 0.0, "Enter must not seek to the parked mouse");
+
+    // Space is the other activation key; same contract.
+    let mut i = mouse(input_at(0.016), 220.0, 20.0);
+    i.keys = vec![key_ev(Key::Space, false)];
+    let (r, _) = frame(&mut ui, i, |ui| {
+        ui.slider_styled(id, rect, &mut value, 0.0, 1.0, &style)
+    });
+    assert!(r.response.keyboard_activated);
+    assert!(!r.changed);
+    assert_eq!(value, 0.0, "Space must not seek to the parked mouse");
+}
+
+/// The keyboard fix must not disable ordinary pointer clicks.
+#[test]
+fn slider_mouse_click_still_commits_the_pointer_fraction() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("pointer-slider");
+    let rect = Rect::new(10.0, 10.0, 200.0, 20.0);
+    let style = SliderStyle::from_theme(ui.theme());
+    let mut value = 0.0f32;
+    let (mx, my) = rect.center();
+    let (r, _) = frame(&mut ui, press(mouse(input_at(0.0), mx, my)), |ui| {
+        ui.slider_styled(id, rect, &mut value, 0.0, 1.0, &style)
+    });
+    assert!(r.response.active);
+    assert!(!r.response.keyboard_activated);
+    assert!(
+        r.changed,
+        "the press commits the fraction under the pointer"
+    );
+
+    let (r, _) = frame(&mut ui, release(mouse(input_at(0.016), mx, my)), |ui| {
+        ui.slider_styled(id, rect, &mut value, 0.0, 1.0, &style)
+    });
+    assert!(r.response.clicked);
+    assert!(!r.response.keyboard_activated);
+    assert!(r.response.pointer_clicked());
+    assert!((value - 0.5).abs() < 0.02, "value {value}");
+}
+
+// ---------------------------------------------------------------------------
 // text
 // ---------------------------------------------------------------------------
 
@@ -454,6 +537,29 @@ fn scroll_content_rect_is_offset_and_stable_gutter_reserves_width() {
     assert_eq!(r.content_rect.y, 20.0 - 50.0);
 }
 
+/// A focused scrollbar track receiving Enter/Space must not jump to the parked
+/// pointer: the synthetic keyboard click is not a positional gesture.
+#[test]
+fn focused_scrollbar_track_ignores_keyboard_activation() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("keyboard-scrollbar");
+    let rect = Rect::new(0.0, 0.0, 400.0, 200.0);
+    let track = id.with("track");
+    ui.request_focus(track);
+    // Pointer near the bottom of the bar: the pointer path would scroll to the
+    // end (t = 1 → offset = max_offset).
+    let mut i = mouse(input_at(0.0), 395.0, 190.0);
+    i.keys = vec![key_ev(Key::Space, false)];
+    let (r, _) = frame(&mut ui, i, |ui| {
+        let (_, response) = ui.scroll_area(id, rect, 1000.0, |_ui, _content| {});
+        response
+    });
+    assert_eq!(r.offset, 0.0, "keyboard activation must not jump");
+    assert!(!r.scrolled);
+    assert_eq!(ui.scroll_offset(id), 0.0);
+    assert!(ui.is_focused(track), "test setup: the track has focus");
+}
+
 // ---------------------------------------------------------------------------
 // popups / toasts / tooltips
 // ---------------------------------------------------------------------------
@@ -633,6 +739,134 @@ fn text_input_escape_cancels_and_blurs() {
     assert_eq!(ui.focused_id(), None);
 }
 
+/// Gaining focus without a pointer click (autofocus, Tab) puts the caret at the
+/// end, so typing appends to a prefilled draft like an HTML `autofocus` input.
+#[test]
+fn first_focus_puts_the_caret_at_the_end() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("input-focus-caret");
+    let mut text = String::from("Mix");
+    ui.request_focus(id);
+    let (r, _) = frame(&mut ui, typed(input_at(0.0), " 2"), |ui| {
+        draw_input(ui, id, &mut text)
+    });
+    assert!(r.changed);
+    assert_eq!(text, "Mix 2");
+}
+
+/// A focused field is stable: it does not report a spurious `lost_focus`.
+#[test]
+fn focused_text_input_does_not_report_lost_focus() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("input-lost-none");
+    let mut text = String::from("abc");
+    ui.request_focus(id);
+    for step in 0..3 {
+        let (r, _) = frame(&mut ui, input_at(step as f64 / 60.0), |ui| {
+            draw_input(ui, id, &mut text)
+        });
+        assert!(r.response.focused, "the field keeps focus");
+        assert!(!r.lost_focus, "no blur happened, so no lost_focus");
+    }
+}
+
+/// Clicking empty space blurs the field in `Ui::end_frame`, after the field has
+/// already run, so `lost_focus` is reported by the *next* frame's call.
+#[test]
+fn text_input_reports_lost_focus_one_frame_after_clicking_away() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("input-lost-away");
+    let mut text = String::from("abc");
+    ui.request_focus(id);
+    let (r, _) = frame(&mut ui, input_at(0.0), |ui| draw_input(ui, id, &mut text));
+    assert!(r.response.focused);
+    assert!(!r.lost_focus);
+
+    // Press on empty space: nothing takes focus, so `end_frame` blurs the field.
+    let (r, _) = frame(&mut ui, press(mouse(input_at(0.1), 600.0, 600.0)), |ui| {
+        draw_input(ui, id, &mut text)
+    });
+    assert!(
+        r.response.focused,
+        "the blur is committed after the field ran"
+    );
+    assert!(!r.lost_focus, "the field cannot see end_frame's blur yet");
+
+    // The following frame reports the blur (and the release frame is nothing
+    // special: the record is consumed as soon as the field is drawn).
+    let (r, _) = frame(&mut ui, release(mouse(input_at(0.2), 600.0, 600.0)), |ui| {
+        draw_input(ui, id, &mut text)
+    });
+    assert!(!r.response.focused);
+    assert!(
+        r.lost_focus,
+        "lost_focus must be reported on the frame after the click-away blur"
+    );
+}
+
+/// Focus taken by a widget drawn *after* the field is also only visible in the
+/// next frame. Re-focusing the field in that frame suppresses the report, so a
+/// quick click back into it is not treated as a cancel.
+#[test]
+fn text_input_reports_lost_focus_when_another_widget_takes_focus() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("input-lost-other");
+    let other = Id::from_str("input-lost-other-button");
+    let other_rect = Rect::new(480.0, 280.0, 100.0, 40.0);
+    let mut text = String::from("abc");
+    ui.request_focus(id);
+
+    let draw_both = |ui: &mut Ui, text: &mut String| {
+        let r = draw_input(ui, id, text);
+        let _ = ui.interact(other_rect, other, Sense::CLICK);
+        r
+    };
+    let (r, _) = frame(&mut ui, input_at(0.0), |ui| draw_both(ui, &mut text));
+    assert!(r.response.focused);
+
+    // The pointer presses the other widget: its `interact` takes focus during
+    // this frame, after the text field already ran.
+    let at = (other_rect.center().0, other_rect.center().1);
+    let (r, _) = frame(&mut ui, press(mouse(input_at(0.1), at.0, at.1)), |ui| {
+        draw_both(ui, &mut text)
+    });
+    assert!(r.response.focused, "the field still believes it is focused");
+    assert!(!r.lost_focus);
+
+    let (r, _) = frame(&mut ui, release(mouse(input_at(0.2), at.0, at.1)), |ui| {
+        draw_both(ui, &mut text)
+    });
+    assert!(!r.response.focused);
+    assert!(r.lost_focus, "the next frame reports the focus loss");
+}
+
+/// Clicking back into a blurred field in the frame that would report the loss
+/// re-focuses it first, so a fast blur + refocus is not a cancel.
+#[test]
+fn clicking_back_into_a_blurred_field_suppresses_lost_focus() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("input-lost-refocus");
+    let mut text = String::from("abc");
+    ui.request_focus(id);
+    frame(&mut ui, input_at(0.0), |ui| draw_input(ui, id, &mut text));
+
+    // Blur by pressing empty space; `end_frame` records the loss.
+    frame(&mut ui, press(mouse(input_at(0.1), 600.0, 600.0)), |ui| {
+        draw_input(ui, id, &mut text)
+    });
+
+    // Press back into the field on the next frame: `interact` re-focuses before
+    // `lost_focus` is computed, so the record is suppressed.
+    let (r, _) = frame(&mut ui, press(mouse(input_at(0.2), 20.0, 10.0)), |ui| {
+        draw_input(ui, id, &mut text)
+    });
+    assert!(r.response.focused, "the click focused the field again");
+    assert!(
+        !r.lost_focus,
+        "a refocused field must not report the previous blur"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // styles / theme
 // ---------------------------------------------------------------------------
@@ -712,6 +946,38 @@ fn inter_frame_texture_upload_reaches_the_next_paint_list() {
     );
 }
 
+/// The OS IME candidate window needs the focused field's caret rectangle. It
+/// must be reported while a text input is focused (even with the caret blink
+/// off) and cleared once focus leaves the field.
+#[test]
+fn the_focused_text_input_reports_its_ime_caret_area() {
+    let mut ui = Ui::new();
+    let id = Id::from_str("ime/input");
+    let rect = Rect::new(20.0, 30.0, 200.0, 33.0);
+    let style = TextInputStyle::default_theme(&ui.theme().clone());
+    let mut text = String::from("hello");
+    ui.request_focus(id);
+    let (_, _) = frame(&mut ui, input_at(0.0), |ui| {
+        ui.text_input(rect, id, &mut text, "Placeholder", &style);
+    });
+    let area = ui
+        .ime_cursor_area()
+        .expect("a focused text input must report its caret");
+    assert!(
+        area.x >= rect.x - 1.0 && area.x <= rect.right() + 1.0,
+        "the caret anchor must be inside the field: {area:?} vs {rect:?}"
+    );
+    assert!(area.y >= rect.y && area.y <= rect.bottom());
+    assert!(area.h > 0.0 && area.w > 0.0);
+
+    // Blur: the next frame has no focused input, so there is nothing to anchor.
+    ui.clear_focus();
+    let (_, _) = frame(&mut ui, input_at(0.1), |ui| {
+        ui.text_input(rect, id, &mut text, "Placeholder", &style);
+    });
+    assert_eq!(ui.ime_cursor_area(), None);
+}
+
 #[test]
 fn in_frame_texture_upload_appears_exactly_once() {
     let mut ui = Ui::new();
@@ -720,7 +986,14 @@ fn in_frame_texture_upload_appears_exactly_once() {
         ui.update_texture(9002, 2, 2, vec![8; 16]);
     });
     assert_eq!(paint.created.iter().filter(|t| t.id == 9001).count(), 1);
-    assert_eq!(paint.updated.iter().filter(|t| t.id == 9002).count(), 1);
+    assert_eq!(
+        paint
+            .updated
+            .iter()
+            .filter(|t| matches!(t, TextureUpdate::Whole(upload) if upload.id == 9002))
+            .count(),
+        1
+    );
     // The next frame must not re-send them.
     let (_, paint) = frame(&mut ui, input_at(0.016), |_ui| {});
     assert!(paint.created.is_empty());

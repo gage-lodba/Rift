@@ -13,6 +13,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege: this workflow only reads the repository. Without a block the
+# token's permissions come from the repository default, which can be
+# write-capable — and CI runs repository code (build scripts, proc macros,
+# tests), so a write token is reachable from anything that runs. A job that
+# genuinely needs more must ask for it explicitly; none here does.
+permissions:
+  contents: read
+
 jobs:
   # Cheap and platform-independent, so it runs before anything that compiles.
   toolchain:
@@ -20,6 +28,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this workflow pushes or otherwise needs the token; don't
+          # leave it in `.git/config` where a build script, proc macro or test
+          # could read it.
+          persist-credentials: false
       # `rust-version` in Cargo.toml, the channel in rust-toolchain.toml, and the
       # `toolchain:` inputs below all state the same version, and they are not
       # redundant — see the script's header. Fails if they disagree, so the
@@ -44,6 +57,11 @@ jobs:
       # arbitrary code without this file changing. Dependabot understands the
       # comment form and will keep the SHAs current.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this workflow pushes or otherwise needs the token; don't
+          # leave it in `.git/config` where a build script, proc macro or test
+          # could read it.
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
           # The declared MSRV. Every job builds at the floor on purpose: that is
@@ -55,6 +73,24 @@ jobs:
       # application is built by cargo, so there is no separate frontend
       # formatter to run, and no `.cargo/config.toml` runner wiring is needed.
       - run: cargo fmt --all --check
+
+  # The local gate exists in two implementations (bash for Linux/macOS, pwsh
+  # for Windows). This guard is cheap and needs no Rust install: it syntax-checks
+  # the bash front-end, compares the two front-ends' row sets, and verifies the
+  # four clippy configurations are still present in both gates and this workflow.
+  gates:
+    name: local gate scripts are in sync
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this workflow pushes or otherwise needs the token; don't
+          # leave it in `.git/config` where a build script, proc macro or test
+          # could read it.
+          persist-credentials: false
+      - name: Check gate syntax, row parity and clippy coverage
+        shell: bash
+        run: .github/scripts/check-local-gates.sh
 
   build:
     name: clippy, test & build (${{ matrix.os }})
@@ -68,6 +104,11 @@ jobs:
         os: [ubuntu-22.04, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this workflow pushes or otherwise needs the token; don't
+          # leave it in `.git/config` where a build script, proc macro or test
+          # could read it.
+          persist-credentials: false
 
       # Native build dependencies. The app is winit + Vulkano + rodio:
       #   * ALSA (rodio/cpal) is the only hard link dependency on Linux;
@@ -107,8 +148,19 @@ jobs:
       # Explicit package list rather than `--workspace`: it documents exactly the
       # crates the native application is built from (the workspace members are
       # the five crates under `crates/`).
-      - name: Clippy
+      #
+      # Debug/default-features is not the whole gate. The UI-only
+      # `--no-default-features` build and the release build compile different
+      # `cfg` branches (the release CLI parser is
+      # `not(any(debug_assertions, feature = "preview"))`), so a clippy warning
+      # in one of those branches would pass every other step. Lint the UI-only
+      # configuration here; the two release configurations are linted below,
+      # once the release dependency artifacts exist.
+      - name: Clippy (debug, default features)
         run: cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop --all-targets --locked -- -D warnings
+
+      - name: Clippy (UI-only, no default features)
+        run: cargo clippy -p rift-desktop --no-default-features --all-targets --locked -- -D warnings
 
       # The four library crates opt into `#![warn(missing_docs)]`; deny rustdoc
       # warnings so doc coverage cannot regress silently. rift-desktop is an
@@ -189,6 +241,23 @@ jobs:
               ;;
           esac
 
+      # The debug clippy run above cannot see `not(debug_assertions)` code: the
+      # shipped CLI parser lives there, so a warning in that branch used to pass
+      # every step. Lint the shipped configuration against the release artifacts
+      # the build above produced, and then the acceptance-only `preview`
+      # configuration. `preview` is non-default, so the latter would otherwise
+      # only be compiled by this workflow (or exercised by the local gate);
+      # clippy compiles the same graph as the old `cargo check` while also
+      # denying warnings. Keep `--locked`: this checks the committed graph.
+      - name: Clippy (release, shipped configuration)
+        run: cargo clippy --release -p rift-desktop --all-targets --locked -- -D warnings
+
+      # A separate step, not a second line in the one above: the Windows runner's
+      # pwsh does not stop a multi-command step on the first native failure, so a
+      # shipped-config failure could be masked by the preview command's exit code.
+      - name: Clippy (release, acceptance preview configuration)
+        run: cargo clippy --release -p rift-desktop --features backend,preview --all-targets --locked -- -D warnings
+
   # Supply-chain gate. This is independent of the build matrix (one cheap Docker
   # action, no application compile), so it is its own job: a vulnerability or a
   # new/denied license should fail review quickly instead of waiting for three
@@ -199,6 +268,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this workflow pushes or otherwise needs the token; don't
+          # leave it in `.git/config` where a build script, proc macro or test
+          # could read it.
+          persist-credentials: false
       # SHA-pinned like every other action here; `v2` in the comment is what
       # Dependabot tracks. The action is a Docker image with cargo-deny 0.20.x
       # baked in — there is no separate Rust-install step, and the version is

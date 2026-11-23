@@ -59,17 +59,73 @@ const PRESENCE_REFRESH_GAP: Duration = Duration::from_millis(500);
 
 /// Ceiling on a single IPC exchange with Discord.
 ///
-/// `rift_discord::Client`'s reads block with no timeout of their own, and the
-/// client is not `Send` (it holds a `File` on Windows), so it cannot be moved
-/// into `spawn_blocking` and an async timeout on its own thread cannot interrupt
-/// it.
-/// Every socket operation therefore runs on a dedicated worker thread that
-/// applies this deadline itself; the event loop only ever waits on a channel.
-/// Without that, one unanswered read would stall the loop outright — commands
-/// would stop coalescing, the heartbeat would stop firing, and the unbounded
-/// command channel would grow for the rest of the session. Comfortably under
-/// [`POLL`] so a slow exchange cannot eat a whole tick.
+/// Every socket operation runs on a dedicated worker thread that applies this
+/// deadline itself; the event loop only ever waits on a channel. The worker's
+/// client is not `Send` on every platform (it holds a `File` on Windows), so it
+/// cannot be moved into `spawn_blocking`, and an async timeout cannot interrupt
+/// a blocking read from the loop's thread.
+///
+/// On Unix the transport additionally sets its own 250 ms read/write timeout
+/// (`rift_discord`'s `SOCKET_IO_TIMEOUT`, deliberately half of this), so a peer
+/// that accepts the socket and then goes silent fails as an I/O error and the
+/// worker retires normally well before this deadline. This outer deadline still
+/// matters for the Windows named pipe — a `std::fs::File` read has no std
+/// timeout, and interrupting it needs unsafe Win32 calls this crate forbids —
+/// and for a peer that trickles just enough bytes to keep each individual read
+/// under its deadline. A request that reaches this deadline abandons its worker
+/// (see [`IpcWorker`]), bounded per session by [`MAX_ABANDONED_WORKERS`].
+/// Comfortably under [`POLL`] so a slow exchange cannot eat a whole tick.
 const IPC_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How many stalled IPC workers one session may abandon before it stops
+/// replacing them.
+///
+/// Abandoning a worker is the only way out of a blocking read that cannot be
+/// interrupted, and each abandonment leaks that worker's thread and socket until
+/// its read eventually fails — which a genuinely hung peer never allows. On
+/// Windows that is the only defence: the transport is a `std::fs::File` named
+/// pipe with no std read timeout, and making the read interruptible would need
+/// unsafe Win32 calls, which this crate forbids. Three abandoned workers — the
+/// initial worker and two replacements — absorb a Discord restart or a transient
+/// wedge without letting a hung or forged `discord-ipc-N` peer leak one thread +
+/// socket per attempt for the whole session. On Unix the transport's own
+/// read/write timeout normally retires the worker with an I/O error instead, so
+/// the cap is a backstop there.
+const MAX_ABANDONED_WORKERS: u32 = 3;
+
+/// Session bookkeeping for the bounded worker-abandonment fallback.
+///
+/// Split out of the event loop as a pure counter so the policy is testable
+/// without real sockets or threads. A slot is spent only when a worker is
+/// abandoned after [`IPC_TIMEOUT`]; a call that returned normally (a reply, or a
+/// clean "socket unusable" `None`) leaves the budget untouched because that
+/// worker exits on its own and holds no socket open.
+#[derive(Debug, Default)]
+struct Abandonments {
+    /// Workers abandoned so far this session.
+    abandoned: u32,
+}
+
+impl Abandonments {
+    /// Whether the loop may still spawn a worker for the next request.
+    fn may_spawn(&self) -> bool {
+        self.abandoned < MAX_ABANDONED_WORKERS
+    }
+
+    /// Fold one dispatch outcome into the budget; returns whether a replacement
+    /// worker may be spawned afterwards.
+    ///
+    /// `abandoned` must be true only for a worker that missed [`IPC_TIMEOUT`].
+    /// Counting a normal answer would make ordinary Discord hiccups (it is not
+    /// running, the pipe broke) burn the session's allowance and disable
+    /// presence for a reason that leaks nothing.
+    fn record(&mut self, abandoned: bool) -> bool {
+        if abandoned && self.may_spawn() {
+            self.abandoned += 1;
+        }
+        self.may_spawn()
+    }
+}
 
 /// Rift's Discord application ID (Developer Portal → General Information). It
 /// sets the app name shown as "Listening to Rift" and hosts uploaded art.
@@ -318,8 +374,13 @@ fn push_due(elapsed_since_last_push: Option<Duration>, dirty: bool) -> bool {
 
 async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
     // Every socket operation goes through this worker; see [`IpcWorker`]. Held as
-    // an `Option` so a stall can abandon the worker and start a fresh one.
+    // an `Option` so a stalled worker can be abandoned and — while the session's
+    // budget allows — replaced.
     let mut ipc = None;
+    // Session budget for abandoned workers. A peer that stalls every replacement
+    // must not leak one thread + socket per attempt; once the budget is spent the
+    // loop stops attempting IPC entirely (see [`MAX_ABANDONED_WORKERS`]).
+    let mut stalls = Abandonments::default();
     // Whether the IPC socket is currently connected. Discord may be closed when
     // Rift starts (or restarted later), so we connect lazily and reconnect on
     // the next push if one fails.
@@ -372,7 +433,7 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
             // Loading snapshot is skipped (the previous track stays up), so if it
             // reset `last_send` the real Playing push moments later would be held
             // for a whole MIN_INTERVAL — the new song wouldn't show for ~15s.
-            if apply(&mut ipc, &mut connected, enabled, now.as_mut()).await {
+            if apply(&mut ipc, &mut connected, &mut stalls, enabled, now.as_mut()).await {
                 last_send = Some(Instant::now());
             }
             dirty = false;
@@ -385,12 +446,23 @@ async fn event_loop(mut rx: UnboundedReceiver<DiscordCmd>, mut enabled: bool) {
 /// failure so the next update retries. Returns whether an IPC operation was
 /// attempted, so the caller only paces the interval on a real push (a skipped
 /// Loading frame must not consume the send slot).
+///
+/// Once the session's abandonment budget is spent this returns `false` without
+/// touching the socket: spawning another worker would only park it on the same
+/// hung peer (see [`MAX_ABANDONED_WORKERS`]).
 async fn apply(
     ipc: &mut Option<IpcWorker>,
     connected: &mut bool,
+    stalls: &mut Abandonments,
     enabled: bool,
     now: Option<&mut Now>,
 ) -> bool {
+    // The fallback has given up for this session. Keep draining commands in the
+    // event loop (so the unbounded channel cannot grow) but stop spawning
+    // workers, each of which a hung socket would park forever.
+    if !stalls.may_spawn() {
+        return false;
+    }
     let state = now.as_deref().map(|n| n.state);
     // While a new track is still loading, leave the current presence untouched
     // rather than push a bar-less entry (the bar is withheld until Playing so it
@@ -403,13 +475,8 @@ async fn apply(
     let show = enabled && matches!(state, Some(PlaybackState::Playing | PlaybackState::Paused));
     if !show {
         if *connected {
-            let req = IpcRequest::Clear;
-            match dispatch(ipc, req).await {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("discord clear failed, reconnecting next tick: {e}");
-                    *connected = false;
-                }
+            if let Err(failure) = dispatch(ipc, IpcRequest::Clear).await {
+                on_ipc_failure(ipc, connected, stalls, failure);
             }
             return true;
         }
@@ -425,14 +492,9 @@ async fn apply(
     // push has been accepted, so a failed attempt retries the whole refresh.
     if n.forced_refresh {
         debug!("same track restarted; clearing the Discord presence before re-posting");
-        match dispatch(ipc, IpcRequest::Clear).await {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("discord refresh clear failed ({e}); retrying on a later update");
-                *ipc = None;
-                *connected = false;
-                return true;
-            }
+        if let Err(failure) = dispatch(ipc, IpcRequest::Clear).await {
+            on_ipc_failure(ipc, connected, stalls, failure);
+            return true;
         }
         // Let Discord process the clear as its own presence state before the new
         // activity arrives; see [`PRESENCE_REFRESH_GAP`].
@@ -457,25 +519,85 @@ async fn apply(
         // The worker ran the request but the socket was unusable (Discord not
         // running, or the pipe broke). Reconnect on the next paced attempt.
         Ok(None) => *connected = false,
-        Err(e) => {
-            warn!("discord ipc stalled ({e}); starting a fresh worker");
-            // The abandoned worker is parked on a blocking read we cannot
-            // interrupt; `dispatch` spawns a replacement on the next request.
-            *ipc = None;
-            *connected = false;
-        }
+        // A timed-out call abandons its worker; `on_ipc_failure` spends one slot
+        // of the session budget and `dispatch` spawns the replacement lazily on
+        // the next paced attempt.
+        Err(failure) => on_ipc_failure(ipc, connected, stalls, failure),
     }
     true
 }
 
+/// Fold a failed dispatch into the event loop's state and the abandonment budget.
+///
+/// The worker is always dropped here: a stalled one is parked on a blocking read
+/// and cannot be reused, and a gone one has nothing to reuse. Only a stall spends
+/// a replacement (see [`Abandonments::record`]); the "unavailable until restart"
+/// line is logged exactly once, when the cap is reached, after which [`apply`]
+/// stops dispatching entirely.
+fn on_ipc_failure(
+    ipc: &mut Option<IpcWorker>,
+    connected: &mut bool,
+    stalls: &mut Abandonments,
+    failure: IpcFailure,
+) {
+    *ipc = None;
+    *connected = false;
+    let stalled = failure.is_stalled();
+    if !stalls.record(stalled) {
+        warn!(
+            "discord ipc stalled {} times; Discord presence is unavailable until restart",
+            MAX_ABANDONED_WORKERS
+        );
+    } else if stalled {
+        warn!(
+            "discord ipc stalled ({}); the next update starts a fresh worker",
+            failure.message()
+        );
+    } else {
+        warn!(
+            "discord ipc worker unavailable ({}); retrying on a later update",
+            failure.message()
+        );
+    }
+}
+
 /// Run one request on the worker, spawning a replacement first if the previous
-/// one was abandoned.
+/// one was abandoned. Spawning is lazy because a replacement is only needed once
+/// there is a request to run (and the loop paces those).
 async fn dispatch(
     ipc: &mut Option<IpcWorker>,
     req: IpcRequest,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, IpcFailure> {
     let worker = ipc.get_or_insert_with(IpcWorker::spawn);
     worker.call(req).await
+}
+
+/// Why a dispatch produced no reply from its worker.
+///
+/// The distinction decides whether the session's abandonment budget is spent: a
+/// timed-out call leaves its worker parked on a blocking socket read (one leaked
+/// thread + socket), while a worker that is already gone leaked nothing and can
+/// simply be respawned on a later update.
+enum IpcFailure {
+    /// The call reached a worker that did not answer within [`IPC_TIMEOUT`]; the
+    /// worker must be abandoned.
+    Stalled(String),
+    /// The worker thread was never spawned, has exited, or dropped the request.
+    Gone(String),
+}
+
+impl IpcFailure {
+    /// Whether this failure abandons a worker that is still parked on a read.
+    fn is_stalled(&self) -> bool {
+        matches!(self, Self::Stalled(_))
+    }
+
+    /// The human-readable cause, for the worker log line.
+    fn message(&self) -> &str {
+        match self {
+            Self::Stalled(message) | Self::Gone(message) => message,
+        }
+    }
 }
 
 /// One socket operation for the IPC worker. Carries its own reply channel so the
@@ -494,18 +616,24 @@ enum IpcRequest {
 /// Owns the IPC socket on its own thread and answers requests.
 ///
 /// The IPC client is not `Send` on every platform (it holds a `File` on Windows)
-/// and its reads block with no timeout of their own, so it cannot live in
+/// and its reads can outlive any caller-side deadline, so it cannot live in
 /// `spawn_blocking` and an async timeout cannot interrupt it from the loop's
 /// thread. Isolating it here is what keeps the event loop responsive: a wedged
 /// socket stalls only this worker, not command coalescing, the heartbeat, or the
 /// command channel.
 ///
-/// Each request is answered or times out within [`IPC_TIMEOUT`]. A worker that
-/// misses that deadline is **abandoned** rather than awaited — its thread stays
-/// parked on the blocking read (there is no way to interrupt it safely: closing
-/// the handle underneath a read is the one thing that would be worse than a
-/// leak), so `IpcWorker::call` drops it and the next call spawns a fresh worker
-/// with a fresh socket. That bounds the leak to one parked thread per stall.
+/// Each request is answered or hits [`IPC_TIMEOUT`]. A worker that misses that
+/// deadline is **abandoned** rather than awaited — its thread may stay parked on
+/// the blocking read (there is no safe way to interrupt it: closing the handle
+/// underneath a read is the one thing that would be worse than a leak), so
+/// `IpcWorker::call` drops it and the next call spawns a fresh worker with a
+/// fresh socket. On Unix the transport's own 250 ms socket timeout normally makes
+/// a stalled read return as an I/O error first, so the worker closes its socket
+/// and keeps serving requests instead of being abandoned; abandonment is the
+/// Windows-pipe and slow-drip backstop. Because a peer that stalls every
+/// replacement would otherwise leak one parked thread + socket per attempt,
+/// abandonment is capped per session by [`MAX_ABANDONED_WORKERS`]: after that the
+/// loop stops spawning replacements and Discord presence stays off until restart.
 struct IpcWorker {
     tx: UnboundedSender<(
         IpcRequest,
@@ -532,18 +660,20 @@ impl IpcWorker {
     }
 
     /// Run one request, bounded by [`IPC_TIMEOUT`].
-    async fn call(&self, req: IpcRequest) -> Result<Option<serde_json::Value>, String> {
+    async fn call(&self, req: IpcRequest) -> Result<Option<serde_json::Value>, IpcFailure> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send((req, reply_tx))
-            .map_err(|_| "discord ipc worker is gone".to_owned())?;
+            .map_err(|_| IpcFailure::Gone("the worker thread is gone".to_owned()))?;
         match tokio::time::timeout(IPC_TIMEOUT, reply_rx).await {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => Err("discord ipc worker dropped the request".to_owned()),
-            Err(_) => Err(format!(
-                "discord ipc timed out after {}ms",
-                IPC_TIMEOUT.as_millis()
+            Ok(Err(_)) => Err(IpcFailure::Gone(
+                "the worker dropped the request".to_owned(),
             )),
+            Err(_) => Err(IpcFailure::Stalled(format!(
+                "timed out after {}ms",
+                IPC_TIMEOUT.as_millis()
+            ))),
         }
     }
 }
@@ -655,8 +785,8 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        anchor, build_activity, fold, push_due, unix_millis, DiscordCmd, Now, HEARTBEAT,
-        MIN_INTERVAL,
+        anchor, build_activity, fold, push_due, unix_millis, Abandonments, DiscordCmd, Now,
+        HEARTBEAT, MAX_ABANDONED_WORKERS, MIN_INTERVAL,
     };
     use rift_types::PlaybackState;
 
@@ -700,6 +830,57 @@ mod tests {
         assert!(
             push_due(Some(HEARTBEAT), false),
             "an idle heartbeat re-asserts the presence"
+        );
+    }
+
+    /// The bounded fallback for a socket read that cannot be interrupted: only an
+    /// abandoned worker spends one of the session's replacements, a call that
+    /// returned normally spends nothing, and once the cap is reached no
+    /// replacement is spawned (so a hung or forged `discord-ipc-N` peer cannot
+    /// leak one parked thread + socket per attempt for the rest of the session).
+    #[test]
+    fn stalled_ipc_workers_are_abandoned_only_up_to_the_cap() {
+        let mut stalls = Abandonments::default();
+
+        // A reply — or a clean "socket unusable" `None` — lets the worker retire
+        // on its own, so neither may consume the abandonment budget.
+        for _ in 0..16 {
+            assert!(
+                stalls.record(false),
+                "an answered call must never exhaust the budget"
+            );
+        }
+        assert_eq!(stalls.abandoned, 0, "successes must not spend the budget");
+        assert!(stalls.may_spawn());
+
+        // Each abandoned worker is counted, and replacements stay allowed while
+        // under the cap. Guard the loop against a cap that was removed or raised
+        // to a huge value so the test fails fast instead of iterating forever.
+        assert!(
+            (1..=16).contains(&MAX_ABANDONED_WORKERS),
+            "the abandonment cap must stay small, not {MAX_ABANDONED_WORKERS}"
+        );
+        for expected in 1..MAX_ABANDONED_WORKERS {
+            assert!(
+                stalls.record(true),
+                "replacement {expected} is allowed while under the cap"
+            );
+            assert_eq!(stalls.abandoned, expected, "each abandonment is counted");
+        }
+        // The cap-th abandonment is the last one: that worker had already been
+        // spawned, but no replacement may follow it.
+        assert!(
+            !stalls.record(true),
+            "the cap must stop replacements after {MAX_ABANDONED_WORKERS} abandoned workers"
+        );
+        assert_eq!(stalls.abandoned, MAX_ABANDONED_WORKERS);
+        assert!(
+            !stalls.may_spawn(),
+            "no worker may be spawned after the cap"
+        );
+        assert!(
+            !stalls.record(false),
+            "a spent budget is not refunded by a later answered call"
         );
     }
 

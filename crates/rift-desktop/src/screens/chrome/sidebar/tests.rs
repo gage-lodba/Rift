@@ -253,6 +253,86 @@ fn sidebar_new_playlist_inline_input_creates() {
         .any(|a| matches!(a, Action::ClosePlaylistEditor)));
 }
 
+/// Clicking empty space must close an inline editor and the next frame must not
+/// re-grab focus. Regression: `focused_id() == None` used to mean "request the
+/// field's focus again", so clicking away kept the editor open forever.
+#[test]
+fn sidebar_inline_editor_closes_on_empty_click_without_regrabbing_focus() {
+    let _guard = lock_for_flows();
+    let mut ui = Ui::new();
+    let mut state = base_state();
+    let mut actions = Vec::new();
+    state.new_playlist = Some("My Mix".into());
+    let input_id = Id::from_str("sidebar/new-playlist-input");
+    let new_row_y = playlist_row_y(3);
+
+    // Opening frame: the editor autofocuses (one-shot).
+    frame(
+        &mut ui,
+        &mut state,
+        &mut actions,
+        input_at((100.0, new_row_y + 19.0), 1.0),
+    );
+    assert!(ui.is_focused(input_id), "the editor autofocuses on open");
+
+    // Click empty space in the main content: the press frame blurs the field in
+    // `Ui::end_frame`, so the release frame notices and closes the editor.
+    actions.clear();
+    let empty = (800.0, 600.0);
+    press_release(&mut ui, &mut state, &mut actions, empty, 2.0);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::ClosePlaylistEditor)),
+        "clicking empty space closes the new-playlist editor: {actions:?}"
+    );
+    assert_ne!(
+        ui.focused_id(),
+        Some(input_id),
+        "the click-away blurs the field"
+    );
+
+    // Even if the app has not applied ClosePlaylistEditor yet, the next frame
+    // must stay blurred instead of focusing the field again.
+    actions.clear();
+    frame(&mut ui, &mut state, &mut actions, input_at(empty, 2.2));
+    assert_ne!(
+        ui.focused_id(),
+        Some(input_id),
+        "a closed editor must not re-focus itself"
+    );
+}
+
+/// The import editor uses the same focus bookkeeping: clicking empty space
+/// clears its UI-local draft on the frame after the blur.
+#[test]
+fn sidebar_import_inline_editor_closes_on_empty_click() {
+    let _guard = lock_for_flows();
+    let mut ui = Ui::new();
+    let mut state = base_state();
+    let mut actions = Vec::new();
+    state.import_playlist = Some(String::new());
+    let (import_y, ..) = sidebar_pinned_rows(SIDEBAR_RECT);
+
+    frame(
+        &mut ui,
+        &mut state,
+        &mut actions,
+        input_at((100.0, import_y + 19.0), 1.0),
+    );
+    assert!(
+        ui.is_focused(Id::from_str("sidebar/import-input")),
+        "the import box autofocuses on open"
+    );
+
+    actions.clear();
+    press_release(&mut ui, &mut state, &mut actions, (800.0, 600.0), 2.0);
+    assert!(
+        state.import_playlist.is_none(),
+        "clicking empty space closes the import editor"
+    );
+}
+
 /// The new-playlist editor's confirm/cancel buttons must be separate hit
 /// targets (they used to overlap: confirm at right-34, cancel at right-28)
 /// and clicking either must work. The editor also must stay open while a

@@ -3,8 +3,9 @@
 //!
 //! Transfers go through the native streaming downloader
 //! ([`crate::stream::fetch_to_path`]), which writes the caller's temporary
-//! `.part` file; the worker publishes it by rename and emits throttled progress
-//! snapshots (`docs/native-streaming.md` §3.2–3.4).
+//! `.part` file; the worker publishes it by rename, emits throttled lightweight
+//! progress events, and emits a whole [`DownloadState`] snapshot on each
+//! lifecycle transition (`docs/native-streaming.md` §3.2–3.4).
 
 use std::sync::Arc;
 
@@ -43,13 +44,15 @@ fn emit_downloads(backend: &BackendInner, state: &DownloadState) {
     backend.emit(BackendEvent::Downloads(state.clone()));
 }
 
-/// Minimum gap between the progress snapshots the download worker emits for one
+/// Minimum gap between the progress updates the download worker emits for one
 /// active track.
 ///
-/// The UI redraws from whole `Downloads` snapshots; 100 ms keeps a 3 px bar
-/// smooth without flooding the event bus with one snapshot per network chunk
-/// (`docs/native-streaming.md` §3.4). The transition snapshots (`begin`,
-/// `finish`, and a failed pass) are still emitted immediately by the caller.
+/// The UI updates one fraction from each lightweight
+/// [`BackendEvent::DownloadProgress`]; 100 ms keeps a 3 px bar smooth without
+/// flooding the event bus with one event per network chunk
+/// (`docs/native-streaming.md` §3.4). Whole `Downloads` snapshots are reserved
+/// for lifecycle transitions (`begin`, `finish`, `fail`, `remove`), which the
+/// caller still emits immediately.
 const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Whether a progress snapshot is due at `now`: the first callback always emits
@@ -62,60 +65,224 @@ fn progress_emit_due(last_emit: Option<std::time::Instant>, now: std::time::Inst
     last_emit.is_none_or(|at| now.saturating_duration_since(at) >= PROGRESS_EMIT_INTERVAL)
 }
 
-/// Download one track into its final `<id>.m4a` path with the native streaming
-/// downloader, emitting throttled [`BackendEvent::Downloads`] snapshots as bytes
-/// arrive.
+/// What one track's transfer did.
 ///
-/// On success the completed `.part` file is renamed into place and the track is
-/// marked finished. On any failure the `.part` file is removed and the
-/// user-facing failure message is returned; the caller records the failure, and
-/// its lifecycle transition clears the track's progress fraction.
+/// `Canceled` is a normal outcome, not a failure: the user removed the download
+/// while it was in flight, so the completed `.part` is discarded and the batch
+/// moves on without a "downloaded" mark and without a misleading error toast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadOutcome {
+    /// The file is in place and the store records the track as downloaded.
+    Published,
+    /// The user removed the download mid-transfer; nothing was published and
+    /// the store's tombstone keeps the stale transition out.
+    Canceled,
+}
+
+/// Collects the one-off failures of a single download pass so the pass can
+/// surface one notice instead of one toast per track.
+///
+/// "One-off" means a failed track that is not a kept-offline playlist's
+/// responsibility: its row is marked `failed` for a manual retry, but there is
+/// no automatic retry to keep quiet about. The collector is bounded on purpose:
+/// it keeps the failure count and only the first (representative) reason, not a
+/// per-track error list a large batch could grow without bound.
+#[derive(Debug, Default)]
+struct OneOffFailures {
+    count: usize,
+    first: Option<String>,
+}
+
+impl OneOffFailures {
+    /// Record one failed track's user-facing reason, keeping the first.
+    fn record(&mut self, reason: String) {
+        if self.first.is_none() {
+            self.first = Some(reason);
+        }
+        self.count = self.count.saturating_add(1);
+    }
+
+    /// The single notice for the pass, or `None` when nothing failed.
+    ///
+    /// Exactly one failure keeps its own specific message — coalescing it into
+    /// a vague count would hide the only reason the user has. Several failures
+    /// become one summary with the count and the first reason; the per-track
+    /// `failed` marks (not this notice) are what offer the retries.
+    fn notice(&self) -> Option<String> {
+        let first = self.first.as_deref()?;
+        if self.count == 1 {
+            return Some(first.to_owned());
+        }
+        Some(format!(
+            "Couldn\u{2019}t download {} tracks. First failure: {first}",
+            self.count
+        ))
+    }
+}
+
+/// Publish a transfer's completed `.part` file as `<safe_stem>.m4a`, unless the
+/// user removed the download while it was running.
+///
+/// The transfer itself cannot be interrupted (it owns the open `.part` file), so
+/// cancellation is enforced at the publication boundary: the tombstone is
+/// re-checked immediately before the rename, a canceled transfer's part is
+/// deleted instead of published, and a `remove` that lands between the check and
+/// the rename is caught by a second check which deletes what was just renamed.
+/// Split out from [`download_track`] so this final decision is unit-testable
+/// without a network transfer.
+async fn publish_part(
+    downloads: &Downloads,
+    track: &Track,
+    attempt: u64,
+    part: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<DownloadOutcome, String> {
+    // Canceled *or* superseded by a retry (the user removed and re-downloaded):
+    // the retry has its own part path and claim token, so this worker must
+    // neither publish its bytes nor touch the retry's state.
+    if downloads.is_canceled(&track.id) || !downloads.is_current_attempt(&track.id, attempt) {
+        let _ = tokio::fs::remove_file(part).await;
+        return Ok(DownloadOutcome::Canceled);
+    }
+    // A capped id's name cannot be decoded, so record its stem in the name index
+    // *before* publishing: a crash between the two leaves a file the next load
+    // cannot map, whereas a stale index entry for a file that never appeared is
+    // pruned harmlessly. A normal (decodable) stem needs no entry.
+    if !downloads.record_name(&track.id) {
+        let _ = tokio::fs::remove_file(part).await;
+        return Err(format!(
+            "Could not save \u{201c}{}\u{201d}: the offline file name index could not be written",
+            track.title
+        ));
+    }
+    // Never replace a non-empty offline file. The job only starts when
+    // `is_downloaded` is false, so a file here is either a pre-P5 name that
+    // differs only by case on a case-insensitive filesystem (a different track's
+    // audio) or a copy whose index was lost. Replacing it would destroy audio
+    // Rift cannot reconstruct; failing leaves the row retryable and the file
+    // intact (an explicit remove deletes it first).
+    if tokio::fs::metadata(dest)
+        .await
+        .is_ok_and(|meta| meta.len() > 0)
+    {
+        let _ = tokio::fs::remove_file(part).await;
+        return Err(format!(
+            "Could not save \u{201c}{}\u{201d}: an offline file with that name already exists",
+            track.title
+        ));
+    }
+    // A pre-P5 file under a different name is the same download. The store's
+    // `is_downloaded` already skips it, but a publish that still reached this
+    // point must not create a second copy under the current name: after an
+    // upgrade that would leave two files for one id and make `remove` ambiguous.
+    if let Some(legacy) = downloads.legacy_path(&track.id) {
+        if !downloads.legacy_owned_elsewhere(&track.id)
+            && tokio::fs::metadata(&legacy)
+                .await
+                .is_ok_and(|meta| meta.len() > 0)
+        {
+            // This id's own pre-P5 copy is the offline file; publishing a second
+            // name would make `remove` ambiguous. A `_` stem owned by a
+            // *different* id is that track's audio, not this id's copy, so it
+            // must not block this download.
+            let _ = tokio::fs::remove_file(part).await;
+            return Err(format!(
+                "Could not save \u{201c}{}\u{201d}: an offline copy already exists under its previous name",
+                track.title
+            ));
+        }
+    }
+    match tokio::fs::rename(part, dest).await {
+        Ok(()) => {
+            // `remove` may have run between the check above and the rename (it
+            // could only delete a final file that did not exist yet). If its
+            // tombstone appeared, delete what this publish just created rather
+            // than leaving an unlisted `<safe_stem>.m4a` for the startup scan to trust.
+            if downloads.is_canceled(&track.id) || !downloads.is_current_attempt(&track.id, attempt)
+            {
+                let _ = tokio::fs::remove_file(dest).await;
+                return Ok(DownloadOutcome::Canceled);
+            }
+            downloads.finish_attempt(&track.id, attempt);
+            Ok(DownloadOutcome::Published)
+        }
+        Err(e) => {
+            // A failed rename can leave the `.part` behind; remove it now rather
+            // than leaving scratch for the next launch's scan to clear.
+            let _ = tokio::fs::remove_file(part).await;
+            // `remove` may have deleted the part between the check above and the
+            // rename; that is a cancellation, not a save failure to report.
+            if downloads.is_canceled(&track.id) {
+                return Ok(DownloadOutcome::Canceled);
+            }
+            Err(format!(
+                "Could not save \u{201c}{}\u{201d}: {e}",
+                track.title
+            ))
+        }
+    }
+}
+
+/// Download one track into its final `<safe_stem>.m4a` path with the native streaming
+/// downloader, emitting throttled [`BackendEvent::DownloadProgress`] events as
+/// bytes arrive.
+///
+/// On success the completed `.part` file is published by [`publish_part`] and
+/// the track is marked finished. On any failure the `.part` file is removed and
+/// the user-facing failure message is returned; the caller records the failure,
+/// and its lifecycle transition clears the track's progress fraction. A
+/// cancellation (`remove` during the transfer) is an `Ok(Canceled)`: the batch
+/// continues and no error is surfaced.
 async fn download_track(
     backend: &BackendInner,
     downloads: &Downloads,
     track: &Track,
-) -> Result<(), String> {
+    attempt: u64,
+) -> Result<DownloadOutcome, String> {
     let dest = downloads.path(&track.id);
     // Temp file + rename: a crash mid-write must not leave a truncated .m4a,
     // which the next launch's directory scan would treat as a valid offline
     // copy. The downloader writes this part path directly and never renames it.
-    let part = dest.with_extension("m4a.part");
+    // The attempt token in the name gives each claim its own scratch file, so a
+    // worker abandoned by `remove` can never rename a retry's mid-write bytes.
+    let part = downloads.part_path_for(&track.id, attempt);
 
     // Only the active track has a progress entry: `begin` cleared every entry
     // for this batch, and `finish`/`fail`/`mark_failed` clear it when the
     // transfer ends.
     let mut last_emit: Option<std::time::Instant> = None;
     let mut progress = |received: u64, total: u64| {
-        downloads.set_progress(&track.id, received, total);
-        // Emit the first callback immediately (the bar appears at its known
+        // `None` means the transfer is not (or no longer) claimable, or the
+        // length is unknown: no fraction to publish, and never a stale one.
+        let Some(permille) = downloads.set_progress_attempt(&track.id, attempt, received, total)
+        else {
+            return;
+        };
+        // Emit the first update immediately (the bar appears at its known
         // start fraction) and then at most every `PROGRESS_EMIT_INTERVAL`.
         let now = std::time::Instant::now();
         if progress_emit_due(last_emit, now) {
             last_emit = Some(now);
-            emit_downloads(backend, &downloads.state());
+            // One id + one fraction: this deliberately avoids cloning the
+            // downloaded/downloading/failed sets on every network chunk.
+            backend.emit(BackendEvent::DownloadProgress {
+                id: track.id.clone(),
+                permille,
+            });
         }
     };
     match crate::stream::fetch_to_path(&track.id, &part, &mut progress).await {
-        Ok(()) => match tokio::fs::rename(&part, &dest).await {
-            Ok(()) => {
-                downloads.finish(&track.id);
-                Ok(())
-            }
-            Err(e) => {
-                // A failed rename can leave the `.part` behind; remove it now
-                // rather than leaving scratch for the next launch's directory
-                // scan to clear.
-                let _ = tokio::fs::remove_file(&part).await;
-                Err(format!(
-                    "Could not save \u{201c}{}\u{201d}: {e}",
-                    track.title
-                ))
-            }
-        },
+        Ok(()) => publish_part(downloads, track, attempt, &part, &dest).await,
         Err(error) => {
             // Never leave a partial transfer behind: a retry writes the same
             // part path from scratch.
             let _ = tokio::fs::remove_file(&part).await;
+            // A cancellation can also surface here: `remove` deleted the open
+            // part file (or the transfer aborted while it was being deleted), so
+            // the expected outcome is a silent cancel, not a download error.
+            if downloads.is_canceled(&track.id) {
+                return Ok(DownloadOutcome::Canceled);
+            }
             Err(format!(
                 "Could not download \u{201c}{}\u{201d}: {error:#}",
                 track.title
@@ -285,9 +452,16 @@ fn start_downloads_attempt(backend: &Arc<BackendInner>, tracks: Vec<Track>, atte
     let downloads = Arc::clone(&backend.downloads);
     // `begin` atomically claims each id and returns false if one was already in
     // flight, so concurrent or repeated calls never fetch the same track twice.
-    let pending: Vec<Track> = tracks
+    let pending: Vec<(Track, u64)> = tracks
         .into_iter()
-        .filter(|t| !downloads.is_downloaded(&t.id) && downloads.begin(&t.id))
+        .filter_map(|t| {
+            if downloads.is_downloaded(&t.id) || !downloads.begin(&t.id) {
+                return None;
+            }
+            // The token identifies this claim: a later remove/retry invalidates
+            // it so this worker's progress and publish become no-ops.
+            downloads.claim_token(&t.id).map(|token| (t, token))
+        })
         .collect();
     if pending.is_empty() {
         return;
@@ -298,26 +472,39 @@ fn start_downloads_attempt(backend: &Arc<BackendInner>, tracks: Vec<Track>, atte
     let task_backend = Arc::clone(backend);
     runtime.spawn(async move {
         let backend = task_backend;
-        let batch = pending.clone();
+        let batch: Vec<Track> = pending.iter().map(|(track, _)| track.clone()).collect();
         let mut failed: Vec<Track> = Vec::new();
-        for track in pending {
-            let err = download_track(&backend, &downloads, &track).await.err();
-            if let Some(msg) = err {
+        // One-off failures are collected across the whole pass and toasted once
+        // at the end; the per-track `mark_failed` below is what offers a retry.
+        let mut one_off_failures = OneOffFailures::default();
+        for (track, attempt) in pending {
+            // A canceled track is a normal outcome: nothing to record, nothing
+            // to toast, and the rest of the batch keeps downloading.
+            if let Err(msg) = download_track(&backend, &downloads, &track, attempt).await {
                 warn!("download failed for {}: {msg}", track.id);
                 // A track a kept-offline playlist depends on gets requeued; one
                 // coalesced notice is emitted after the pass (per-track toasts
                 // would flood a large playlist). The retries stay quiet.
                 if kept_offline(&backend, &track.id, &batch) {
-                    downloads.fail(&track.id);
+                    downloads.fail_attempt(&track.id, attempt);
                     failed.push(track);
                 } else {
                     // A one-off download that failed: surface it as failed so the
-                    // row offers a retry, and toast the reason.
-                    downloads.mark_failed(&track.id);
-                    backend.emit(BackendEvent::Error(msg));
+                    // row offers a retry, and remember the reason for the one
+                    // summary notice emitted after the batch.
+                    downloads.mark_failed_attempt(&track.id, attempt);
+                    one_off_failures.record(msg);
                 }
             }
             emit_downloads(&backend, &downloads.state());
+        }
+
+        // One notice per pass, not per failed track. A single failure keeps its
+        // exact reason; several are summarized with the first reason. A mixed
+        // pass can still emit this plus the kept-offline retry notice below:
+        // they describe different classes of failure and different remedies.
+        if let Some(notice) = one_off_failures.notice() {
+            backend.emit(BackendEvent::Error(notice));
         }
 
         if failed.is_empty() {
@@ -405,17 +592,17 @@ fn start_downloads_attempt(backend: &Arc<BackendInner>, tracks: Vec<Track>, atte
 mod tests {
     use super::{
         partition_and_release, partition_retryable, playlist_kept_offline, progress_emit_due,
-        PROGRESS_EMIT_INTERVAL,
+        publish_part, DownloadOutcome, OneOffFailures, PROGRESS_EMIT_INTERVAL,
     };
     use crate::downloads::Downloads;
     use rift_types::{Playlist, Track};
 
-    /// The UI redraws from whole snapshots, so the worker must emit the first
-    /// progress callback immediately and then throttle to one snapshot per
-    /// 100 ms — not one per network chunk. Pure instants keep the test
-    /// deterministic.
+    /// The UI redraws a single fraction from lightweight progress events, so
+    /// the worker must emit the first callback immediately and then throttle to
+    /// one event per 100 ms — not one per network chunk. Pure instants keep the
+    /// test deterministic.
     #[test]
-    fn progress_snapshots_are_emitted_immediately_then_throttled() {
+    fn progress_updates_are_emitted_immediately_then_throttled() {
         let start = std::time::Instant::now();
         assert!(
             progress_emit_due(None, start),
@@ -442,6 +629,273 @@ mod tests {
         );
     }
 
+    /// The publication boundary is where a removal wins. A transfer can finish
+    /// its bytes after `remove` ran (the worker cannot be interrupted once
+    /// `stream::fetch_to_path` owns the part file); publishing it anyway would
+    /// recreate a file the user deleted and a "downloaded" row they dismissed.
+    #[tokio::test]
+    async fn a_remove_during_the_transfer_discards_the_completed_part() {
+        let dir = crate::util::testing::TempDir::new("remove-during-transfer");
+        let downloads = Downloads::load(dir.path().to_path_buf());
+        let t = track("a");
+        let dest = downloads.path(&t.id);
+        let part = downloads.part_path(&t.id);
+
+        assert!(downloads.begin(&t.id));
+        let attempt = downloads.claim_token(&t.id).expect("the claim has a token");
+        std::fs::write(&part, b"complete audio").expect("write the in-flight part");
+        // The user removes the row while the transfer is still running.
+        assert!(downloads.remove(&t.id));
+        assert!(!part.exists(), "remove cleans the in-flight part");
+        // The worker's transfer finishes regardless (remove only unlinked the
+        // file; the open handle kept writing on Unix) and reaches publication.
+        std::fs::write(&part, b"complete audio").expect("the transfer rewrote the part");
+
+        let outcome = publish_part(&downloads, &t, attempt, &part, &dest)
+            .await
+            .expect("a cancellation is not a save error");
+        assert_eq!(outcome, DownloadOutcome::Canceled);
+        assert!(
+            !dest.exists(),
+            "a canceled transfer must not be published under the track's stem"
+        );
+        assert!(!part.exists(), "the canceled transfer's part is removed");
+        let state = downloads.state();
+        assert!(
+            !state.downloaded.contains("a"),
+            "the tombstone keeps a stale finish out of the snapshot"
+        );
+        assert!(!state.downloading.contains("a"));
+        assert!(!state.progress.contains_key("a"));
+        assert!(downloads.is_canceled("a"));
+    }
+
+    /// Regression for the remove-then-retry race: the abandoned worker and the
+    /// retry must never share a `.part` path, and the stale worker must not be
+    /// able to publish (or mark finished) over the retry's transfer. Before the
+    /// per-claim token/part path, the stale worker could rename the retry's
+    /// partially written file as a complete download.
+    #[tokio::test]
+    async fn a_stale_worker_cannot_publish_over_a_retry() {
+        let dir = crate::util::testing::TempDir::new("stale-publish");
+        let downloads = Downloads::load(dir.path().to_path_buf());
+        let t = track("a");
+        let dest = downloads.path(&t.id);
+
+        assert!(downloads.begin(&t.id));
+        let first = downloads.claim_token(&t.id).expect("first token");
+        let first_part = downloads.part_path_for(&t.id, first);
+        std::fs::write(&first_part, b"first attempt").expect("write the first part");
+
+        // The user removes and immediately re-downloads the same id.
+        assert!(downloads.remove(&t.id));
+        assert!(downloads.begin(&t.id));
+        let second = downloads.claim_token(&t.id).expect("retry token");
+        assert_ne!(first, second, "a retry must get a fresh claim token");
+        assert!(
+            !downloads.is_current_attempt(&t.id, first),
+            "the abandoned worker's token is dead"
+        );
+        let retry_part = downloads.part_path_for(&t.id, second);
+        assert_ne!(
+            first_part, retry_part,
+            "attempts must not share one .part path"
+        );
+        std::fs::write(&retry_part, b"retry partial").expect("write the retry part");
+
+        // The stale worker reaches publication after the retry started writing.
+        let outcome = publish_part(&downloads, &t, first, &first_part, &dest)
+            .await
+            .expect("a superseded publish is a cancellation, not an error");
+        assert_eq!(outcome, DownloadOutcome::Canceled);
+        assert!(!dest.exists(), "stale bytes must not be published");
+        assert_eq!(
+            std::fs::read(&retry_part).expect("the retry part is untouched"),
+            b"retry partial",
+            "the stale worker must not delete or truncate the retry's part"
+        );
+        assert!(
+            downloads.state().downloading.contains("a"),
+            "the retry is still in flight"
+        );
+
+        // The retry publishes normally afterwards.
+        let outcome = publish_part(&downloads, &t, second, &retry_part, &dest)
+            .await
+            .expect("the retry publishes");
+        assert_eq!(outcome, DownloadOutcome::Published);
+        assert_eq!(
+            std::fs::read(&dest).expect("read the file"),
+            b"retry partial"
+        );
+        assert!(!retry_part.exists());
+        assert!(downloads.is_downloaded("a"));
+    }
+
+    /// The normal path stays intact: a completed part is renamed into place and
+    /// recorded as downloaded (the transfer itself is only covered live, but the
+    /// publish half runs here against a real file and a real store).
+    #[tokio::test]
+    async fn a_completed_part_is_published_and_recorded() {
+        let dir = crate::util::testing::TempDir::new("publish-part");
+        let downloads = Downloads::load(dir.path().to_path_buf());
+        let t = track("a");
+        let dest = downloads.path(&t.id);
+        let part = downloads.part_path(&t.id);
+
+        assert!(downloads.begin(&t.id));
+        let attempt = downloads.claim_token(&t.id).expect("the claim has a token");
+        downloads.set_progress(&t.id, 900, 1000);
+        std::fs::write(&part, b"complete audio").expect("write the completed part");
+
+        let outcome = publish_part(&downloads, &t, attempt, &part, &dest)
+            .await
+            .expect("publishing a completed part succeeds");
+        assert_eq!(outcome, DownloadOutcome::Published);
+        assert_eq!(
+            std::fs::read(&dest).expect("read the published file"),
+            b"complete audio"
+        );
+        assert!(!part.exists(), "the part is moved, not copied");
+        assert!(downloads.is_downloaded("a"));
+        assert!(!downloads.is_downloading("a"));
+        assert!(downloads.state().progress.is_empty());
+    }
+
+    /// A capped id's filename cannot be decoded, so the publish boundary must
+    /// put it in the name index *before* the rename; otherwise the next startup
+    /// would see the file but be unable to map it back to the id.
+    #[tokio::test]
+    async fn publishing_a_capped_id_records_the_name_index_for_the_next_load() {
+        let dir = crate::util::testing::TempDir::new("publish-capped-index");
+        let downloads = Downloads::load(dir.path().to_path_buf());
+        let id = "z".repeat(400);
+        let t = track(&id);
+        let dest = downloads.path(&t.id);
+        let part = downloads.part_path(&t.id);
+
+        assert!(downloads.begin(&t.id));
+        let attempt = downloads.claim_token(&t.id).expect("the claim has a token");
+        std::fs::write(&part, b"complete audio").expect("write the completed part");
+
+        let outcome = publish_part(&downloads, &t, attempt, &part, &dest)
+            .await
+            .expect("publishing a capped name succeeds");
+        assert_eq!(outcome, DownloadOutcome::Published);
+        assert!(dir.path().join(".names.json").exists());
+
+        let reloaded = Downloads::load(dir.path().to_path_buf());
+        assert!(reloaded.is_downloaded(&id));
+        assert!(reloaded.path(&id).exists());
+    }
+
+    /// A pre-P5 file under the old name *is* the offline copy. Publishing a
+    /// second file under the current name would leave two files for one id, so
+    /// the publication boundary refuses and keeps the legacy copy untouched.
+    #[tokio::test]
+    async fn publishing_refuses_to_create_a_second_name_for_a_legacy_copy() {
+        let dir = crate::util::testing::TempDir::new("publish-legacy-exists");
+        let downloads = Downloads::load(dir.path().to_path_buf());
+        let id = "dQw4w9WgXcQ";
+        let t = track(id);
+        let legacy = downloads
+            .legacy_path(id)
+            .expect("the old name differs from the current one");
+        std::fs::write(&legacy, b"legacy audio").expect("write the legacy copy");
+        let dest = downloads.path(id);
+        let part = downloads.part_path(id);
+        std::fs::write(&part, b"new audio").expect("write the completed part");
+        assert!(downloads.begin(id));
+        let attempt = downloads.claim_token(id).expect("the claim has a token");
+
+        let error = publish_part(&downloads, &t, attempt, &part, &dest)
+            .await
+            .expect_err("a legacy copy must not be duplicated");
+        assert!(
+            error.contains("previous name"),
+            "the error names the existing copy: {error}"
+        );
+        assert!(!dest.exists(), "no second file is published");
+        assert_eq!(
+            std::fs::read(&legacy).expect("read the legacy copy"),
+            b"legacy audio"
+        );
+        assert!(!part.exists(), "the refused transfer's scratch is removed");
+    }
+
+    /// A `_` stem owned by a *different* id is not this id's legacy copy. A
+    /// download must not be refused (forever) just because another track's owned
+    /// file shares this id's pre-P5 fold.
+    #[tokio::test]
+    async fn an_owned_legacy_name_for_another_id_does_not_block_a_download() {
+        let dir = crate::util::testing::TempDir::new("publish-owned-legacy");
+        let downloads = Downloads::load(dir.path().to_path_buf());
+        // `a_b` owns its own `_` stem (recorded in the name index).
+        assert!(downloads.record_name("a_b"));
+        let other = downloads.path("a_b");
+        std::fs::write(&other, b"other track audio").expect("write the other track's file");
+
+        let id = "a/b";
+        let t = track(id);
+        let dest = downloads.path(id);
+        let legacy = downloads.legacy_path(id).expect("old name differs");
+        assert_eq!(legacy, other, "the fold of a/b is a_b");
+        let part = downloads.part_path(id);
+        std::fs::write(&part, b"new audio").expect("write the completed part");
+        assert!(downloads.begin(id));
+        let attempt = downloads.claim_token(id).expect("the claim has a token");
+
+        let outcome = publish_part(&downloads, &t, attempt, &part, &dest)
+            .await
+            .expect("another id's owned file must not block this publish");
+        assert_eq!(outcome, DownloadOutcome::Published);
+        assert_eq!(
+            std::fs::read(&dest).expect("read the new file"),
+            b"new audio"
+        );
+        assert_eq!(
+            std::fs::read(&other).expect("the other track's file is untouched"),
+            b"other track audio"
+        );
+    }
+
+    /// A publish must never replace a non-empty offline file it did not create:
+    /// the only way one is present although `is_downloaded` was false is a
+    /// legacy name that differs only by case (another track's audio) or a lost
+    /// index, and replacing it would destroy data Rift cannot fetch back.
+    #[tokio::test]
+    async fn publishing_never_overwrites_an_existing_non_empty_file() {
+        let dir = crate::util::testing::TempDir::new("publish-no-overwrite");
+        let downloads = Downloads::load(dir.path().to_path_buf());
+        let t = track("a");
+        let dest = downloads.path(&t.id);
+        let part = downloads.part_path(&t.id);
+        std::fs::write(&dest, b"existing audio").expect("write the existing copy");
+        std::fs::write(&part, b"new audio").expect("write the completed part");
+        assert!(downloads.begin(&t.id));
+        let attempt = downloads.claim_token(&t.id).expect("the claim has a token");
+
+        let error = publish_part(&downloads, &t, attempt, &part, &dest)
+            .await
+            .expect_err("an existing non-empty file must not be replaced");
+        assert!(
+            error.contains("already exists"),
+            "the error explains the refusal: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&dest).expect("read the existing copy"),
+            b"existing audio"
+        );
+        assert!(
+            !part.exists(),
+            "the failed transfer's scratch file is removed"
+        );
+        assert!(
+            !downloads.is_downloaded(&t.id),
+            "a refused publish must not mark the track downloaded"
+        );
+    }
+
     fn track(id: &str) -> Track {
         Track {
             id: id.into(),
@@ -461,6 +915,50 @@ mod tests {
             name: "pl".into(),
             tracks: ids.iter().map(|i| track(i)).collect(),
         }
+    }
+
+    /// The coalescing rule: exactly one failed one-off track keeps its own
+    /// specific text (a count-only summary would be strictly less useful), and
+    /// zero failures produce no notice at all.
+    #[test]
+    fn a_single_one_off_failure_keeps_its_specific_reason() {
+        let mut failures = OneOffFailures::default();
+        assert_eq!(failures.notice(), None, "a clean pass must not toast");
+
+        failures.record("Could not download \u{201c}A\u{201d}: 403".into());
+        assert_eq!(
+            failures.notice().as_deref(),
+            Some("Could not download \u{201c}A\u{201d}: 403"),
+            "one failure must not be collapsed into a vague summary"
+        );
+    }
+
+    /// Several one-off failures in one pass are one notice: count + the first
+    /// reason. The later per-track reasons are deliberately not retained (the
+    /// per-row `failed` marks are the retry mechanism), which also keeps the
+    /// collector's memory bounded by one message.
+    #[test]
+    fn a_failed_one_off_batch_is_coalesced_into_one_summary() {
+        let mut failures = OneOffFailures::default();
+        failures.record("first reason".into());
+        failures.record("second reason".into());
+        failures.record("third reason".into());
+
+        let notice = failures
+            .notice()
+            .expect("a failed pass produces one summary");
+        assert!(
+            notice.contains('3'),
+            "the summary names the count: {notice}"
+        );
+        assert!(
+            notice.contains("first reason"),
+            "the summary keeps a representative reason: {notice}"
+        );
+        assert!(
+            !notice.contains("second reason") && !notice.contains("third reason"),
+            "later reasons are not accumulated: {notice}"
+        );
     }
 
     #[test]

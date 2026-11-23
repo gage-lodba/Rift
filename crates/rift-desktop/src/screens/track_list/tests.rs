@@ -60,6 +60,37 @@ fn rich_state() -> State {
     state
 }
 
+/// The per-frame acceptance guard for the liked-index cache: rendering the
+/// same unchanged list repeatedly must build the index exactly once, not once
+/// per list per frame. Rendering ten frames is enough to catch a regression
+/// back to `SongIndex::new` in `track_list`.
+#[test]
+fn repeated_frames_reuse_the_liked_index() {
+    let _guard = menu::lock_for_tests();
+    let mut state = rich_state();
+    state.library.liked = vec![track("t1", "One", Some(100)), track("t2", "Two", Some(101))];
+    let tracks = state.library.liked.clone();
+    let rect = Rect::new(100.0, 100.0, 766.0, 108.0);
+    let opts = TrackListOpts {
+        id: "liked-cache-test",
+        ..TrackListOpts::default()
+    };
+    let mut sim = Sim::new();
+    {
+        let mut draw = |ui: &mut Ui, actions: &mut Vec<Action>| {
+            crate::screens::track_list::track_list(ui, &mut state, actions, rect, &tracks, &opts);
+        };
+        for _ in 0..10 {
+            sim.step(&mut draw);
+        }
+    }
+    assert_eq!(
+        state.liked_index_builds(),
+        1,
+        "ten frames over an unchanged library must build the liked index once"
+    );
+}
+
 /// Click the kebab of row 0 through the real list renderer and assert the
 /// track menu opens for that track.
 #[test]

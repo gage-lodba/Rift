@@ -117,6 +117,9 @@ fn atlas_produces_upload_once_and_uvs_are_sane() {
         assert!(g.x.is_finite() && g.y.is_finite());
     }
     let upload = f.take_atlas_update(ATLAS_TEXTURE_ID).expect("dirty atlas");
+    let crate::gfx::paint::TextureUpdate::Whole(upload) = upload else {
+        panic!("the first atlas upload must create the whole texture");
+    };
     assert_eq!(upload.id, ATLAS_TEXTURE_ID);
     assert_eq!(
         upload.width as usize * upload.height as usize * 4,
@@ -124,6 +127,87 @@ fn atlas_produces_upload_once_and_uvs_are_sane() {
     );
     // Nothing changed since: no second upload.
     assert!(f.take_atlas_update(ATLAS_TEXTURE_ID).is_none());
+}
+
+/// A scale change re-creates the atlas, so the next upload must be a whole
+/// image (atlas re-creation is not a dirty sub-rect), even though the texture id
+/// and size may be unchanged. This pins the `Whole` contract the renderer's
+/// replaced-image path relies on.
+#[test]
+fn a_scale_change_reuploads_the_whole_atlas() {
+    use crate::gfx::paint::TextureUpdate;
+
+    let mut f = fonts();
+    let style = regular();
+    f.layout("A", &style);
+    let first = f.take_atlas_update(ATLAS_TEXTURE_ID).expect("created");
+    assert!(matches!(first, TextureUpdate::Whole(_)));
+
+    f.set_scale(2.0);
+    f.layout("A", &style);
+    let update = f
+        .take_atlas_update(ATLAS_TEXTURE_ID)
+        .expect("the re-created atlas is dirty");
+    let TextureUpdate::Whole(upload) = update else {
+        panic!("a scale change must re-upload the whole atlas, not a dirty region");
+    };
+    assert_eq!(upload.id, ATLAS_TEXTURE_ID);
+    assert_eq!(
+        upload.rgba.len(),
+        (upload.width * upload.height * 4) as usize
+    );
+}
+
+/// The per-keystroke cost guard: once the atlas exists, a newly rasterised
+/// glyph must upload only its dirty rectangle, with pixels identical to that
+/// rectangle of the CPU atlas. A regression to `pixels().to_vec()` fails the
+/// payload-size assertion (it would copy the full 4 MiB image).
+#[test]
+fn a_new_glyph_uploads_only_its_dirty_region() {
+    use crate::gfx::paint::TextureUpdate;
+
+    let mut f = fonts();
+    let style = regular();
+
+    // First layout consumes the whole-atlas creation upload.
+    let first = f.layout("A", &style);
+    assert!(!first.glyphs.is_empty());
+    let created = f.take_atlas_update(ATLAS_TEXTURE_ID).expect("created");
+    let TextureUpdate::Whole(created) = created else {
+        panic!("the first upload must be a whole texture");
+    };
+    let full_len = created.rgba.len();
+    assert_eq!(
+        full_len,
+        (ATLAS_INITIAL_SIZE * ATLAS_INITIAL_SIZE * 4) as usize
+    );
+
+    // A brand-new glyph must produce a small region update.
+    let second = f.layout("B", &style);
+    assert!(!second.glyphs.is_empty());
+    let update = f
+        .take_atlas_update(ATLAS_TEXTURE_ID)
+        .expect("incremental atlas update");
+    let TextureUpdate::Region(region) = update else {
+        panic!("an incremental glyph must upload a region, not the whole atlas");
+    };
+    assert_eq!(region.id, ATLAS_TEXTURE_ID);
+    assert!(region.width > 0 && region.height > 0);
+    assert!(
+        region.rgba.len() * 100 < full_len,
+        "a single glyph copied {} bytes of a {full_len}-byte atlas",
+        region.rgba.len()
+    );
+    // Pixel-correct: the region is exactly that rectangle of the atlas.
+    let (copied, expected) =
+        f.atlas()
+            .copy_region(IRect::new(region.x, region.y, region.width, region.height));
+    assert_eq!(
+        copied,
+        IRect::new(region.x, region.y, region.width, region.height),
+        "the uploaded region must be inside the atlas"
+    );
+    assert_eq!(region.rgba, expected, "region payload must match the atlas");
 }
 
 #[test]

@@ -31,25 +31,45 @@ JavaScript.
 Prebuilt binaries are attached to the
 [latest GitHub release](https://github.com/gage-lodba/Rift/releases/latest):
 Windows (`rift-music-windows-x86_64.exe`), macOS (`rift-music-macos-universal`)
-and Linux (`rift-music-linux-x86_64`). The app needs a Vulkan-capable GPU driver;
-audio streams natively.
+and Linux (`rift-music-linux-x86_64`). The binaries are not code-signed: there
+is no Windows Authenticode signature and no Apple Developer ID
+signature/notarization yet, because both need project-owned certificates and
+credentials. Each release also carries a `SHA256SUMS` manifest: verify a
+download with `sha256sum -c SHA256SUMS` on Linux,
+`shasum -a 256 -c SHA256SUMS` on macOS, or compare
+`Get-FileHash <file> -Algorithm SHA256` on Windows with the matching line in
+`SHA256SUMS`. The
+checksums are an integrity check, not provenance — they are not a signature and
+do not attest who built the binary. Provenance comes from the GitHub build
+attestation for each binary; verify it with
+`gh attestation verify <asset> --repo gage-lodba/Rift` (add
+`--signer-workflow gage-lodba/Rift/.github/workflows/release.yml` to pin the
+workflow too). The app needs a Vulkan-capable GPU driver (on macOS, a Vulkan
+loader such as MoltenVK); audio streams natively.
 
 ## Requirements
 
 | Platform | Requirements |
 |---|---|
-| **Windows** | Windows 10/11, an up-to-date GPU driver with Vulkan, and the [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) when building from source |
-| **macOS** | macOS 13+, an up-to-date GPU driver, and Xcode Command Line Tools when building from source |
-| **Linux** | A Vulkan driver, ALSA and the X11/Wayland/xkbcommon development headers |
+| **Windows** | Windows 10/11, an up-to-date GPU driver with Vulkan, and the [Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) when building from source. If Vulkan is unavailable, the GUI shows a startup-error dialog naming the failure instead of exiting silently |
+| **macOS** | macOS 13+; a Vulkan-capable GPU driver to run. Rift does not bundle a Vulkan loader/MoltenVK — install one if the system lacks it; Xcode Command Line Tools when building from source |
+| **Linux** | A Vulkan driver and a PipeWire or PulseAudio session (raw ALSA fallback), plus ALSA and the X11/Wayland/xkbcommon development headers when building from source |
 
 Also required: **Rust 1.88** (pinned by [`rust-toolchain.toml`](rust-toolchain.toml)).
 
 Linux build dependencies:
 
 ```sh
-sudo apt install libasound2-dev libvulkan-dev libxkbcommon-dev libwayland-dev \
-  libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+sudo apt install pkg-config libasound2-dev libvulkan-dev libxkbcommon-dev \
+  libwayland-dev libx11-dev libx11-xcb-dev libxcb-render0-dev libxcb-shape0-dev \
+  libxcb-xfixes0-dev
 ```
+
+On Linux, playback goes through the session's sound server — PipeWire (which serves the
+PulseAudio protocol through `pipewire-pulse`) or PulseAudio — so it uses the output sink
+configured in the desktop mixer instead of opening a hardware card. Raw ALSA is used only
+when no sound server is reachable, and the startup log's `audio output host:` line names the
+selected host.
 
 ## Build & run
 
@@ -60,11 +80,40 @@ cargo run -p rift-desktop              # debug build, live backend
 cargo build --release -p rift-desktop  # release binary: target/release/rift-music
 ```
 
+### Desktop launcher (optional, Linux)
+
+To add Rift to your application menu (correct taskbar grouping and icon), build a
+release binary and install it together with the launcher entry and icons:
+
+```sh
+cargo build --release -p rift-desktop
+tools/install-linux-desktop.sh
+```
+
+The script and its assets live in the source tree, so a prebuilt release binary
+works too when installing from a checkout — pass it with `--binary PATH` (for example
+`tools/install-linux-desktop.sh --binary ~/Downloads/rift-music-linux-x86_64`); a
+downloaded 0644 asset is fine, the installer sets the execute bit.
+
+With no options it follows the XDG base directories, so no root is needed:
+`${XDG_BIN_HOME:-~/.local/bin}` for the binary and
+`${XDG_DATA_HOME:-~/.local/share}` for the entry, icons and install manifest.
+`--prefix DIR` installs under `DIR/bin` and `DIR/share` instead. `--dry-run` only
+prints the operations. `--uninstall` removes only the manifest-listed paths that
+sit inside its own install roots (refusing a tampered/stale manifest's outside or
+relative entries; pass `--force` to fall back to the fixed paths after a
+warning). Rift then appears in the application
+menu as **Rift**.
+
 ## Development
 
 ```sh
 cargo test -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop
+# clippy in every configuration the gates build:
 cargo clippy -p rift -p rift-types -p rift-ytmusic -p rift-discord -p rift-desktop --all-targets -- -D warnings
+cargo clippy -p rift-desktop --no-default-features --all-targets -- -D warnings
+cargo clippy --release -p rift-desktop --all-targets -- -D warnings
+cargo clippy --release -p rift-desktop --features backend,preview --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
@@ -84,9 +133,9 @@ Manual, network-requiring probes back the native-streaming work
   playback path (`fetch::fetch_bytes`), decodes each result with the playback
   decoder and prints bytes/timing/duration.
 - `cargo run -p rift --example download_probe` — drives the real backend's
-  download worker against a throwaway data directory, prints the progress
-  snapshots the UI receives, then proves a restarted backend discovers the copy
-  and replays it offline through `fetch::fetch_track`.
+  download worker against a throwaway data directory, prints the per-track
+  progress events the UI receives, then proves a restarted backend discovers the
+  copy and replays it offline through `fetch::fetch_track`.
 
 The end-to-end app path (controller/events) is covered by ignored live tests:
 
@@ -103,11 +152,16 @@ tables for backtraces without full DWARF.
 
 The full local acceptance gate (formatting, lints, docs, both feature
 configurations, release build, offscreen screenshot comparison, dependency guards)
-runs on Windows:
+runs on Linux/macOS and Windows:
 
-```powershell
-pwsh tools/ci-local.ps1
+```sh
+./tools/ci-local.sh       # Linux/macOS
+pwsh tools/ci-local.ps1   # Windows
 ```
+
+On Linux/macOS the Windows-only executable-icon check is reported as N/A, not a skip; CI's
+Windows job checks it. Install `cargo-deny` and a Pillow+numpy Python so the optional
+environment checks are not skipped.
 
 For UI work without real data, development builds support deterministic preview
 mode (placeholder library, no backend, no network). Preview and screenshot
@@ -145,9 +199,10 @@ Developer documentation lives in [`docs/README.md`](docs/README.md):
 
 ## Contributing
 
-Issues and pull requests are welcome. Please run `pwsh tools/ci-local.ps1`
-(or the equivalent `cargo` steps above) before opening a PR; all new code must
-pass `cargo fmt`, clippy with `-D warnings`, and the test suites.
+Issues and pull requests are welcome. Please run `./tools/ci-local.sh` on Linux/macOS or
+`pwsh tools/ci-local.ps1` on Windows (or the equivalent `cargo` steps above) before opening a
+PR; all new code must pass `cargo fmt`, clippy with `-D warnings` in every gated
+configuration, and the test suites.
 
 ## License
 

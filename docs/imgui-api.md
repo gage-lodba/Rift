@@ -5,7 +5,7 @@ Status: **v1.3, implemented and compiling** — all signatures below exist on di
 `crates/rift-desktop/src/app.rs` and `crates/rift-desktop/src/main.rs`. If you need a widget that is missing,
 message `imgui` rather than hand-rolling it in screens.
 
-Recent additions (v1.3): real clipboard support — `ui.text_input` Ctrl+A/C/X/V now uses the native OS clipboard via `arboard` by default (created lazily; injected `MemoryClipboard`/custom `Clipboard` backends still work, and headless tests disable it). v1.2: texture uploads queued **between** frames are preserved
+Recent additions (v1.3): real clipboard support — `ui.text_input` Ctrl+A/C/X/V now uses the native OS clipboard via `arboard` by default (created lazily; injected `MemoryClipboard`/custom `Clipboard` backends still work, and headless tests disable it). On Linux the native backend is built with `arboard`'s `wayland-data-control` feature, so a Wayland session reads the compositor clipboard instead of only the XWayland one (see "Clipboard" below). v1.2: texture uploads queued **between** frames are preserved
 (they are drained by `end_frame`, not cleared by `begin_frame`) so cover art
 decoded outside the frame renders live; `end_frame` without `begin_frame` is
 tolerated; an open popup that no screen draws is auto-closed; DPI scale path
@@ -25,7 +25,7 @@ The framework is owned by `imgui`: `crates/rift-desktop/src/ui/**`, `crates/rift
 ui/mod.rs        frame lifecycle, ids, interaction, clip stack, deferred layers,
                  primitives, text/icon drawing
 ui/widgets.rs    styled widgets (buttons, switch, slider, badge, cover, …)
-ui/text_input.rs single-line text editing (caret, selection, clipboard)
+ui/text_input/{mod,edit,state}.rs single-line text editing (widget/paint, keyboard + clipboard editing, retained caret/selection)
 ui/scroll.rs     scroll containers + scrollbar
 ui/popup.rs      menus/popups, tooltips, toasts
 ui/layout.rs     Rect helpers, Vec2/Size, Row/Column cursors, Padding, Align
@@ -54,7 +54,8 @@ When `end_frame` is called, the UI has already:
 
 * flattened all primitives into one painter-ordered `PaintList` (one `Layer` per
   contiguous clip run; scroll containers and popups handled automatically),
-* uploaded/replaced/dropped textures (`created`/`updated`/`dropped`),
+* uploaded/replaced/dropped textures (`created`/`updated`/`dropped`; an
+  `updated` entry is a whole image or a dirty sub-rectangle),
 * drawn deferred overlays (open popup, tooltips, toasts) **on top** of all
   screen content,
 * committed interaction state for the next frame.
@@ -89,6 +90,10 @@ The UI is resolution-independent and needs **no API call from screens**:
   1024² and can grow to 2048², which is enough for 4 Inter weights + both icon
   fonts at any single scale. There is exactly one atlas variant at a time (the
   current scale), so memory stays bounded after monitor changes.
+* Once the atlas exists, newly rasterised glyphs are uploaded as dirty-rectangle
+  `updated` regions rather than re-copying the whole image; growth and scale
+  changes are the only whole uploads. The renderer batches every upload of a
+  frame into one command buffer and waits once.
 * Layout/measure results are scale-independent within rounding: logical text
   widths agree across 0.75–3.0 scale factors (tested).
 * Screenshot mode at a simulated scale: set `input.scale_factor = scale` and
@@ -143,7 +148,16 @@ the UI consumed the frame).
   when `!event.repeat || state.is_pressed()`. Text-producing keys also set
   `Key::Char(c)` so text inputs can consume them.
 * `ModifiersChanged(mods)` → `modifiers` (winit `ModifiersState`).
-* `Ime::Commit(text)` / `ReceivedCharacter(ch)` → append to `text`.
+* The focused `text_input` records its caret in logical px; after the frame
+  `Ui::ime_cursor_area()` returns it and `main.rs` forwards it (converted to
+  physical px) to `Window::set_ime_cursor_area`, so the candidate window follows
+  the field. It is `None` when no text input was focused that frame.
+* `Ime::Commit(text)` and `KeyEvent::text` both feed `ui::push_ime_text`
+  (control characters stripped, multi-byte text preserved). The window calls
+  `set_ime_allowed(true)` once at creation; `Ime::Preedit` is not inserted (no
+  composition preview). The two paths are complementary per winit's contract,
+  so there is no same-frame dedupe guard — a Windows IME-processed key arrives
+  as `NamedKey::Process` with no text and is ignored.
 * `Resized`/`ScaleFactorChanged` → update viewport and scale factor before the
   next `begin_frame`.
 
@@ -335,14 +349,22 @@ All interactive widgets return `Response`:
 pub struct Response {
     pub id: Id, pub rect: Rect,
     pub hovered: bool, pub pressed: bool, pub clicked: bool,
+    pub keyboard_activated: bool, // clicked came from Enter/Space, not a pointer
     pub secondary_clicked: bool, pub double_clicked: bool,
     pub active: bool, pub dragged: bool, pub drag_delta: Vec2, pub drag_started: bool,
     pub focused: bool, pub focus_visible: bool, pub hover_t: f32, // 0..1 animated
 }
+// response.pointer_clicked() == clicked && !keyboard_activated
 ```
 
+`pointer_clicked()` is what positional widgets must use: a keyboard activation
+carries no pointer position, so a slider/scrollbar that read `mouse_pos` for it
+would commit a fraction the user never pointed at. Buttons, rows and menu items
+keep using `clicked` so Enter/Space activation works.
+
 Buttons (kind derives colors from the theme; `Response` semantics as above;
-keyboard Enter/Space while focused also produces `clicked`):
+keyboard Enter/Space while focused also produces `clicked` with
+`keyboard_activated = true`):
 
 ```rust
 use rift_desktop::ui::ButtonKind;
@@ -413,7 +435,9 @@ let r = ui.text_input(rect, Id::from_str("playlist/rename"), &mut draft, "Playli
 // r.changed    -> text mutated this frame (mark dirty)
 // r.submitted  -> Enter pressed (commit)
 // r.cancelled  -> Escape pressed (cancel; field also blurred)
-// r.lost_focus -> focus left the field this frame (commit-or-cancel policy is yours)
+// r.lost_focus -> focus left the field at the end of the previous frame;
+//                 reported one frame later (commit-or-cancel policy is yours).
+//                 Re-focusing in this frame suppresses it.
 // r.response   -> normal Response
 ```
 
@@ -434,8 +458,14 @@ returns, which is the invariant the module documents. There are no
 
 Clipboard: by default the UI uses the **real OS clipboard** (`arboard`), created
 lazily on the first copy/paste and degrading to a no-op if the session has no
-clipboard service — nothing to wire in `main.rs`. Two other backends are
-available through the `Clipboard` trait:
+clipboard service — nothing to wire in `main.rs`. On Linux the `arboard` build
+enables `wayland-data-control`: a Wayland session talks to the compositor's
+clipboard directly (the only way to see what other Wayland apps copied), and
+`arboard` falls back to X11 by itself when `WAYLAND_DISPLAY` is unset or the
+compositor lacks the protocol (GNOME/Mutter). The X11-only build was the bug
+where Ctrl+V in the sidebar's import box silently ignored a link copied from a
+Wayland browser. Two other backends are available through the `Clipboard`
+trait:
 
 ```rust
 ui.set_clipboard(Box::new(MemoryClipboard::new())); // deterministic/in-process
@@ -445,8 +475,16 @@ let available = ui.native_clipboard_available();
 ```
 
 `MemoryClipboard` is cloneable so a test can read back what the widget copied.
-`cargo test` uses disabled/memory backends only, so tests never touch the OS
-clipboard.
+One Ctrl+V insert is capped at `MAX_PASTE_BYTES` (64 KiB): control characters
+are stripped, the cut is made on a UTF-8 char boundary, and a truncated paste
+raises the standard info toast (`Pasted text was truncated to 64 KiB.`) rather
+than silently inserting a partial payload. The cap applies to the paste, not the
+field's total length.
+Widget/fuzz suites use the memory or disabled backends; the `ui::clipboard` OS
+tests do use the real clipboard when a service exists and put the previous
+contents back best-effort (they skip headless CI; on Wayland the selection is
+owned by the writing process, so a local run can leave a test marker on the
+desktop clipboard until the next copy).
 
 ## Scrolling
 
@@ -501,6 +539,10 @@ ui.popup(menu_id, kebab_rect, Size::new(180.0, 3.0 * MENU_ITEM_HEIGHT),
   with a CSS-like shadow (`0 10px 30px rgba(0,0,0,.55)`), auto-places it below
   the anchor (+4px, flips above if needed, clamps to the viewport), registers it
   as an input blocker for next frame, and closes on click-outside, Escape or Tab.
+  A click outside dismisses **and consumes the whole press/release gesture**: the
+  widget under the pointer is inert (no hover, press latch, focus change or
+  click) until the button is released, so dismissing a menu never also
+  activates the control underneath.
 * **Keyboard**: opening a menu focuses its first row; Up/Down/Home/End move the
   focus ring; Enter/Space activates the focused row; Escape closes and returns
   focus to the widget that had it when the menu opened (the trigger).
@@ -539,10 +581,18 @@ inside `ui.deferred(|ui| …)` and it will land on top.
 * Tab / Shift+Tab move keyboard focus in paint order (previous frame's order);
   clicking a focusable widget focuses it (without the visible ring), clicking
   empty space blurs.
-* Focused buttons activate on Enter/Space (`Response.clicked`).
+* Focused buttons activate on Enter/Space (`Response.clicked`, with
+  `keyboard_activated = true`). Positional widgets (sliders, scrollbar tracks)
+  use `pointer_clicked()` and therefore ignore keyboard activation; buttons,
+  rows, tabs and menu items keep activating on Enter/Space.
 * `ui.wants_keyboard()` is true while a text field or focused widget owns the
   keyboard — **screens must skip global shortcuts when it is true**
   (Space play/pause, Ctrl+arrows etc.).
+* `ui.request_focus_on_open(id) -> bool` — one-shot autofocus: requests focus
+  only on the frame the id first becomes focusable (no-op every later frame), so
+  an inline editor can autofocus without re-grabbing focus after a click-away.
+  Focus loss is committed in `end_frame`, so a text field/editor observes it on
+  the following frame.
 * `ui.keyboard_mode()`, `ui.request_focus(id)`, `ui.clear_focus()`,
   `ui.is_focused(id)`, `ui.focused_id()`, `ui.focus_ring(rect, radius)` (offset
   +2, for buttons) and `ui.focus_ring_inset(rect, radius)` (offset −2, for
@@ -569,7 +619,7 @@ inside `ui.deferred(|ui| …)` and it will land on top.
 colors/metrics: `bg #0e0e10`, `bg_raised #151518`, `bg_hover #1d1d21`,
 `border #232328`, `text #ececef`, `text_dim #8b8b93`, `accent #8b3df0`,
 `accent_dim #6d28d9`, `danger #e5484d`, `focus #c4a0ff`, plus font sizes,
-`titlebar_height 46`, `sidebar_width 216`, `player_height 92`, radii, spacing,
+`titlebar_height 46`, `sidebar_width 216`, `player_height 84`, radii, spacing,
 card gap/min-width, track row height (=54 incl. padding), etc.
 `ui.theme_mut()` exists for previews/settings; don't mutate it from screens.
 
@@ -643,12 +693,12 @@ screen needs to match them.
 
 | Module | What it covers |
 |---|---|
-| `text::tests` (29) | embedded font loading; measure vs layout agreement; measure never rasterises; glyph-cache hits; atlas allocation/`TextureUpdate`; line boxes + CSS half-leading baseline; wrap word/gap correctness (incl. regression: no double-counted line prefix, long-word hard break, leading whitespace); ellipsis fit/borrow; randomized Unicode wrap/measure/ellipsize fuzz (250 cases) asserting char boundaries, no lost glyphs, line widths fit; HiDPI bitmap-vs-logical-quad math + cache invalidation; scale-stable measuring |
-| `ui::tests` (33) | paint primitives/layers, clip grouping + nesting, deferred-after-base ordering; interaction (press/release/drag/outside-click/double-click), Tab/Shift+Tab focus, click-focus, keyboard activation; text prims/ellipsis/atlas id; icons; scroll wheel/clamp/retain/stable gutter; popup open/close/Escape/blockers; toasts/tooltips; text input typing/backspace/enter/escape; theme styles; widget auto-id stability; texture lifecycle incl. **inter-frame uploads**, in-frame exactly-once, dropped ids, `end_frame` without `begin_frame` |
-| `ui::tests_polish` (13) | disabled button/switch, dynamic scroll containers, menu focus + arrow keys + Escape focus-return + click activation, slider thumb-inside-track geometry + colors, single-slot toasts/sticky, focus-ring inset, submenu caret |
-| `ui::fuzz` (17) | deterministic xorshift fuzz over 3×220 random frames (random clicks/drags/wheel/Tab/typing/Escape/resizes/scale changes): paint rects finite/non-negative, clips valid, texture payload sizes correct, focus resolves, scroll clamped, text stays valid UTF-8, app texture/atlas created exactly once; popup cannot leak to a screen that doesn't draw it; deferred content paints once per frame; text-input edge cases (bounds, UTF-8 arrows, shift selection, Ctrl+A/C/X/V with injected clipboard and no-clipboard no-ops, Enter submit, Escape cancel/blur, long-text editing) |
+| `text::tests` + `text::atlas` (33) | embedded font loading; measure vs layout agreement; measure never rasterises; glyph-cache hits; atlas allocation/`TextureUpdate` (whole uploads vs dirty-region glyph updates, pixel-checked); line boxes + CSS half-leading baseline; wrap word/gap correctness (incl. regression: no double-counted line prefix, long-word hard break, leading whitespace); ellipsis fit/borrow; randomized Unicode wrap/measure/ellipsize fuzz (250 cases) asserting char boundaries, no lost glyphs, line widths fit; HiDPI bitmap-vs-logical-quad math + cache invalidation; scale-stable measuring |
+| `ui::tests` (51) | paint primitives/layers, clip grouping + nesting, deferred-after-base ordering; interaction (press/release/drag/outside-click/double-click), Tab/Shift+Tab focus, click-focus, keyboard activation, keyboard-vs-pointer activation (a focused slider/scrollbar ignores Enter/Space; a focused button still activates); popup-dismissal gesture latch (the press **and** release after an outside press are consumed); text prims/ellipsis/atlas id; icons; scroll wheel/clamp/retain/stable gutter; popup open/close/Escape/blockers; toasts/tooltips; text input typing/backspace/enter/escape; theme styles; widget auto-id stability; texture lifecycle incl. **inter-frame uploads**, in-frame exactly-once, dropped ids, `end_frame` without `begin_frame` |
+| `ui::tests_polish` (16) | disabled button/switch, dynamic scroll containers, menu focus + arrow keys + Escape focus-return + click activation, slider thumb-inside-track geometry + colors, single-slot toasts/sticky, focus-ring inset, submenu caret |
+| `ui::fuzz` (11) | deterministic xorshift fuzz over 3×220 random frames (random clicks/drags/wheel/Tab/typing/Escape/resizes/scale changes): paint rects finite/non-negative, clips valid, texture payload sizes correct, focus resolves, scroll clamped, text stays valid UTF-8, app texture/atlas created exactly once; popup cannot leak to a screen that doesn't draw it; deferred content paints once per frame; text-input edge cases (bounds, UTF-8 arrows, shift selection, Ctrl+A/C/X/V with injected clipboard and no-clipboard no-ops, Enter submit, Escape cancel/blur, long-text editing) |
 | `ui::gallery` (1 pure + 2 `#[ignore]` GPU, serialized by an internal mutex) |
-| `ui::clipboard` (4) | in-memory round-trip/sharing; real OS clipboard round-trip when a service is available (skips on headless CI, restores the previous contents); full `Ui` Ctrl+V/paste + Ctrl+A/C/copy path against the real OS clipboard (Windows, serialized); unavailable-backend no-op path | gallery paint test; renders `crates/rift-desktop/target/ui-gallery{,-125,-150}.png` through the real renderer and a dedicated `ui-image-check.png` test that **asserts rendered pixels** of a 64×64 RGBA gradient + red tint through `ui.image` (texture upload path) |
+| `ui::clipboard` (5) | in-memory round-trip/sharing; real OS clipboard round-trip when a service is available (skips on headless CI, restores the previous contents best-effort; Wayland writes are polled because the compositor commits them asynchronously); full `Ui` Ctrl+V/paste + Ctrl+A/C/copy path against the real OS clipboard (Windows and Linux, serialized); Linux/Wayland only: a selection copied by a real `wl-clipboard-rs` data-control client must be visible to the app clipboard (the regression the `wayland-data-control` feature fixes; skips without Wayland or data-control); unavailable-backend no-op path | gallery paint test; renders `crates/rift-desktop/target/ui-gallery{,-125,-150}.png` through the real renderer and a dedicated `ui-image-check.png` test that **asserts rendered pixels** of a 64×64 RGBA gradient + red tint through `ui.image` (texture upload path) |
 
 GPU tests are `#[ignore = "requires a Vulkan device"]`; run them manually
 (they take an internal mutex because the offscreen renderer owns process-wide GPU

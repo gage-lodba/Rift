@@ -2,18 +2,69 @@
 
 use rift_types::{PlaybackState, QueueSnapshot, RepeatMode, Track};
 
+use super::events::{audio_event_applies, AudioEventKind};
 use super::nav::{
-    anchor_playing, cancel_playback, cycle_repeat, pick_next, pick_prev, seed_shuffle_anchor,
-    toggle_shuffle,
+    anchor_playing, cancel_playback, cycle_repeat, handle_ended, pick_next, pick_prev,
+    seed_shuffle_anchor, toggle_shuffle, EndedOutcome,
 };
 use super::playback::{
-    byline, commit_crossfade, crossfade_hold, is_current_generation, preseed_duration,
-    should_arm_crossfade, CrossfadeHold,
+    byline, commit_crossfade, crossfade_hold, crossfade_play_id, is_current_generation,
+    prepare_play_index, preseed_duration, should_arm_crossfade, CrossfadeHold,
 };
 use super::queue::{
     append_tracks, insert_next, move_in_queue, remove_from_queue, AddOutcome, RemoveOutcome,
 };
 use super::state::{load_snapshot, session_changed, PlayerCore};
+
+/// An end that raced a pause must stop at the end: advancing would play the
+/// next track while the user asked for silence, and ignoring it leaves a silent
+/// `Playing` bar that `Resume` cannot revive (the audio thread unloaded).
+#[test]
+fn an_end_that_raced_a_pause_stops_at_the_end() {
+    let mut core = PlayerCore {
+        queue: vec![dummy_track(0), dummy_track(1)],
+        current: Some(0),
+        state: PlaybackState::Paused,
+        position: 199.5,
+        duration: 200.0,
+        generation: 3,
+        ..PlayerCore::default()
+    };
+    let outcome = handle_ended(&mut core, 3);
+    assert_eq!(outcome, EndedOutcome::PauseAtEnd(200.0));
+    assert_eq!(core.state, PlaybackState::Stopped);
+    assert_eq!(
+        core.current,
+        Some(0),
+        "a paused end must not advance the queue behind the user's back"
+    );
+    assert_eq!(core.position, 200.0, "the stopped bar shows the end");
+}
+
+/// A stale end (a newer play/stop owns the transport) is still dropped.
+#[test]
+fn an_end_from_a_stale_play_is_ignored() {
+    let mut core = PlayerCore {
+        state: PlaybackState::Playing,
+        generation: 5,
+        ..PlayerCore::default()
+    };
+    assert_eq!(handle_ended(&mut core, 4), EndedOutcome::Ignore);
+    assert_eq!(core.state, PlaybackState::Playing);
+}
+
+/// The normal path is unchanged: a playing end picks and advances.
+#[test]
+fn a_playing_end_advances_the_queue() {
+    let mut core = PlayerCore {
+        queue: vec![dummy_track(0), dummy_track(1)],
+        current: Some(0),
+        state: PlaybackState::Playing,
+        generation: 1,
+        ..PlayerCore::default()
+    };
+    assert_eq!(handle_ended(&mut core, 1), EndedOutcome::Advance(Some(1)));
+}
 
 fn dummy_track(i: usize) -> Track {
     Track {
@@ -271,8 +322,8 @@ fn stopping_supersedes_an_in_flight_play_request() {
 
     assert_eq!(
         core.generation,
-        generation + 1,
-        "work in flight for the stopped request is stale now"
+        generation + 2,
+        "work in flight for the stopped request is stale now (skipping the crossfade id)"
     );
     assert_eq!(core.state, PlaybackState::Stopped);
     assert_eq!(core.position, 0.0);
@@ -280,6 +331,86 @@ fn stopping_supersedes_an_in_flight_play_request() {
     assert_eq!(
         core.crossfade_armed_for, None,
         "and a fresh track can arm a crossfade"
+    );
+}
+
+/// Two rapid play requests must each claim the index from their own queue.
+///
+/// The command used to install a replacement queue under one core lock and then
+/// call `play_index`, which validated the index under a second lock. A second
+/// `play_tracks` landing in between could replace the queue first, so the first
+/// request validated its `start` against the second's queue — starting a track
+/// nobody asked for, or silently losing its own request. The queue replacement,
+/// index check, shuffle anchor, `pending_next` invalidation and generation bump
+/// now share one critical section (`prepare_play_index`), so a claim always
+/// names the queue it was validated against.
+#[test]
+fn two_interleaved_play_requests_each_claim_their_own_queue() {
+    let mut core = queue_core(3, Some(0));
+    core.shuffle = true;
+    core.shuffle_history = vec![0];
+    core.shuffle_cursor = 0;
+    core.pending_next = Some(1);
+
+    // Request A: replace the queue with three tracks, play index 2.
+    let a = prepare_play_index(
+        &mut core,
+        2,
+        Some((
+            vec![dummy_track(10), dummy_track(11), dummy_track(12)],
+            Some("a".into()),
+        )),
+    )
+    .expect("index 2 exists in A's queue");
+    // Request B lands before A hands anything to the audio thread: a two-track
+    // queue and index 0.
+    let b = prepare_play_index(
+        &mut core,
+        0,
+        Some((vec![dummy_track(20), dummy_track(21)], Some("b".into()))),
+    )
+    .expect("index 0 exists in B's queue");
+
+    // Each claim carries the track from the queue it validated against, not a
+    // slot in whatever queue happened to be installed last.
+    assert_eq!(a.track.id, "12", "A must claim A's index");
+    assert_eq!(a.index, 2);
+    assert_eq!(b.track.id, "20", "B claims B's index");
+    assert_eq!(b.index, 0);
+    assert_eq!(
+        b.generation,
+        a.generation + 2,
+        "B is the newer play request"
+    );
+
+    // The winning request's queue, source and shuffle anchor are the ones in
+    // force; the prefetched crossfade pick was invalidated by the claim.
+    assert_eq!(ids(&core), vec!["20", "21"], "B's queue is installed");
+    assert_eq!(core.current, Some(0), "B's index is current");
+    assert_eq!(core.source.as_deref(), Some("b"));
+    assert_eq!(core.shuffle_history, vec![0], "anchored on B's track");
+    assert_eq!(core.pending_next, None, "the prefetch was invalidated");
+    assert_eq!(core.generation, b.generation);
+    assert!(
+        !is_current_generation(&core, a.generation),
+        "A's request is stale and its launch is discarded"
+    );
+    assert!(is_current_generation(&core, b.generation));
+
+    // An index that only existed in A's replacement cannot be claimed against
+    // the queue that actually exists, and a rejected request changes nothing.
+    assert!(prepare_play_index(
+        &mut core,
+        2,
+        Some((vec![dummy_track(30), dummy_track(31)], None))
+    )
+    .is_none());
+    assert_eq!(ids(&core), vec!["20", "21"], "nothing was installed");
+    assert_eq!(core.current, Some(0), "the current track is untouched");
+    assert!(prepare_play_index(&mut core, 2, None).is_none());
+    assert_eq!(
+        core.generation, b.generation,
+        "a rejected request must not claim a generation"
     );
 }
 
@@ -928,7 +1059,7 @@ impl Rng {
 /// only the queue bookkeeping is under test here.
 fn start_like(core: &mut PlayerCore, index: usize) {
     core.current = Some(index);
-    core.generation += 1;
+    core.generation += 2;
     core.pending_next = None;
     core.state = PlaybackState::Playing;
     core.position = 0.0;
@@ -1660,6 +1791,38 @@ fn a_toggle_off_mid_prefetch_draws_under_the_new_mode_not_the_stale_pick() {
 // functions now (`should_arm_crossfade`, `crossfade_hold`), and these tests pin
 // the behaviour that used to be only implied by the comments.
 
+/// The crossfade play-identity contract: the id sent with
+/// `AudioCmd::Crossfade` must be exactly the generation `commit_crossfade`
+/// assigns when the acknowledgement lands. The audio thread starts the incoming
+/// track before the manager commits it, so until the commit makes that generation
+/// current every event it emits is dropped; if the two drifted apart, the
+/// committed track's own ticks and natural end would be dropped forever.
+#[test]
+fn a_crossfade_commits_the_play_id_it_handed_the_audio_thread() {
+    let mut core = crossfade_core();
+    core.generation = 7;
+    core.pending_next = Some(1);
+    let anchor = core.generation;
+    let play_id = crossfade_play_id(anchor);
+    assert_eq!(play_id, anchor + 1, "the committed generation");
+
+    // The target starts (and may tick) before the acknowledgement commits it:
+    // that audio is not the manager's current play yet, so its events are
+    // dropped rather than overwriting the outgoing track.
+    assert!(!audio_event_applies(
+        &core,
+        play_id,
+        AudioEventKind::Position
+    ));
+
+    commit_crossfade(&mut core, 1);
+    assert_eq!(core.generation, play_id, "the commit assigns the sent id");
+    assert!(
+        audio_event_applies(&core, play_id, AudioEventKind::Position),
+        "after the commit the new track's own events apply"
+    );
+}
+
 /// The crossfade arming rule: arm once, inside the overlap window, and re-arm
 /// only for a new track.
 #[test]
@@ -1674,7 +1837,7 @@ fn crossfade_arms_once_inside_the_overlap_window() {
     // …and only once for this track.
     assert!(!should_arm_crossfade(&mut core, 192.0));
     // A new play request (generation) can arm again.
-    core.generation += 1;
+    core.generation += 2;
     assert!(should_arm_crossfade(&mut core, 195.0));
 }
 

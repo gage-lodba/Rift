@@ -66,6 +66,25 @@ const MAX_PLAYER_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// Longest excerpt of a non-JSON error body copied into an error message.
 const MAX_ERROR_EXCERPT_CHARS: usize = 200;
 
+/// Longest server-provided `error.message` copied into [`Error::Api`].
+///
+/// The player endpoint's error text is normally one sentence. A broken or
+/// hostile response must not be able to put an arbitrary string (or embedded
+/// newlines) into a user-facing error, so it is capped like the metadata
+/// client's.
+const MAX_API_MESSAGE_CHARS: usize = 300;
+
+/// Longest server-provided `playabilityStatus.status` copied into a debug log
+/// line.
+///
+/// The status is server text and is only logged (the user-facing reason is
+/// handled separately); capping it keeps a hostile response from writing a
+/// multi-megabyte log line.
+const MAX_PLAYABILITY_STATUS_CHARS: usize = 100;
+
+/// Longest server-provided MIME type copied into a debug log line.
+const MAX_MIME_TYPE_LOG_CHARS: usize = 100;
+
 /// One JS-less innertube client the resolver can ask for a player response.
 ///
 /// This is the client table from `docs/native-streaming.md` §3.1: a row is data,
@@ -167,9 +186,11 @@ pub struct AudioStream {
 /// anonymous visitor id from the crate-wide pool, then picks a format from
 /// `streamingData.adaptiveFormats`. The selection order is itag `140` (AAC
 /// 128 kbit/s, the format the pre-native app streamed) → `141` →
-/// `139` → any other `audio/mp4` entry → any audio-only entry. Entries with
-/// `signatureCipher` or without a direct `url` are skipped: solving them would
-/// need the JavaScript this resolver deliberately does without.
+/// `139` → any other `audio/mp4` entry. WebM/Opus entries are skipped because
+/// rodio cannot decode them directly; if only such a format is offered the
+/// resolve fails with `NoAudioFormat` rather than publishing unplayable audio.
+/// Entries with `signatureCipher` or without a direct `url` are skipped: solving
+/// them would need the JavaScript this resolver deliberately does without.
 ///
 /// One visitor rotation is attempted per resolve when a client's request is
 /// rejected with HTTP 403 or the player answers
@@ -193,8 +214,9 @@ pub struct AudioStream {
 /// not JSON or carries no `playabilityStatus.status`; [`Error::Unavailable`]
 /// when the player reports the video itself as not playable (with the server's
 /// reason); and [`Error::NoAudioFormat`] when the response offers no directly
-/// downloadable audio format, in which case the fetch surfaces that error
-/// directly (there is no fallback backend).
+/// playable `audio/mp4` format (a WebM/Opus-only response lands here too), in
+/// which case the fetch surfaces that error directly (there is no fallback
+/// backend).
 pub async fn resolve(video_id: &str) -> Result<AudioStream> {
     let http = shared_http_client()?;
     resolve_with_chain(&http, video_id, CHAIN).await
@@ -369,6 +391,11 @@ fn build_http_client() -> Result<reqwest::Client> {
         .brotli(true)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
+        // The visitor scrape is the cold-start request that `YouTube` answers
+        // with the over-large header block this constant exists for; without
+        // the raised h2 receive limit the scrape is reset on about half of
+        // cold starts (see [`crate::MAX_H2_RESPONSE_HEADER_LIST_BYTES`]).
+        .http2_max_header_list_size(crate::MAX_H2_RESPONSE_HEADER_LIST_BYTES)
         .build()?)
 }
 
@@ -506,22 +533,51 @@ fn api_message(parsed: &Value) -> String {
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
+        .map(|message| single_line_excerpt(message, MAX_API_MESSAGE_CHARS))
         .unwrap_or_default()
-        .to_owned()
 }
 
 /// A short, single-line excerpt of a non-JSON response body, for an error
-/// message. Collapses whitespace and truncates on a character boundary.
+/// message.
 fn body_excerpt(body: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(body);
-    let flat = lossy.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = flat.chars();
-    let excerpt: String = chars.by_ref().take(MAX_ERROR_EXCERPT_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{excerpt}…")
-    } else {
-        excerpt
+    single_line_excerpt(&String::from_utf8_lossy(body), MAX_ERROR_EXCERPT_CHARS)
+}
+
+/// Collapse whitespace and truncate `text` to `max` characters.
+///
+/// One pass over `chars()` with a `pending_space` flag: no `Vec<&str>` of the
+/// whole body (which would transiently allocate ~250 MB for a 32 MiB body) and
+/// no intermediate flattened `String` either. Output is bounded at
+/// `max + 1` chars (the extra is the ellipsis), and the walk stops as soon as
+/// the bound is reached, so a huge repetitive body costs almost nothing.
+fn single_line_excerpt(text: &str, max: usize) -> String {
+    let mut excerpt = String::with_capacity(max.saturating_add(1).min(text.len()));
+    let mut count = 0usize;
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if count > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            if count == max {
+                excerpt.push('…');
+                return excerpt;
+            }
+            excerpt.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        if count == max {
+            excerpt.push('…');
+            return excerpt;
+        }
+        excerpt.push(ch);
+        count += 1;
     }
+    excerpt
 }
 
 /// The `playabilityStatus.status` string, when the response carries one.
@@ -543,51 +599,80 @@ fn check_playability(response: &Value) -> Result<()> {
     if status == "OK" {
         return Ok(());
     }
-    let reason = response
-        .pointer("/playabilityStatus/reason")
-        .and_then(Value::as_str)
-        .filter(|reason| !reason.is_empty())
-        .unwrap_or(status)
-        // The reason is server text copied into a user-facing toast; cap it so
-        // a hostile/broken response cannot balloon the UI payload.
-        .chars()
-        .take(300)
-        .collect::<String>();
-    debug!(status, %reason, "player reported an unplayable video");
+    let reason = single_line_excerpt(
+        response
+            .pointer("/playabilityStatus/reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or(status),
+        // The reason is server text copied into a user-facing toast: collapse
+        // its whitespace/newlines and cap it so a hostile/broken response cannot
+        // balloon or wrap the UI payload.
+        MAX_API_MESSAGE_CHARS,
+    );
+    debug!(status = %single_line_excerpt(status, MAX_PLAYABILITY_STATUS_CHARS), %reason,
+        "player reported an unplayable video");
     Err(Error::Unavailable { reason })
 }
 
 /// Pick the preferred audio stream out of one player response, tagging it with
 /// the client that served it.
 ///
+/// Only `audio/mp4` is directly playable by the app (rodio decodes MP4/AAC; the
+/// offline path publishes `.m4a`). WebM/Opus is a perfectly good audio-only
+/// container, but handing it to the playback sink — or naming a downloaded file
+/// `.m4a` — is not something the app can actually play, so a response that
+/// offers only that is [`Error::NoAudioFormat`], not a last resort. The unknown
+/// `audio/mp4` format is still accepted, after the known itags.
+///
 /// Tolerant by construction: unknown fields are ignored, unusable format entries
 /// are skipped rather than failing the whole response, and only "there is no
-/// directly downloadable audio at all" is an error.
+/// directly playable audio at all" is an error.
 fn select_audio(response: &Value, client: &'static str) -> Result<AudioStream> {
     let formats = audio_formats(response, client);
 
     // The known itags first, in the order the app's playback format has always
-    // been requested (140 is the historical audio format). Then the container
-    // and finally "any audio-only format" as a last resort.
+    // been requested (140 is the historical audio format). The MIME check is
+    // repeated here so a mislabelled 140 cannot bypass the playability rule.
     for itag in [140, 141, 139] {
-        if let Some(stream) = formats.iter().find(|stream| stream.itag == itag) {
+        if let Some(stream) = formats
+            .iter()
+            .find(|stream| stream.itag == itag && is_directly_playable(&stream.mime_type))
+        {
             return Ok(stream.clone());
         }
     }
     if let Some(stream) = formats
         .iter()
-        .find(|stream| stream.mime_type.starts_with("audio/mp4"))
+        .find(|stream| is_directly_playable(&stream.mime_type))
     {
         return Ok(stream.clone());
     }
-    if let Some(stream) = formats.first() {
-        return Ok(stream.clone());
+    // Name every rejected container once: a live report should say whether the
+    // response was WebM/Opus-only or something else entirely.
+    for stream in &formats {
+        if !is_directly_playable(&stream.mime_type) {
+            debug!(
+                client,
+                itag = stream.itag,
+                mime_type = %single_line_excerpt(&stream.mime_type, MAX_MIME_TYPE_LOG_CHARS),
+                "rejecting audio format: container is not directly playable"
+            );
+        }
     }
     debug!(
         client,
-        "player response offered no directly downloadable audio format"
+        "player response offered no directly playable audio/mp4 format"
     );
     Err(Error::NoAudioFormat)
+}
+
+/// Whether the app can decode `mime_type` directly.
+///
+/// `audio/mp4` (AAC) is the one container both the playback sink and the
+/// offline `.m4a` publication path support. Opus/WebM must not pass this gate.
+fn is_directly_playable(mime_type: &str) -> bool {
+    mime_type.starts_with("audio/mp4")
 }
 
 /// Every directly downloadable audio format in a player response, in response
@@ -1252,6 +1337,69 @@ mod tests {
         );
     }
 
+    /// The server-provided `error.message` is user-facing text: a huge or
+    /// multi-line value is capped and flattened instead of being copied whole.
+    #[test]
+    fn a_huge_server_error_message_is_capped_to_one_line() {
+        let huge = format!("first line\n{}", "x".repeat(10_000));
+        let parsed = json!({ "error": { "message": huge } });
+
+        let message = api_message(&parsed);
+        assert_eq!(
+            message.chars().count(),
+            MAX_API_MESSAGE_CHARS + 1,
+            "the message is capped plus the ellipsis"
+        );
+        assert!(message.starts_with("first line x"));
+        assert!(message.ends_with('…'));
+        assert!(!message.contains('\n'), "the message must be one line");
+    }
+
+    /// A huge non-JSON error body must not materialise every word before
+    /// truncating: the excerpt is one bounded pass (see `single_line_excerpt`).
+    #[test]
+    fn body_excerpt_is_bounded_on_a_large_repetitive_body() {
+        let body = vec![b'x'; 8 * 1024 * 1024];
+        let excerpt = body_excerpt(&body);
+        assert_eq!(
+            excerpt.chars().count(),
+            MAX_ERROR_EXCERPT_CHARS + 1,
+            "a repetitive body yields at most the excerpt plus the ellipsis"
+        );
+        assert!(excerpt.ends_with('…'));
+    }
+
+    /// The player's unavailability reason is server text shown in a toast; it
+    /// must stay one bounded line even if the response embeds newlines.
+    #[test]
+    fn an_unplayable_reason_is_capped_to_one_line() {
+        let response = serde_json::json!({
+            "playabilityStatus": {
+                "status": "ERROR",
+                "reason": format!("first line\n\tsecond   line {}", "x".repeat(1000)),
+            }
+        });
+        let error = check_playability(&response).expect_err("a non-OK status is unavailable");
+        let Error::Unavailable { reason } = error else {
+            panic!("expected Unavailable, got {error:?}");
+        };
+        assert!(!reason.contains('\n') && !reason.contains('\t'));
+        assert!(reason.contains("first line second line"));
+        assert!(
+            reason.chars().count() <= MAX_API_MESSAGE_CHARS + 1,
+            "the reason must stay bounded, got {} chars",
+            reason.chars().count()
+        );
+    }
+
+    #[test]
+    fn single_line_excerpt_collapses_whitespace_at_the_boundary() {
+        assert_eq!(single_line_excerpt("  a \n\t b  ", 8), "a b");
+        assert_eq!(single_line_excerpt("a b c", 3), "a b…");
+        assert_eq!(single_line_excerpt("a b", 3), "a b");
+        assert_eq!(single_line_excerpt("a b", 2), "a …");
+    }
+
     // -----------------------------------------------------------------------
     // Chain: table order, fall-through, and the shared rotation budget
     // -----------------------------------------------------------------------
@@ -1476,20 +1624,26 @@ mod tests {
     }
 
     #[test]
-    fn any_audio_mp4_is_preferred_over_other_audio_containers() {
+    fn an_unknown_but_audio_mp4_format_still_resolves() {
         // An unknown/renumbered itag in the right container still beats a known
         // Opus format, because the app's decoder path is m4a.
         let response = response_with(&[audio(251, OPUS_MIME), audio(999, AAC_MIME)]);
         assert_eq!(selected(&response).expect("audio").itag, 999);
     }
 
+    /// A WebM/Opus-only response is not directly playable: rodio cannot decode
+    /// it, and the download path would publish it as `.m4a`. It must be a
+    /// distinct error, not a "last resort" that only fails at decode time.
     #[test]
-    fn any_audio_only_format_is_the_last_resort() {
+    fn a_webm_opus_only_response_is_no_audio_format() {
         let response = response_with(&[
             json!({ "itag": 137, "mimeType": "video/mp4", "url": "https://example.invalid/137" }),
+            // Even a known itag is not playable when its server-reported
+            // container says WebM.
+            audio(140, OPUS_MIME),
             audio(251, OPUS_MIME),
         ]);
-        assert_eq!(selected(&response).expect("audio").itag, 251);
+        assert!(matches!(selected(&response), Err(Error::NoAudioFormat)));
     }
 
     #[test]

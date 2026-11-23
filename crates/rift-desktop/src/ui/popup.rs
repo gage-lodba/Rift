@@ -125,9 +125,10 @@ impl Ui {
     ///
     /// `content_size` is the size of the *content* inside the popup (the 4px
     /// padding and 1px border are added for you). The closure receives the
-    /// content rectangle. Clicking outside the popup and its anchor closes it;
-    /// Escape closes it; call [`Ui::close_popup`] from inside the closure when an
-    /// item is activated.
+    /// content rectangle. Clicking outside the popup and its anchor closes it
+    /// and consumes that whole press/release gesture, so the control underneath
+    /// does not also activate; Escape closes it; call [`Ui::close_popup`] from
+    /// inside the closure when an item is activated.
     pub fn popup<R>(
         &mut self,
         id: Id,
@@ -221,6 +222,12 @@ impl Ui {
             && !menu_rect.contains(pos.x, pos.y)
             && !anchor.contains(pos.x, pos.y);
         if outside {
+            // The press belongs to the dismissal, not to whatever control sits
+            // under the pointer. Consume the whole gesture: without this a row
+            // under the press latches `active` now and fires its action on the
+            // release frame, when the popup is already closed. Later widgets
+            // this frame are inert too (the popup layer runs before content).
+            self.suppress_pointer_gesture();
             self.close_popup();
         }
         Some(out)

@@ -11,8 +11,9 @@
 //! audio-thread pump, background download jobs and the media/Discord threads
 //! alike.
 //!
-//! The variants keep the old event payloads **1:1**, so the app crate ports
-//! straight across from the legacy web event handlers:
+//! The variants keep the old event payloads **1:1** (one addition,
+//! [`BackendEvent::DownloadProgress`], has no legacy counterpart), so the app
+//! crate ports straight across from the legacy web event handlers:
 //!
 //! | Old shell event | Event | Payload |
 //! |---|---|---|
@@ -22,6 +23,7 @@
 //! | `rift://progress` | [`BackendEvent::Progress`] | [`rift_types::Progress`] |
 //! | `rift://library` | [`BackendEvent::Library`] | [`rift_types::Library`] |
 //! | `rift://downloads` | [`BackendEvent::Downloads`] | [`rift_types::DownloadState`] |
+//! | *new* | [`BackendEvent::DownloadProgress`] | `id` + `permille` |
 //! | `rift://error` | [`BackendEvent::Error`] | `String` (toast) |
 //! | `rift://notice` | [`BackendEvent::Notice`] | `String` (toast) |
 //! | `rift://open_playlist` | [`BackendEvent::OpenPlaylist`] | `String` (playlist id) |
@@ -51,6 +53,20 @@ pub enum BackendEvent {
     Library(Library),
     /// Offline-download status changed.
     Downloads(DownloadState),
+    /// One in-flight download's byte progress changed.
+    ///
+    /// Emitted by the download worker's throttled progress callback instead of a
+    /// whole [`BackendEvent::Downloads`] snapshot, so a per-chunk update does not
+    /// clone the three status sets. Lifecycle transitions (claim, finish, fail,
+    /// remove) still arrive as `Downloads` snapshots; a consumer applies this
+    /// fraction to its current `DownloadState::progress` map and leaves the sets
+    /// alone. A later snapshot is authoritative and clears the fraction itself.
+    DownloadProgress {
+        /// Track whose offline transfer advanced.
+        id: String,
+        /// Completed fraction in permille (`0..=1000`), clamped by the backend.
+        permille: u16,
+    },
     /// A user-facing error toast.
     Error(String),
     /// A user-facing informational toast.
@@ -61,7 +77,9 @@ pub enum BackendEvent {
 }
 
 impl BackendEvent {
-    /// The legacy event name this variant replaces.
+    /// The legacy event name this variant replaces, or — for a backend-only
+    /// addition such as [`BackendEvent::DownloadProgress`] — the `rift://` name
+    /// it publishes under.
     ///
     /// Kept for parity, logging and tests: the app crate migrates from the old
     /// web handlers by event name, so having the old name visible makes the
@@ -75,6 +93,7 @@ impl BackendEvent {
             BackendEvent::Progress(_) => "rift://progress",
             BackendEvent::Library(_) => "rift://library",
             BackendEvent::Downloads(_) => "rift://downloads",
+            BackendEvent::DownloadProgress { .. } => "rift://download_progress",
             BackendEvent::Error(_) => "rift://error",
             BackendEvent::Notice(_) => "rift://notice",
             BackendEvent::OpenPlaylist(_) => "rift://open_playlist",
@@ -195,6 +214,10 @@ mod tests {
             }),
             BackendEvent::Library(Library::default()),
             BackendEvent::Downloads(DownloadState::default()),
+            BackendEvent::DownloadProgress {
+                id: "id".into(),
+                permille: 500,
+            },
             BackendEvent::Error("boom".into()),
             BackendEvent::Notice("hi".into()),
             BackendEvent::OpenPlaylist("pl".into()),
@@ -215,6 +238,7 @@ mod tests {
                 "rift://progress",
                 "rift://library",
                 "rift://downloads",
+                "rift://download_progress",
                 "rift://error",
                 "rift://notice",
                 "rift://open_playlist",

@@ -1,9 +1,9 @@
 # cargo-deny configuration — the supply-chain gate for the dependency graph.
 #
 # Run by `.github/workflows/ci.yml` (the `deny` job) on every push and pull
-# request, and by `tools/ci-local.ps1` as an optional local step when
-# `cargo deny` is installed. `cargo deny check` runs four checks, each with a
-# section below:
+# request, and by the local gate (`tools/ci-local.sh` / `tools/ci-local.ps1`)
+# as an optional local step when `cargo deny` is installed. `cargo deny check`
+# runs four checks, each with a section below:
 #
 #   advisories — known vulnerabilities (RustSec), unmaintained/yanked crates
 #   licenses   — every crate in the graph must be under an allowed license

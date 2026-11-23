@@ -20,6 +20,15 @@ const WIN_GLYPH: f32 = 14.0;
 // titlebar
 // ---------------------------------------------------------------------------
 
+/// The search field's stable id.
+///
+/// Shared with `app.rs` so the debounce flush can tell whether the field still
+/// owns focus after the frame that may have blurred it (`lost_focus` itself is
+/// reported one frame later).
+pub(crate) fn search_input_id() -> Id {
+    Id::from_str("titlebar/search-input")
+}
+
 /// The 46 px window titlebar: logo + wordmark, centred search box, window
 /// controls, and the drag region. Window commands go through `actions`
 /// (`Action::WindowDrag`, `WindowMinimize`, `WindowToggleMaximize`,
@@ -74,7 +83,7 @@ pub fn titlebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect:
         (btn_rect.x - box_rect.x - 1.0).max(0.0),
         box_rect.h - 2.0,
     );
-    let input_id = Id::from_str("titlebar/search-input");
+    let input_id = search_input_id();
     // Move the query out for the widget (the text input binds `&mut String`) and
     // put it back before returning: cloning it every frame would allocate on the
     // hot path, and nothing else reads it during the titlebar pass (main content
@@ -104,16 +113,17 @@ pub fn titlebar(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, rect:
     if focused {
         ui.stroke(box_rect.expand(1.0), 6.5, 1.0, theme.focus);
     }
+    if input.lost_focus {
+        // The user clicked another control: drop any pending debounced search so
+        // it cannot yank the view to Search ~300 ms later.
+        actions.push(Action::SearchBlur);
+    }
     if input.changed {
+        // The box only reports the edit; `app.rs` owns the 300 ms debounce
+        // (ui-spec §6.1) and dispatches `Action::Search` once the text is stable.
+        // Enter and the Search button submit immediately below.
         actions.push(Action::SearchQueryChanged(query.clone()));
-        // The old box live-searched on a 300 ms debounce; the native port issues
-        // the command on the edit frame (the controller's search generation keeps
-        // stale results from landing, and the acceptance harness expects the
-        // command on the typing frame).
-        let trimmed = query.trim();
-        if !trimmed.is_empty() {
-            actions.push(Action::Search(trimmed.to_string()));
-        } else if state.view == View::Search {
+        if query.trim().is_empty() && state.view == View::Search {
             // Clearing the box leaves Search for Home (`SearchClear`, ui-spec §7.4).
             actions.push(Action::Navigate(View::Home));
         }

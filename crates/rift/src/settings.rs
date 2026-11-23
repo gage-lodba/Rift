@@ -72,6 +72,13 @@ pub struct SettingsStore {
     /// Preview mode: settings live in memory only; nothing touches disk, and
     /// the user's real settings.json is neither read nor overwritten.
     ephemeral: bool,
+    /// Set when `settings.json` existed but could not be read **and** could not
+    /// be moved aside: writing the in-memory defaults would destroy the user's
+    /// only copy, so [`save`](Self::save) refuses to write for this session.
+    read_only: bool,
+    /// The startup toast for a load that could not read the file, held until the
+    /// backend's event bus exists — this store is constructed before it.
+    load_warning: Option<String>,
     /// The backend's durable writer. Every save is queued to it, so the UI-thread
     /// setters below (slider release, toggles) return without waiting for disk.
     writer: Arc<DurableWriter>,
@@ -88,10 +95,14 @@ impl SettingsStore {
                 path,
                 data: Settings::default(),
                 ephemeral: true,
+                read_only: false,
+                load_warning: None,
                 writer: Arc::clone(writer),
             };
         }
-        let mut data: Settings = crate::util::load_json(&path);
+        let (mut data, status) = crate::util::load_json_with_status::<Settings>(&path);
+        let read_only = !status.may_overwrite();
+        let load_warning = status.warning(&path);
         // A hand-edited settings.json can carry out-of-range values; clamp here
         // so the volume slider and crossfade logic see sane bounds every launch.
         data.volume = clamp_setting(data.volume, 1.0);
@@ -100,6 +111,8 @@ impl SettingsStore {
             path,
             data,
             ephemeral: false,
+            read_only,
+            load_warning,
             writer: Arc::clone(writer),
         }
     }
@@ -110,14 +123,27 @@ impl SettingsStore {
     /// and the durable writer serializes + atomically writes the snapshot in
     /// queue order. `DurableWriter::flush` is the barrier tests use; the backend
     /// flushes on shutdown so the last change survives a quit.
+    ///
+    /// Refuses to write when the load could neither read nor preserve
+    /// `settings.json`: the defaults in memory are not the user's settings, and
+    /// saving them would overwrite the one copy that is still on disk.
     fn save(&self) {
-        if self.ephemeral {
+        if self.ephemeral || self.read_only {
             return;
         }
         self.writer
             .write(self.path.clone(), "settings", self.data.clone(), |data| {
                 serde_json::to_vec_pretty(data).map_err(|e| e.to_string())
             });
+    }
+
+    /// The warning for a load that could not read `settings.json`, or `None`
+    /// when the load was clean.
+    ///
+    /// The backend emits this once its event bus exists; it is empty here
+    /// because loading runs during construction, before the bus.
+    pub(crate) fn load_warning(&self) -> Option<&str> {
+        self.load_warning.as_deref()
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -155,6 +181,96 @@ mod tests {
     fn temp_store(dir: &TempDir) -> (SettingsStore, Arc<DurableWriter>) {
         let writer = Arc::new(DurableWriter::spawn());
         (SettingsStore::load(dir.path(), &writer), writer)
+    }
+
+    /// A first launch: no file, in-memory defaults, and the first change writes
+    /// the file. Missing is not an error.
+    #[test]
+    fn a_missing_settings_file_loads_defaults_and_stays_writable() {
+        let dir = TempDir::new("settings-missing");
+        let (mut store, writer) = temp_store(&dir);
+        assert_eq!(store.data.volume, 1.0);
+        assert!(!dir.join("settings.json").exists());
+
+        store.set_volume(0.5);
+        assert!(writer.flush(), "the save must reach disk");
+        assert!(dir.join("settings.json").is_file());
+        let restored = SettingsStore::load(dir.path(), &writer).data;
+        assert!((restored.volume - 0.5).abs() < 1e-6);
+    }
+
+    /// A readable-but-corrupt file keeps its historical path: quarantine it,
+    /// start from defaults, and let the next change write a fresh file.
+    #[test]
+    fn a_corrupt_settings_file_is_quarantined_and_stays_writable() {
+        let dir = TempDir::new("settings-corrupt");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"{ not json").expect("seed corrupt file");
+
+        let (mut store, writer) = temp_store(&dir);
+        store.set_volume(0.25);
+        assert!(writer.flush(), "the fresh settings must be written");
+
+        assert_eq!(
+            std::fs::read(path.with_extension("json.bad")).expect("the corrupt original"),
+            b"{ not json"
+        );
+        let restored = SettingsStore::load(dir.path(), &writer).data;
+        assert!((restored.volume - 0.25).abs() < 1e-6, "writable as before");
+    }
+
+    /// The bug: an existing-but-unreadable file is not "no file". When even the
+    /// quarantine rename fails, the store is read-only and a change + save must
+    /// leave the original bytes untouched.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_settings_file_that_cannot_be_quarantined_is_never_overwritten() {
+        let dir = TempDir::new("settings-unreadable");
+        if crate::util::testing::running_as_root(&dir) {
+            return; // permission bits do not stop root
+        }
+        let path = dir.join("settings.json");
+        let stored = Settings {
+            volume: 0.25,
+            ..Settings::default()
+        };
+        crate::util::save_json(&path, &stored, "settings");
+        let original = std::fs::read(&path).expect("seed bytes");
+
+        let guard = crate::util::testing::UnreadableFile::apply(dir.path(), &path);
+        guard.lock_parent_dir();
+
+        let (mut store, writer) = temp_store(&dir);
+        assert!(
+            store.read_only,
+            "the load must put the store in read-only mode"
+        );
+        assert!(
+            store
+                .load_warning()
+                .is_some_and(|w| w.contains("changes will not be saved")),
+            "the backend needs a startup warning: {:?}",
+            store.load_warning()
+        );
+        store.set_volume(0.75);
+        assert!(
+            writer.flush(),
+            "nothing is queued, so this drains instantly"
+        );
+
+        guard.make_file_readable();
+        assert_eq!(
+            std::fs::read(&path).expect("the original must still be there"),
+            original,
+            "an unreadable settings file that could not be quarantined must not be overwritten"
+        );
+        assert!(
+            !path.with_extension("json.bad").exists(),
+            "the failed quarantine must not leave a bogus backup"
+        );
+        // And the stored value is still the one the file held, not the default.
+        let restored = SettingsStore::load(dir.path(), &writer).data;
+        assert!((restored.volume - 0.25).abs() < 1e-6);
     }
 
     #[test]

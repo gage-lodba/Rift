@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use rift::fetch::safe_stem;
 use rift_desktop::app::App;
 use rift_desktop::controller::{Controller, ControllerEvent};
 use rift_desktop::state::{Action, View};
@@ -212,6 +213,7 @@ fn kind(event: &ControllerEvent) -> &'static str {
         ControllerEvent::Progress(_) => "Progress",
         ControllerEvent::Library(_) => "Library",
         ControllerEvent::Downloads(_) => "Downloads",
+        ControllerEvent::DownloadProgress { .. } => "DownloadProgress",
         ControllerEvent::Error(_) => "Error",
         ControllerEvent::Notice(_) => "Notice",
         ControllerEvent::OpenPlaylist(_) => "OpenPlaylist",
@@ -741,11 +743,15 @@ fn live_native_playback_download_progress_and_offline_restart() {
     let mut saw_progress = false;
     let mut max_permille = 0u16;
     live.poll_until(NETWORK_TIMEOUT, |event| {
-        if let ControllerEvent::Downloads(state) = event {
-            if let Some(permille) = state.progress.get(&track.id) {
+        // Progress travels in its own lightweight event; the `Downloads`
+        // snapshots are lifecycle transitions and no longer carry a fraction.
+        if let ControllerEvent::DownloadProgress { id, permille } = event {
+            if id == &track.id {
                 saw_progress = true;
                 max_permille = max_permille.max(*permille);
             }
+        }
+        if let ControllerEvent::Downloads(state) = event {
             state.downloaded.contains(&track.id)
         } else {
             false
@@ -763,7 +769,7 @@ fn live_native_playback_download_progress_and_offline_restart() {
     let offline_file = live
         .data_dir
         .join("downloads")
-        .join(format!("{}.m4a", track.id));
+        .join(format!("{}.m4a", safe_stem(&track.id)));
     let size = std::fs::metadata(&offline_file)
         .expect("the offline audio file should exist")
         .len();

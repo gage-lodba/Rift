@@ -126,6 +126,19 @@ fn run(id: &str, data_dir: &std::path::Path) -> anyhow::Result<()> {
                         failure = Some("the backend marked the download failed".to_owned());
                     }
                 }
+                // Live progress moved off the whole-state snapshots to a
+                // lightweight per-id event; the snapshots now arrive only at
+                // lifecycle transitions and no longer carry the fraction.
+                BackendEvent::DownloadProgress {
+                    id: progress_id,
+                    permille,
+                } if progress_id == id => {
+                    if last_progress != Some(permille) {
+                        println!("progress {permille:>4}‰");
+                        last_progress = Some(permille);
+                        samples += 1;
+                    }
+                }
                 BackendEvent::Error(message) => {
                     eprintln!("backend error: {message}");
                     failure = Some(message);
@@ -139,7 +152,9 @@ fn run(id: &str, data_dir: &std::path::Path) -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    let file = data_dir.join("downloads").join(format!("{id}.m4a"));
+    let file = data_dir
+        .join("downloads")
+        .join(format!("{}.m4a", rift::fetch::safe_stem(id)));
     let saved = std::fs::read(&file).ok();
     let decoded = saved.as_deref().map(decode_length);
     let bytes = saved.as_ref().map_or(0, Vec::len);
@@ -158,7 +173,7 @@ fn run(id: &str, data_dir: &std::path::Path) -> anyhow::Result<()> {
         (Some(error), ..) => format!("FAILED: {error}"),
         (None, false, _) => "FAILED: timed out before the track was reported downloaded".to_owned(),
         (None, true, Some(Err(error))) => format!("FAILED: saved file does not decode: {error:#}"),
-        (None, true, None) => format!("FAILED: reported downloaded but {id}.m4a is missing"),
+        (None, true, None) => format!("FAILED: reported downloaded but {} is missing", file.display()),
         // The feature under test is the determinate bar: a download that
         // completed without a single progress fraction reaching the event bus
         // is a regression, not a pass.

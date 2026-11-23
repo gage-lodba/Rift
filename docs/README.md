@@ -15,8 +15,8 @@ native app.
 | [`native-streaming.md`](native-streaming.md) | Clean-room native audio streaming: the validated JS-less resolver/client table, ranged downloader, per-track progress contract/UI, verification record and phase history (including the yt-dlp removal). |
 | [`imgui-api.md`](imgui-api.md) | The hand-written immediate-mode GUI: layout, text, input, widgets, popups, ids and the per-frame contract used by the screens. |
 | [`ui-spec.md`](ui-spec.md) | Screen-by-screen visual/behavioural specification: design tokens, geometry, states and interactions. |
-| [`controller-notes.md`](controller-notes.md) | UI-to-backend bridge: command mapping table, threading model, stale-generation rules and the cover pipeline. |
-| [`native-platform.md`](native-platform.md) | Native window-state persistence and the single-instance guard. |
+| [`controller-notes.md`](controller-notes.md) | UI-to-backend bridge: module layout, command mapping table, threading model, stale-generation rules and the cover pipeline. |
+| [`native-platform.md`](native-platform.md) | Native window-state persistence, the single-instance guard and the Linux desktop launcher (entry/identity contract, installer, icon theme, guard tests). |
 
 Related repository notes:
 

@@ -20,7 +20,11 @@ use crate::ui::{Id, Rect, Sense, Ui};
 /// Content height (no main padding) for [`view`].
 pub fn height(_ui: &mut Ui, state: &State, _width: f32, id: &str) -> f32 {
     let Some(page) = state.album_page.as_ref().filter(|p| p.id == id) else {
-        return pages::EMPTY_H;
+        return if state.page_error.is_some() {
+            pages::PAGE_ERROR_H
+        } else {
+            pages::EMPTY_H
+        };
     };
     meta_height(&page.tracks).max(pages::ALBUM_ART)
         + pages::PAGE_HEAD_MARGIN_BOTTOM
@@ -45,7 +49,14 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
     let page = state.album_page.take();
     let Some(album) = page.as_ref().filter(|page| page.id == id) else {
         state.album_page = page;
-        pages::empty(ui, area.x, area.y, area.w, "Loading album...");
+        match state.page_error.as_deref() {
+            Some(message) => {
+                pages::error_state(ui, actions, area.x, area.y, area.w, message);
+            }
+            None => {
+                pages::empty(ui, area.x, area.y, area.w, "Loading album...");
+            }
+        }
         return;
     };
     let theme = ui.theme().clone();
@@ -163,6 +174,20 @@ mod tests {
         let mut ui = Ui::new();
         let state = State::default();
         assert_eq!(height(&mut ui, &state, 766.0, "x"), pages::EMPTY_H);
+    }
+
+    #[test]
+    fn a_failed_album_load_reserves_the_retry_state_height() {
+        let mut ui = Ui::new();
+        let state = State {
+            page_error: Some("could not load album: offline".into()),
+            ..State::default()
+        };
+        assert_eq!(
+            height(&mut ui, &state, 766.0, "x"),
+            pages::PAGE_ERROR_H,
+            "a failed load must not keep reporting the loading height"
+        );
     }
 
     #[test]

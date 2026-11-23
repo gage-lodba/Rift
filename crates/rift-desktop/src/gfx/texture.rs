@@ -2,15 +2,19 @@
 //!
 //! The UI owns the id space and tells the renderer what changed:
 //! * `PaintList::created` — new `TextureUpload`s (glyph atlas, cover art, …);
-//! * `PaintList::updated` — replacement pixels for an existing id (the font
-//!   atlas grows 1024 -> 2048 when glyphs run out, so this is a full replace);
+//! * `PaintList::updated` — a [`TextureUpdate`]: `Whole` replaces the image
+//!   (texture growth, or the atlas re-created after a scale change, so the
+//!   dimensions may change), `Region` overwrites only a dirty sub-rectangle
+//!   (each newly rasterised glyph). A whole update wins over a region for the
+//!   same id in one frame;
 //! * `PaintList::dropped`  — ids the UI will never reference again.
 //!
 //! For each id the renderer keeps an `R8G8B8A8_SRGB` device-local image, an
 //! image view, and a descriptor set with a combined image sampler. Uploads go
 //! through a host-visible staging buffer and a one-shot command buffer that is
-//! waited on; uploads are infrequent (texture creation / atlas growth), so the
-//! simple synchronous path is worth more than a frame of latency. Pixel data is
+//! waited on once per frame (whole images and regions share the batch); the
+//! simple synchronous wait keeps image-layout/ordering correct, and the region
+//! path is what keeps a typed glyph from copying the whole atlas. Pixel data is
 //! sRGB-encoded RGBA8, exactly what the PNG/JPEG decode and the font rasteriser
 //! produce; the sRGB image format makes the sampler decode it to linear light.
 //!
@@ -24,7 +28,7 @@ use anyhow::{Context as _, Result};
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
-        AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferToImageInfo,
+        AutoCommandBufferBuilder, BufferImageCopy, CommandBufferUsage, CopyBufferToImageInfo,
         PrimaryCommandBufferAbstract,
     },
     descriptor_set::{layout::DescriptorSetLayout, DescriptorSet, WriteDescriptorSet},
@@ -40,7 +44,7 @@ use vulkano::{
 
 use crate::gfx::{
     gpu::GfxContext,
-    paint::{PaintList, TextureId, TextureUpload, NO_TEXTURE},
+    paint::{PaintList, TextureId, TextureRegion, TextureUpdate, TextureUpload, NO_TEXTURE},
 };
 
 /// How many frames a replaced/dropped texture is kept alive (must be at least
@@ -50,6 +54,9 @@ const RETIRE_FRAMES: u64 = 4;
 /// A texture's GPU resources plus the descriptor set used to bind it.
 pub(crate) struct GpuTexture {
     pub set: Arc<DescriptorSet>,
+    /// Image dimensions, cached for region-upload bounds checks.
+    width: u32,
+    height: u32,
     // Kept alive for as long as `set`/frames may reference them.
     _view: Arc<ImageView>,
     _image: Arc<Image>,
@@ -177,11 +184,19 @@ impl TextureManager {
             .context("reallocating a texture descriptor set")
         };
 
+        // Build every fallible set first. Mutating the live manager as we go
+        // would leave some sets on the new layout and the rest on the old one
+        // if a later allocation failed, which is invalid for the new pipeline.
         let white_set = build(&self.white._view)?;
+        let mut replacement = Vec::with_capacity(self.textures.len());
+        for (id, texture) in &self.textures {
+            replacement.push((*id, build(&texture._view)?));
+        }
         self.white.set = white_set;
-        for texture in self.textures.values_mut() {
-            let set = build(&texture._view)?;
-            texture.set = set;
+        for (id, set) in replacement {
+            if let Some(texture) = self.textures.get_mut(&id) {
+                texture.set = set;
+            }
         }
         self.set_layout = set_layout;
         Ok(())
@@ -189,9 +204,14 @@ impl TextureManager {
 
     /// Applies one frame's `created` / `updated` / `dropped` lists.
     ///
-    /// All uploads of the frame are batched into one command buffer and the CPU
-    /// waits for it; the paint list is small and uploads are rare, so this keeps
-    /// the in-flight tracking trivial and bug-free.
+    /// Whole uploads (texture creation, atlas growth/re-creation) allocate a new
+    /// image; region uploads (incremental glyphs) copy only their dirty
+    /// rectangle into the existing image. Everything is batched into one command
+    /// buffer and the CPU waits once, so the frame that adds a glyph still has a
+    /// single fence wait — but the copied bytes are the dirty rect, not the whole
+    /// atlas. The wait is kept (rather than chaining the upload future into the
+    /// draw) because it makes image-layout/first-use ordering trivially correct;
+    /// the data volume, not the wait, was the per-frame cost.
     pub fn sync(&mut self, paint: &PaintList) -> Result<()> {
         self.frame += 1;
         self.dropped_total += paint.dropped.len() as u64;
@@ -203,45 +223,66 @@ impl TextureManager {
             }
         }
 
-        // `updated` replaces the whole texture (atlas growth); `created` inserts.
-        // An id may appear in both if the UI re-created it this frame.
-        let mut uploads: Vec<&TextureUpload> = Vec::new();
-        for upload in paint.created.iter().chain(paint.updated.iter()) {
-            if upload.width == 0 || upload.height == 0 {
+        // A whole upload (created or updated) supersedes region updates for the
+        // same id in this frame; for whole uploads the last one wins. `created`
+        // is iterated before `updated`, matching the paint contract.
+        let mut full_uploads: Vec<&TextureUpload> = Vec::new();
+        for upload in &paint.created {
+            if !valid_full_upload(upload) {
                 continue;
             }
-            let expected = upload.width as usize * upload.height as usize * 4;
-            if upload.rgba.len() != expected {
-                tracing::warn!(
-                    id = upload.id,
-                    width = upload.width,
-                    height = upload.height,
-                    got = upload.rgba.len(),
-                    expected,
-                    "ignoring texture upload with the wrong pixel buffer size"
-                );
-                continue;
-            }
-            // Last upload for an id wins (created before updated, per contract).
-            uploads.retain(|other| other.id != upload.id);
-            uploads.push(upload);
+            full_uploads.retain(|other| other.id != upload.id);
+            full_uploads.push(upload);
         }
+        let mut regions: Vec<&TextureRegion> = Vec::new();
+        for update in &paint.updated {
+            match update {
+                TextureUpdate::Whole(upload) => {
+                    if !valid_full_upload(upload) {
+                        continue;
+                    }
+                    full_uploads.retain(|other| other.id != upload.id);
+                    full_uploads.push(upload);
+                }
+                TextureUpdate::Region(region) => {
+                    if region.width == 0 || region.height == 0 {
+                        continue;
+                    }
+                    let expected = region.width as usize * region.height as usize * 4;
+                    if region.rgba.len() != expected {
+                        tracing::warn!(
+                            id = region.id,
+                            width = region.width,
+                            height = region.height,
+                            got = region.rgba.len(),
+                            expected,
+                            "ignoring texture region update with the wrong pixel buffer size"
+                        );
+                        continue;
+                    }
+                    regions.push(region);
+                }
+            }
+        }
+        regions.retain(|region| !full_uploads.iter().any(|upload| upload.id == region.id));
 
-        if !uploads.is_empty() || !paint.dropped.is_empty() {
+        if !full_uploads.is_empty() || !regions.is_empty() || !paint.dropped.is_empty() {
             tracing::debug!(
                 created = paint.created.len(),
                 updated = paint.updated.len(),
                 dropped = paint.dropped.len(),
-                uploaded = uploads.len(),
-                upload_ids = ?uploads.iter().map(|upload| upload.id).collect::<Vec<_>>(),
+                full = full_uploads.len(),
+                regions = regions.len(),
+                uploaded_ids = ?full_uploads.iter().map(|upload| upload.id).collect::<Vec<_>>(),
+                region_ids = ?regions.iter().map(|region| region.id).collect::<Vec<_>>(),
                 dropped_ids = ?paint.dropped,
                 live = self.textures.len(),
                 "texture sync"
             );
         }
 
-        if !uploads.is_empty() {
-            let mut staging = Vec::with_capacity(uploads.len());
+        if !full_uploads.is_empty() || !regions.is_empty() {
+            let mut staging = Vec::new();
             let mut builder = AutoCommandBufferBuilder::primary(
                 self.command_buffer_allocator.clone(),
                 self.queue.queue_family_index(),
@@ -249,22 +290,11 @@ impl TextureManager {
             )
             .context("recording the texture upload command buffer")?;
 
-            for upload in &uploads {
+            // Whole uploads first: the new image may also be the target of no
+            // region (regions for the same id were dropped above).
+            for upload in &full_uploads {
                 let image = upload_image(&self.memory_allocator, upload.width, upload.height)?;
-                let buffer = Buffer::from_iter(
-                    self.memory_allocator.clone(),
-                    BufferCreateInfo {
-                        usage: BufferUsage::TRANSFER_SRC,
-                        ..Default::default()
-                    },
-                    AllocationCreateInfo {
-                        memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                        ..Default::default()
-                    },
-                    upload.rgba.iter().copied(),
-                )
-                .context("allocating the texture staging buffer")?;
+                let buffer = staging_buffer(&self.memory_allocator, upload.rgba.iter().copied())?;
                 builder
                     .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
                         buffer.clone(),
@@ -272,6 +302,64 @@ impl TextureManager {
                     ))
                     .context("recording a staging -> image copy")?;
                 staging.push((image, buffer));
+            }
+
+            // Region uploads patch an image that already exists. A stale id or
+            // an out-of-bounds rectangle is a UI bug, not a reason to lose the
+            // rest of the frame (and it can only paint a wrong texel until the
+            // next full upload), so log and skip it.
+            //
+            // Synchronization: Vulkano's `AutoCommandBufferBuilder` inserts its
+            // primary-command-buffer first-use barrier (src stages/access
+            // `ALL_COMMANDS`/`MEMORY_READ|MEMORY_WRITE`) for this image and
+            // transitions from its required `ShaderReadOnlyOptimal` layout to
+            // the copy's `TransferDstOptimal`; the builder's final barrier
+            // restores the sampled layout. That orders this write after the
+            // previously submitted frame's sampling. Do not replace this with a
+            // raw copy command without reproducing that barrier + transition.
+            for region in &regions {
+                let Some(texture) = self.textures.get(&region.id) else {
+                    tracing::warn!(
+                        id = region.id,
+                        "ignoring a texture region update for an unknown texture"
+                    );
+                    continue;
+                };
+                if region
+                    .x
+                    .checked_add(region.width)
+                    .is_none_or(|right| right > texture.width)
+                    || region
+                        .y
+                        .checked_add(region.height)
+                        .is_none_or(|bottom| bottom > texture.height)
+                {
+                    tracing::warn!(
+                        id = region.id,
+                        x = region.x,
+                        y = region.y,
+                        width = region.width,
+                        height = region.height,
+                        texture_width = texture.width,
+                        texture_height = texture.height,
+                        "ignoring a texture region update outside the image bounds"
+                    );
+                    continue;
+                }
+                let image = texture._image.clone();
+                let buffer = staging_buffer(&self.memory_allocator, region.rgba.iter().copied())?;
+                let mut info = CopyBufferToImageInfo::buffer_image(buffer.clone(), image);
+                info.regions.clear();
+                info.regions.push(BufferImageCopy {
+                    image_subresource: info.dst_image.subresource_layers(),
+                    image_offset: [region.x, region.y, 0],
+                    image_extent: [region.width, region.height, 1],
+                    ..Default::default()
+                });
+                builder
+                    .copy_buffer_to_image(info)
+                    .context("recording a staging -> image region copy")?;
+                staging.push((Arc::clone(&texture._image), buffer));
             }
 
             let command_buffer = builder
@@ -287,7 +375,12 @@ impl TextureManager {
             // `staging` can be dropped now: the upload has completed and the
             // device-local images are the only remaining references.
 
-            for (upload, (image, _buffer)) in uploads.iter().zip(staging) {
+            for (upload, (image, _buffer)) in full_uploads.iter().zip(
+                staging
+                    .into_iter()
+                    .take(full_uploads.len())
+                    .collect::<Vec<_>>(),
+            ) {
                 let texture = self.create_gpu_texture(image)?;
                 let previous = self.textures.insert(upload.id, texture);
                 self.created_total += 1;
@@ -362,6 +455,51 @@ impl TextureManager {
     }
 }
 
+/// Validate a whole-texture upload's declared dimensions against its payload.
+fn valid_full_upload(upload: &TextureUpload) -> bool {
+    if upload.width == 0 || upload.height == 0 {
+        return false;
+    }
+    let expected = upload.width as usize * upload.height as usize * 4;
+    if upload.rgba.len() != expected {
+        tracing::warn!(
+            id = upload.id,
+            width = upload.width,
+            height = upload.height,
+            got = upload.rgba.len(),
+            expected,
+            "ignoring texture upload with the wrong pixel buffer size"
+        );
+        return false;
+    }
+    true
+}
+
+/// Allocate a host-visible staging buffer holding exactly these bytes.
+fn staging_buffer<I>(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    bytes: I,
+) -> Result<vulkano::buffer::Subbuffer<[u8]>>
+where
+    I: IntoIterator<Item = u8>,
+    I::IntoIter: ExactSizeIterator,
+{
+    Buffer::from_iter(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        bytes,
+    )
+    .context("allocating the texture staging buffer")
+}
+
 /// Allocates a sampled device-local RGBA8 sRGB image with transfer-dst usage.
 fn upload_image(
     memory_allocator: &Arc<StandardMemoryAllocator>,
@@ -389,6 +527,7 @@ fn build_gpu_texture(
     sampler: &Arc<Sampler>,
     image: Arc<Image>,
 ) -> Result<GpuTexture> {
+    let [width, height, _] = image.extent();
     let view = ImageView::new_default(image.clone()).context("creating a texture image view")?;
     let set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
@@ -403,6 +542,8 @@ fn build_gpu_texture(
     .context("allocating a texture descriptor set")?;
     Ok(GpuTexture {
         set,
+        width,
+        height,
         _view: view,
         _image: image,
     })

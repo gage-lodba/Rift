@@ -29,7 +29,11 @@ fn page_for<'a>(state: &'a State, id: &str) -> Option<&'a rift_types::ArtistPage
 /// Content height (no main padding) for [`view`] (the artist profile).
 pub fn height(ui: &mut Ui, state: &State, width: f32, id: &str) -> f32 {
     let Some(page) = page_for(state, id) else {
-        return pages::EMPTY_H;
+        return if state.page_error.is_some() {
+            pages::PAGE_ERROR_H
+        } else {
+            pages::EMPTY_H
+        };
     };
     let mut h = PAGE_HEAD_H + pages::H2_LINE + pages::VIEW_HEAD_MARGIN_BOTTOM;
     h += track_list::list_height(page.tracks.len());
@@ -63,7 +67,14 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
     let page = state.artist_page.take();
     let Some(artist) = page.as_ref().filter(|page| page.id == id) else {
         state.artist_page = page;
-        pages::empty(ui, area.x, area.y, area.w, "Loading artist...");
+        match state.page_error.as_deref() {
+            Some(message) => {
+                pages::error_state(ui, actions, area.x, area.y, area.w, message);
+            }
+            None => {
+                pages::empty(ui, area.x, area.y, area.w, "Loading artist...");
+            }
+        }
         return;
     };
 
@@ -170,6 +181,7 @@ pub fn songs_height(ui: &mut Ui, state: &State, _width: f32, id: &str) -> f32 {
         .filter(|(cached_id, _)| cached_id == id)
         .map(|(_, t)| t);
     let content = match songs {
+        None if state.page_error.is_some() => pages::PAGE_ERROR_H,
         None => pages::EMPTY_H,
         Some(t) if t.is_empty() => pages::EMPTY_H,
         Some(t) => track_list::list_height(t.len()),
@@ -255,9 +267,14 @@ pub fn songs_view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, are
 
     let y = area.y + head_h;
     match catalogue {
-        None => {
-            pages::empty(ui, area.x, y, area.w, "Loading songs...");
-        }
+        None => match state.page_error.as_deref() {
+            Some(message) => {
+                pages::error_state(ui, actions, area.x, y, area.w, message);
+            }
+            None => {
+                pages::empty(ui, area.x, y, area.w, "Loading songs...");
+            }
+        },
         Some((_, tracks)) if tracks.is_empty() => {
             pages::empty(ui, area.x, y, area.w, "No songs found.");
         }
@@ -293,6 +310,21 @@ mod tests {
         let mut ui = Ui::new();
         let state = State::default();
         assert_eq!(height(&mut ui, &state, 766.0, "x"), pages::EMPTY_H);
+    }
+
+    #[test]
+    fn a_failed_artist_load_reserves_the_retry_state_height() {
+        let mut ui = Ui::new();
+        let state = State {
+            page_error: Some("could not load artist: offline".into()),
+            ..State::default()
+        };
+        assert_eq!(height(&mut ui, &state, 766.0, "x"), pages::PAGE_ERROR_H);
+        assert_eq!(
+            songs_height(&mut ui, &state, 766.0, "x"),
+            pages::PAGE_ERROR_H + 174.0,
+            "the artist-songs head stays, the failed catalogue body shows Retry"
+        );
     }
 
     #[test]

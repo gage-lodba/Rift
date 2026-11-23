@@ -207,8 +207,16 @@ pub struct Renderer {
     retired_vertex_buffers: Vec<(u64, Subbuffer<[Vertex2D]>)>,
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     frame_index: u64,
+    /// The swapchain extent actually in use (physical px), i.e. what the frame
+    /// batch, viewport uniform and scissor bounds must match. A surface may
+    /// clamp this below the window size.
     width: u32,
     height: u32,
+    /// The window size last *requested* (physical px), kept separate from the
+    /// clamped swapchain extent above. Comparing the window against the extent
+    /// instead would see a surface-clamped extent as a permanent resize and
+    /// recreate the swapchain every frame.
+    requested_size: [u32; 2],
     scale_factor: f32,
     recreate_swapchain: bool,
     /// Texture ids referenced by a `PaintList` that the renderer has never seen;
@@ -225,11 +233,65 @@ enum Target {
         _surface: Arc<Surface>,
         swapchain: Arc<Swapchain>,
         framebuffers: Vec<Arc<Framebuffer>>,
+        /// Whether `swapchain` may already be retired by a `recreate` attempt.
+        swapchain_retirement: SwapchainRetirement,
     },
     Offscreen {
         image: Arc<Image>,
         framebuffer: Arc<Framebuffer>,
     },
+}
+
+/// Which creation call the next window-swapchain rebuild may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapchainRebuild {
+    /// The swapchain stored in [`Target::Window`] has never been passed to
+    /// [`Swapchain::recreate`], so it is still a legal `oldSwapchain`.
+    Recreate,
+    /// The stored swapchain was (or may have been) retired by an earlier
+    /// `recreate` attempt, so only [`Swapchain::new`] is safe.
+    Fresh,
+}
+
+/// Whether the swapchain stored in [`Target::Window`] can still be used as the
+/// `oldSwapchain` argument of [`Swapchain::recreate`].
+///
+/// Vulkano marks a swapchain **retired before** it calls `vkCreateSwapchainKHR`
+/// and deliberately leaves it retired when that call fails
+/// (`vulkano-0.35.2/src/swapchain/mod.rs:452-493`): the Vulkan spec allows the
+/// driver to free the old swapchain's images even on failure. A second
+/// `recreate()` on the same `Arc` therefore always fails validation — which used
+/// to freeze the window forever after one transient failure. This state tracks
+/// that retirement, so the rebuild path switches to `Swapchain::new` and stays
+/// there until a replacement swapchain has actually been committed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SwapchainRetirement {
+    /// `true` from the moment a `recreate()` attempt starts until a
+    /// replacement swapchain is stored in [`Target::Window`].
+    may_be_retired: bool,
+}
+
+impl SwapchainRetirement {
+    /// Decide how the next rebuild must create its swapchain and record the
+    /// attempt.
+    ///
+    /// [`SwapchainRebuild::Recreate`] is returned at most once per stored
+    /// swapchain: the plan marks it as possibly retired immediately, because the
+    /// `recreate()` call itself retires it even when creation fails.
+    fn begin_attempt(&mut self) -> SwapchainRebuild {
+        if self.may_be_retired {
+            SwapchainRebuild::Fresh
+        } else {
+            self.may_be_retired = true;
+            SwapchainRebuild::Recreate
+        }
+    }
+
+    /// A replacement swapchain is now stored in [`Target::Window`]. It has not
+    /// been used for a recreation yet, so the next rebuild may use `recreate`.
+    fn commit(&mut self) {
+        self.may_be_retired = false;
+    }
 }
 
 impl Renderer {
@@ -300,6 +362,7 @@ impl Renderer {
                 _surface: surface,
                 swapchain,
                 framebuffers,
+                swapchain_retirement: SwapchainRetirement::default(),
             },
             format,
             pipeline,
@@ -313,6 +376,7 @@ impl Renderer {
             frame_index: 0,
             width,
             height,
+            requested_size: [size.width.max(1), size.height.max(1)],
             scale_factor,
             recreate_swapchain: false,
             missing_textures: HashSet::new(),
@@ -371,6 +435,7 @@ impl Renderer {
             frame_index: 0,
             width,
             height,
+            requested_size: [width, height],
             scale_factor,
             recreate_swapchain: false,
             missing_textures: HashSet::new(),
@@ -404,11 +469,17 @@ impl Renderer {
     /// is not mid-dispatch).
     pub fn resize(&mut self, physical: (u32, u32)) {
         let (width, height) = (physical.0.max(1), physical.1.max(1));
-        if (width, height) == (self.width, self.height) && !self.recreate_swapchain {
+        let changed = window_size_changed(&mut self.requested_size, [width, height]);
+        if !changed && !self.recreate_swapchain {
             return;
         }
-        self.width = width;
-        self.height = height;
+        // A window's extent is the surface-clamped size, assigned by the
+        // rebuild; only the requested size is known here. For the headless
+        // target there is no clamp, so the extent follows immediately.
+        if matches!(self.target, Target::Offscreen { .. }) {
+            self.width = width;
+            self.height = height;
+        }
         self.recreate_swapchain = true;
     }
 
@@ -482,9 +553,22 @@ impl Renderer {
 
     fn frame_window(&mut self, paint: &PaintList) -> Result<()> {
         let frame_started = std::time::Instant::now();
-        let Target::Window { window, .. } = &self.target else {
-            return Ok(());
+        // Clone the window handle so the texture sync below can borrow the
+        // renderer mutably (the `Target` match would otherwise hold `&self`).
+        let window = match &self.target {
+            Target::Window { window, .. } => Arc::clone(window),
+            Target::Offscreen { .. } => return Ok(()),
         };
+
+        // Apply the paint list's texture create/update/drop queue *before* any
+        // early return below. `Ui::end_frame` drains that queue into the
+        // `PaintList` exactly once, and `app.rs` records the new texture ids in
+        // `State` before this call; a frame that skips drawing (minimised, or a
+        // swapchain recreation failure) would otherwise drop the only copy of
+        // the diff, leaving a permanent white cover for the cached id and
+        // leaking every dropped texture.
+        self.textures.sync(paint)?;
+        self.note_missing_textures(paint);
 
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -502,17 +586,24 @@ impl Renderer {
             );
             self.scale_factor = scale_factor;
         }
-        if (size.width, size.height) != (self.width, self.height) {
-            self.width = size.width;
-            self.height = size.height;
+        if window_size_changed(&mut self.requested_size, [size.width, size.height]) {
             self.recreate_swapchain = true;
         }
         if self.recreate_swapchain {
             self.recreate_swapchain = false;
             if let Err(error) = self.recreate_window_swapchain() {
-                // A failed recreation (e.g. window is being moved between
-                // monitors) recovers on the next frame.
-                tracing::warn!("swapchain recreation failed (will retry): {error:#}");
+                // A failed rebuild (e.g. the window is being moved between
+                // monitors) recovers on the next frame — but *not* by retrying
+                // `Swapchain::recreate` on the stored swapchain: vulkano marks
+                // it retired before `vkCreateSwapchainKHR` and keeps it retired
+                // even when that call fails, so a second `recreate()` would
+                // only fail validation and freeze the window. Instead,
+                // `recreate_window_swapchain` falls back to `Swapchain::new`
+                // and records the retirement, so every later frame creates a
+                // fresh swapchain until one is committed.
+                tracing::warn!(
+                    "swapchain rebuild failed (will retry with a fresh swapchain): {error:#}"
+                );
                 self.recreate_swapchain = true;
                 return Ok(());
             }
@@ -522,9 +613,6 @@ impl Renderer {
         if let Some(future) = self.previous_frame_end.as_mut() {
             future.cleanup_finished();
         }
-
-        self.textures.sync(paint)?;
-        self.note_missing_textures(paint);
 
         let batch = FrameBatch::build(self.width, self.height, self.scale_factor, paint);
 
@@ -658,12 +746,23 @@ impl Renderer {
         Ok(())
     }
 
+    /// Rebuild the window swapchain at the current window size.
+    ///
+    /// The stored swapchain is handed to [`Swapchain::recreate`] at most once.
+    /// Vulkano retires it even when `vkCreateSwapchainKHR` fails, so any failure
+    /// falls back to [`Swapchain::new`] through [`create_swapchain_surface`];
+    /// [`SwapchainRetirement`] then keeps following frames on that fresh path
+    /// until a replacement has been committed. A failure *after* creation (a
+    /// format-dependent pipeline or the framebuffers) leaves the retirement flag
+    /// set for the same reason: the next frame must not call `recreate` on the
+    /// retired swapchain.
     fn recreate_window_swapchain(&mut self) -> Result<()> {
         let Target::Window {
             window,
             _surface: surface,
             swapchain,
             framebuffers,
+            swapchain_retirement,
         } = &mut self.target
         else {
             return Ok(());
@@ -682,35 +781,81 @@ impl Renderer {
             .context("querying surface capabilities while recreating the swapchain")?;
         let extent = clamp_swapchain_extent(&caps, [size.width, size.height]);
 
-        let (new_swapchain, new_images) = swapchain
-            .recreate(SwapchainCreateInfo {
-                image_extent: extent,
-                ..swapchain.create_info()
-            })
-            .context("recreating the swapchain after a resize")?;
+        let rebuilt = rebuild_window_swapchain(
+            swapchain_retirement,
+            || {
+                swapchain
+                    .recreate(SwapchainCreateInfo {
+                        image_extent: extent,
+                        ..swapchain.create_info()
+                    })
+                    .map_err(|error| anyhow!("recreating the swapchain after a resize: {error}"))
+            },
+            || {
+                // `Swapchain::new` with no old swapchain: a retired one cannot
+                // poison this attempt. Same format, FIFO present mode and extent
+                // clamping as the startup path (see `create_swapchain_surface`).
+                create_swapchain_surface(
+                    &self.ctx,
+                    surface,
+                    [size.width, size.height],
+                    self.format,
+                    &self.pipeline.render_pass,
+                )
+            },
+        )?;
 
-        if new_swapchain.image_format() != self.format {
-            // Extremely rare (moving to a different surface); rebuild everything
-            // that is format-dependent.
-            tracing::warn!(
-                old = ?self.format,
-                new = ?new_swapchain.image_format(),
-                "swapchain format changed; rebuilding the pipeline"
-            );
-            self.format = new_swapchain.image_format();
-            self.pipeline = create_pipeline(&self.ctx.device, self.format)?;
-            self.uniforms = create_uniform_ring(&self.ctx, &self.pipeline)?;
-            // The texture descriptor sets were allocated against the old
-            // pipeline's set layout; without reallocating them every texture
-            // bind below would be incompatible with the new pipeline layout.
-            self.textures
-                .rebuild_descriptor_sets(self.pipeline.texture_set_layout.clone())?;
-        }
+        let (new_swapchain, new_framebuffers, new_extent) = match rebuilt {
+            RebuiltSwapchain::Recreated((new_swapchain, new_images)) => {
+                if new_swapchain.image_format() == self.format {
+                    (
+                        new_swapchain,
+                        create_framebuffers(&self.pipeline.render_pass, &new_images)?,
+                        extent,
+                    )
+                } else {
+                    // Extremely rare (moving to a different surface); rebuild
+                    // everything that is format-dependent.
+                    let format = new_swapchain.image_format();
+                    tracing::warn!(
+                        old = ?self.format,
+                        new = ?format,
+                        "swapchain format changed; rebuilding the pipeline"
+                    );
+                    // Create every fallible resource before mutating the live
+                    // ones. That includes the texture descriptor sets, which were
+                    // allocated against the old pipeline's set layout; if the
+                    // rebuild fails, the old format/pipeline/sets must all stay
+                    // together or the next frame binds mixed-layout sets to the
+                    // new pipeline. If anything fails, the target still holds the
+                    // retired swapchain and the next frame goes straight to a
+                    // fresh creation.
+                    let pipeline = create_pipeline(&self.ctx.device, format)?;
+                    let uniforms = create_uniform_ring(&self.ctx, &pipeline)?;
+                    let new_framebuffers = create_framebuffers(&pipeline.render_pass, &new_images)?;
+                    self.textures
+                        .rebuild_descriptor_sets(pipeline.texture_set_layout.clone())?;
+                    self.format = format;
+                    self.pipeline = pipeline;
+                    self.uniforms = uniforms;
+                    (new_swapchain, new_framebuffers, extent)
+                }
+            }
+            RebuiltSwapchain::Fresh((new_swapchain, new_framebuffers, fresh_extent)) => {
+                (new_swapchain, new_framebuffers, fresh_extent)
+            }
+        };
 
-        *framebuffers = create_framebuffers(&self.pipeline.render_pass, &new_images)?;
         *swapchain = new_swapchain;
-        self.width = extent[0];
-        self.height = extent[1];
+        *framebuffers = new_framebuffers;
+        self.width = new_extent[0];
+        self.height = new_extent[1];
+        // The request that triggered this rebuild is now the recorded window
+        // size; `new_extent` may be smaller (surface clamp) and must not be
+        // compared against the window next frame.
+        self.requested_size = [size.width.max(1), size.height.max(1)];
+        // The replacement is live now; it has never been used for a recreation.
+        swapchain_retirement.commit();
         Ok(())
     }
 
@@ -998,6 +1143,14 @@ impl Renderer {
                 self.width as usize * self.height as usize * 4
             ));
         }
+        // Headless frames still consume a frame slot and grow/retire the
+        // vertex/uniform rings like windowed ones; advance the frame counter and
+        // drain retirement so a long headless test run (or screenshot batch)
+        // cannot retain every grown ring until shutdown. The readback above
+        // already waited for the GPU, so retiring by frame count is safe.
+        self.frame_index = self.frame_index.wrapping_add(1);
+        self.drain_retired();
+
         Ok(bytes.to_vec())
     }
 }
@@ -1153,6 +1306,22 @@ fn create_framebuffers(
 /// one) must be created at exactly that size — otherwise swapchain creation
 /// fails. Window sizes are passed through this before every creation and
 /// recreation.
+/// Record the window's requested physical size, reporting whether it changed.
+///
+/// The swapchain extent is deliberately *not* an input: a surface may clamp it
+/// (a fixed `currentExtent`, or a driver maximum below the window size), and
+/// comparing the window against the clamped extent would treat every frame as a
+/// resize and recreate the swapchain continuously. Only a change in the window
+/// size itself may request a rebuild.
+fn window_size_changed(requested: &mut [u32; 2], window: [u32; 2]) -> bool {
+    let window = [window[0].max(1), window[1].max(1)];
+    if *requested == window {
+        return false;
+    }
+    *requested = window;
+    true
+}
+
 fn clamp_swapchain_extent(caps: &SurfaceCapabilities, requested: [u32; 2]) -> [u32; 2] {
     if let Some(current) = caps.current_extent {
         return [current[0].max(1), current[1].max(1)];
@@ -1193,6 +1362,56 @@ fn pick_composite_alpha(caps: &SurfaceCapabilities) -> Result<CompositeAlpha> {
 /// A newly created swapchain: the swapchain, its framebuffers, and the extent
 /// actually used (the surface may have clamped the requested window size).
 type SurfaceSwapchain = (Arc<Swapchain>, Vec<Arc<Framebuffer>>, [u32; 2]);
+
+/// A rebuilt window swapchain, tagged with how it was created.
+enum RebuiltSwapchain<R, F> {
+    /// [`Swapchain::recreate`] succeeded on the stored swapchain; the caller
+    /// still has to build framebuffers (and reconcile a format-dependent
+    /// pipeline).
+    Recreated(R),
+    /// A brand-new swapchain made with [`Swapchain::new`]; its framebuffers were
+    /// already built against the caller's current render pass.
+    Fresh(F),
+}
+
+/// Attempt one window-swapchain rebuild.
+///
+/// Only [`SwapchainRetirement`] decides whether the stored swapchain may be
+/// handed to [`Swapchain::recreate`]. A `recreate` failure — including a failed
+/// `vkCreateSwapchainKHR`, after which vulkano has already retired the old
+/// swapchain — falls back to `fresh`, which must create a brand-new swapchain
+/// with [`Swapchain::new`]. If `fresh` fails too, the error is returned with the
+/// retirement state unchanged, so the next attempt goes straight back to
+/// `fresh` instead of retrying `recreate` on the retired swapchain. Only
+/// [`SwapchainRetirement::commit`], called once a replacement is live in the
+/// target, makes a later `recreate` possible again.
+fn rebuild_window_swapchain<R, F>(
+    retirement: &mut SwapchainRetirement,
+    recreate: impl FnOnce() -> Result<R>,
+    fresh: impl FnOnce() -> Result<F>,
+) -> Result<RebuiltSwapchain<R, F>> {
+    match retirement.begin_attempt() {
+        SwapchainRebuild::Recreate => match recreate() {
+            Ok(rebuilt) => return Ok(RebuiltSwapchain::Recreated(rebuilt)),
+            Err(error) => {
+                tracing::warn!(
+                    "recreating the swapchain failed ({error:#}); falling back to creating a \
+                     fresh swapchain, because vulkano retires the old one even when \
+                     vkCreateSwapchainKHR fails"
+                );
+            }
+        },
+        SwapchainRebuild::Fresh => {
+            tracing::debug!(
+                "creating a fresh swapchain: the stored one was already used for a \
+                 recreation attempt and may be retired"
+            );
+        }
+    }
+
+    let rebuilt = fresh().context("creating a fresh swapchain for the window")?;
+    Ok(RebuiltSwapchain::Fresh(rebuilt))
+}
 
 fn create_swapchain_surface(
     ctx: &GfxContext,

@@ -12,7 +12,9 @@ use crate::gfx::paint::{PaintList, TextureId};
 #[cfg(any(debug_assertions, feature = "preview", test))]
 use crate::preview;
 use crate::screens;
-use crate::state::{play_collection_action, Action, ResizeEdge, State, Toast, View};
+use crate::state::{
+    play_collection_action, Action, ResizeEdge, State, Toast, View, MAX_CACHED_COVERS,
+};
 use crate::ui::{CursorShape, InputState, Key, Ui};
 
 /// A request to the OS window, produced by the UI (titlebar buttons, drag
@@ -26,16 +28,9 @@ pub enum WindowCommand {
     BeginResize(ResizeEdge),
 }
 
-/// Upper bound on cached cover textures.
-///
-/// A 256 px RGBA8 cover is 256 KiB of VRAM, and a long browsing session can visit
-/// thousands of distinct URLs (every album/artist card and every track row has
-/// one). `State::covers` therefore cannot grow without limit: once this many
-/// decoded covers are cached, [`App::trim_cover_textures`] evicts the oldest
-/// textures and hands them back to the renderer, and a later frame that still
-/// shows an evicted cover simply re-requests it (the controller's tracker allows
-/// a re-fetch after a success, and the UI's texture is the cache).
-const MAX_CACHED_COVERS: usize = 256;
+/// How long the search box text must stay unchanged before the live search is
+/// issued (`ui-spec.md` §6.1: 300 ms). Enter and the Search button bypass it.
+pub const SEARCH_DEBOUNCE_SECS: f64 = 0.3;
 
 /// The whole application.
 pub struct App {
@@ -49,6 +44,15 @@ pub struct App {
     pub cursor_shape: CursorShape,
     /// Last frame time (UI clock), used for toast expiry and animations.
     now: f64,
+    /// Pending debounced live search: `(trimmed query, deadline in UI seconds)`.
+    ///
+    /// A search-box edit emits [`Action::SearchQueryChanged`] immediately, but
+    /// the network `Action::Search` is only dispatched once the text has been
+    /// stable for [`SEARCH_DEBOUNCE_SECS`] — otherwise every keystroke launched
+    /// its own request. Driven by [`InputState::time`], never a wall-clock
+    /// sleep/thread; Enter, the Search button and clearing the box all resolve
+    /// or cancel it immediately.
+    search_debounce: Option<(String, f64)>,
 }
 
 impl App {
@@ -96,6 +100,7 @@ impl App {
             window_commands: Vec::new(),
             cursor_shape: CursorShape::Default,
             now: 0.0,
+            search_debounce: None,
         };
         if app.controller.is_live() {
             let bootstrap_started = std::time::Instant::now();
@@ -200,8 +205,15 @@ impl App {
             ControllerEvent::PlaybackState(state) => self.state.playback = state,
             ControllerEvent::Queue(queue) => self.state.queue = queue,
             ControllerEvent::Progress(progress) => self.state.progress = progress,
-            ControllerEvent::Library(library) => self.state.library = library,
+            ControllerEvent::Library(library) => self.state.set_library(library),
             ControllerEvent::Downloads(downloads) => self.state.downloads = downloads,
+            ControllerEvent::DownloadProgress { id, permille } => {
+                // A progress tick queued just before a finish/remove snapshot
+                // must not recreate a bar for a track no longer in flight.
+                if self.state.downloads.downloading.contains(&id) {
+                    self.state.downloads.progress.insert(id, permille);
+                }
+            }
             ControllerEvent::Error(message) => {
                 self.state.toast = Some(Toast::error(message, self.now));
             }
@@ -248,28 +260,54 @@ impl App {
                     }
                 }
             }
-            ControllerEvent::ArtistPage { generation, page } => {
-                if generation >= self.state.page_generation {
-                    self.state.page_generation = generation;
-                    self.state.artist_page = Some(page);
+            ControllerEvent::ArtistPage {
+                generation,
+                artist_id,
+                result,
+            } => match result {
+                Ok(page) => {
+                    if generation >= self.state.page_generation {
+                        self.state.page_generation = generation;
+                        self.state.page_error = None;
+                        self.state.artist_page = Some(page);
+                    }
                 }
-            }
+                Err(message) => {
+                    self.apply_page_error(View::Artist(artist_id), generation, message);
+                }
+            },
             ControllerEvent::ArtistSongs {
                 generation,
                 artist_id,
-                tracks,
-            } => {
-                if generation >= self.state.page_generation {
-                    self.state.page_generation = generation;
-                    self.state.artist_songs = Some((artist_id, tracks));
+                result,
+            } => match result {
+                Ok(tracks) => {
+                    if generation >= self.state.page_generation {
+                        self.state.page_generation = generation;
+                        self.state.page_error = None;
+                        self.state.artist_songs = Some((artist_id, tracks));
+                    }
                 }
-            }
-            ControllerEvent::AlbumPage { generation, page } => {
-                if generation >= self.state.page_generation {
-                    self.state.page_generation = generation;
-                    self.state.album_page = Some(page);
+                Err(message) => {
+                    self.apply_page_error(View::ArtistSongs(artist_id), generation, message);
                 }
-            }
+            },
+            ControllerEvent::AlbumPage {
+                generation,
+                album_id,
+                result,
+            } => match result {
+                Ok(page) => {
+                    if generation >= self.state.page_generation {
+                        self.state.page_generation = generation;
+                        self.state.page_error = None;
+                        self.state.album_page = Some(page);
+                    }
+                }
+                Err(message) => {
+                    self.apply_page_error(View::Album(album_id), generation, message);
+                }
+            },
             ControllerEvent::UpdateStatus(status) => {
                 if status.update_available {
                     self.state.update_banner = Some(status.clone());
@@ -278,9 +316,11 @@ impl App {
             }
             ControllerEvent::Cover(image) => {
                 // A cover can only be used if its cache entry still exists: the
-                // entry is what the screens look the texture up through, and it
-                // cannot have been evicted while the fetch was in flight (only
-                // decoded textures are evicted).
+                // entry is what the screens look the texture up through. It can
+                // have been evicted while the fetch was in flight (the entry cap
+                // prefers failed/never-decoded URLs, but a stale request is a
+                // candidate too), so an orphaned reply is simply dropped rather
+                // than uploading a texture nothing could ever release.
                 if !self.state.covers.contains_key(&image.url) {
                     debug!("dropping cover for unknown url: {}", image.url);
                     return;
@@ -312,14 +352,67 @@ impl App {
         }
     }
 
+    /// Enter the retryable page-error state for `failed`, if it is still the
+    /// page the user is looking at.
+    ///
+    /// The controller already dropped stale page replies before they became
+    /// events, so the view check is defence in depth (and the generation guard
+    /// mirrors the success arms). The page caches are cleared so the view cannot
+    /// fall back to a stale page from a previous navigation, and `page_error`
+    /// drives the compact error + Retry state in `album.rs`/`artist.rs` instead
+    /// of a permanent "Loading…".
+    fn apply_page_error(&mut self, failed: View, generation: u64, message: String) {
+        if generation < self.state.page_generation || self.state.view != failed {
+            return;
+        }
+        self.state.page_generation = generation;
+        match &self.state.view {
+            View::Artist(_) => self.state.artist_page = None,
+            View::ArtistSongs(_) => self.state.artist_songs = None,
+            View::Album(_) => self.state.album_page = None,
+            View::Home | View::Search | View::Liked | View::Settings | View::Playlist(_) => {}
+        }
+        self.state.page_error = Some(message);
+    }
+
+    /// Issue the pending debounced live search once its query has been stable
+    /// for [`SEARCH_DEBOUNCE_SECS`]. Called at the end of every frame (after the
+    /// frame's actions, so Enter/submit can supersede it); no timer thread or
+    /// sleep is involved — the deadline is on the UI clock.
+    fn flush_search_debounce(&mut self) {
+        let Some((query, deadline)) = self.search_debounce.as_ref() else {
+            return;
+        };
+        if self.now < *deadline {
+            return;
+        }
+        // `lost_focus` is committed in `end_frame` and reported next frame, so a
+        // click-away that lands on the debounce frame could otherwise dispatch
+        // the search, navigate away and swallow the click. The field's current
+        // focus is already up to date here.
+        if !self
+            .ui
+            .is_focused(crate::screens::chrome::search_input_id())
+        {
+            self.search_debounce = None;
+            return;
+        }
+        let query = query.clone();
+        self.search_debounce = None;
+        self.dispatch_ui(Action::Search(query));
+    }
+
     /// Keep the cover-texture cache bounded (see [`MAX_CACHED_COVERS`]).
     ///
     /// Evicts the oldest decoded covers — texture ids are handed out in upload
     /// order, so the lowest id is the oldest — and releases their GPU images
     /// through the UI's dropped-texture list (the renderer retires them safely
-    /// after the in-flight frames). The cache entries stay consistent: only
-    /// entries that own a texture are chosen, so an in-flight fetch is never
-    /// orphaned. Called after every decoded cover arrives.
+    /// after the in-flight frames). The cache entries are removed with their
+    /// texture ([`State::remove_cover`]), keeping the insertion order in sync;
+    /// only entries that own a texture are chosen, so an in-flight fetch is
+    /// never orphaned by this trimmer (the separate entry cap in
+    /// [`State::request_cover`] handles never-decoded URLs). Called after every
+    /// decoded cover arrives.
     fn trim_cover_textures(&mut self) {
         if self.state.covers.len() <= MAX_CACHED_COVERS {
             return;
@@ -344,7 +437,7 @@ impl App {
                 .get(&url)
                 .is_some_and(|entry| entry.texture == Some(id))
             {
-                self.state.covers.remove(&url);
+                self.state.remove_cover(&url);
                 self.ui.drop_texture(id);
             }
         }
@@ -383,12 +476,22 @@ impl App {
         for action in actions {
             self.dispatch_ui(action);
         }
+        // Resolve the debounce *after* this frame's actions: an Enter or Search
+        // click dispatched above clears it, so a submit and an expiring debounce
+        // can never issue two searches for the same query in one frame.
+        self.flush_search_debounce();
         paint
     }
 
     /// Take the window commands produced during the last frame.
     pub fn take_window_commands(&mut self) -> Vec<WindowCommand> {
         std::mem::take(&mut self.window_commands)
+    }
+
+    /// Logical-pixel caret rectangle of the focused text input, if one was
+    /// drawn this frame. `main.rs` turns it into `set_ime_cursor_area`.
+    pub fn ime_cursor_area(&self) -> Option<crate::ui::Rect> {
+        self.ui.ime_cursor_area()
     }
 
     /// Apply one UI action: local state changes immediately, backend commands
@@ -417,22 +520,51 @@ impl App {
                 self.controller.dispatch(Action::SetSearchTab(tab));
             }
             SearchQueryChanged(query) => {
-                // Clearing the box must invalidate an in-flight search so its
-                // results cannot repopulate the cleared view.
-                if query.is_empty() && !self.state.search.shown_query.is_empty() {
-                    self.controller.cancel_search();
-                    self.state.search.shown_query.clear();
-                    self.state.search.songs.clear();
-                    self.state.search.artists = None;
-                    self.state.search.albums = None;
-                    self.state.search.busy = false;
-                }
-                self.state.search.query = query;
-            }
-            Search(query) => {
+                // The titlebar is the only writer of `search.query`; the action
+                // mirrors the raw text and, for a non-empty box, schedules the
+                // debounced live search. `Search` itself (below) never rewrites
+                // the edit buffer, so typed whitespace survives.
                 self.state.search.query = query.clone();
+                let trimmed = query.trim();
+                if trimmed.is_empty() {
+                    // Clearing (or typing only spaces) cancels a pending
+                    // debounce immediately, so no request can fire after the box
+                    // is empty.
+                    self.search_debounce = None;
+                    // Clearing the box must invalidate an in-flight search so its
+                    // results cannot repopulate the cleared view.
+                    if !self.state.search.shown_query.is_empty() {
+                        self.controller.cancel_search();
+                        self.state.search.shown_query.clear();
+                        self.state.search.songs.clear();
+                        self.state.search.artists = None;
+                        self.state.search.albums = None;
+                        self.state.search.busy = false;
+                    }
+                } else {
+                    self.search_debounce =
+                        Some((trimmed.to_string(), self.now + SEARCH_DEBOUNCE_SECS));
+                }
+            }
+            SearchBlur => self.search_debounce = None,
+            Search(query) => {
+                // Enter / the Search button submit immediately and supersede a
+                // pending live-search debounce (only one request may result).
+                self.search_debounce = None;
+                // `query` is the *trimmed* box text handed over to the search
+                // command; the box itself is the single writer of the live edit
+                // buffer, which `SearchQueryChanged` (emitted first on the same
+                // edit frame) has already updated with the raw text. Writing the
+                // trimmed payload back into `state.search.query` would delete the
+                // whitespace the user just typed — a space at the end of its
+                // frame vanished, so `"sign of the time"` searched as
+                // `"signofthetime"`.
                 self.state.search.meta_query(&query);
-                self.state.view = View::Search;
+                // Route through the shared navigation helper, not a raw view
+                // assignment: submitting a search must bump the page generation
+                // (dropping an abandoned artist/album reply) and clear a stale
+                // page error, exactly like every other navigation.
+                self.navigate(View::Search);
                 self.controller.dispatch(Action::Search(query));
             }
             ToggleQueuePanel | ToggleQueueCollapsed => {}
@@ -463,9 +595,23 @@ impl App {
             DismissUpdateBanner => self.state.update_banner = None,
             Toast(message) => self.toast(message),
             ToastError(message) => self.toast_error(message),
+            // Retry is a new page request: clear the error first so the view
+            // shows its loading state on this frame, then let the controller
+            // re-issue `last_page` at a fresh generation.
+            RetryPage => {
+                self.state.page_error = None;
+                self.controller.dispatch(Action::RetryPage);
+            }
 
             // ----------------------------------------------- playlist editor
             BeginRenamePlaylist { id, name } => {
+                // The only rename editor lives in the playlist view header
+                // (ui-spec §7.3): a rename started from the sidebar/Home card
+                // must navigate there, or it sets `renaming` with nothing on
+                // screen to show or focus it.
+                if self.state.view != View::Playlist(id.clone()) {
+                    self.navigate(View::Playlist(id.clone()));
+                }
                 self.state.renaming = Some((id, name));
                 self.state.new_playlist = None;
             }
@@ -496,6 +642,15 @@ impl App {
 
     fn navigate(&mut self, view: View) {
         debug!("navigate to {view:?}");
+        // Leaving the page invalidates its error state; a new request or success
+        // clears it too. A pending live-search debounce is also abandoned: the
+        // user has moved on, and it must not yank them back to Search.
+        self.state.page_error = None;
+        self.search_debounce = None;
+        // An open context menu belongs to the old view; a backend-driven jump
+        // (`OpenPlaylist`) must not leave it floating over the new page. The
+        // per-frame auto-close only covers menus that no screen drew.
+        crate::screens::menu::close(&mut self.ui);
         self.state.view = view;
         // Issue page loads / cancel superseded ones; search and local views are
         // ignored by the controller.
@@ -574,6 +729,7 @@ impl crate::state::SearchState {
 mod tests {
     use super::*;
     use crate::cover::CoverImage;
+    use crate::state::MAX_CACHED_COVER_ENTRIES;
 
     fn cover_event(url: &str) -> ControllerEvent {
         ControllerEvent::Cover(CoverImage {
@@ -582,6 +738,156 @@ mod tests {
             height: 1,
             rgba: vec![1, 2, 3, 255],
         })
+    }
+
+    /// A failed page reply must become the retryable `page_error` state, and a
+    /// later successful reply (or navigation / retry) clears it. A failure for a
+    /// page the user is not looking at is ignored.
+    #[test]
+    fn a_failed_page_reply_sets_and_a_success_clears_the_page_error() {
+        let mut app = App::new(false, Controller::new_preview());
+        app.state.view = View::Artist("artist-1".into());
+
+        app.apply_controller_event(ControllerEvent::ArtistPage {
+            generation: 1,
+            artist_id: "artist-1".into(),
+            result: Err("could not load artist: offline".into()),
+        });
+        assert_eq!(
+            app.state.page_error.as_deref(),
+            Some("could not load artist: offline")
+        );
+        assert_eq!(app.state.page_generation, 1);
+        assert!(
+            app.state.artist_page.is_none(),
+            "a failed page must not keep a stale cache"
+        );
+
+        // A failure for a different page/view never replaces this one.
+        app.apply_controller_event(ControllerEvent::AlbumPage {
+            generation: 2,
+            album_id: "album-1".into(),
+            result: Err("could not load album".into()),
+        });
+        assert_eq!(
+            app.state.page_error.as_deref(),
+            Some("could not load artist: offline"),
+            "an error for another view is ignored"
+        );
+
+        app.apply_controller_event(ControllerEvent::ArtistPage {
+            generation: 3,
+            artist_id: "artist-1".into(),
+            result: Ok(crate::preview::preview_artist_page()),
+        });
+        assert_eq!(app.state.page_error, None, "a successful reply clears it");
+        assert_eq!(app.state.page_generation, 3);
+        assert!(app.state.artist_page.is_some());
+    }
+
+    /// Losing focus in the search box must cancel a pending debounced search,
+    /// or it would switch the view ~300 ms after the user moved to another
+    /// control.
+    #[test]
+    fn search_blur_cancels_a_pending_debounce() {
+        let mut app = App::new(false, Controller::new_preview());
+        app.search_debounce = Some(("daft".into(), app.now + SEARCH_DEBOUNCE_SECS));
+        app.dispatch_ui(Action::SearchBlur);
+        assert!(app.search_debounce.is_none());
+    }
+
+    /// The blur action is one frame late. If the debounce expires on the frame
+    /// that a click blurred the box, flushing must not search/navigate away and
+    /// swallow that click; the field's current focus is the deciding state.
+    #[test]
+    fn an_expired_debounce_does_not_fire_after_the_box_lost_focus() {
+        let mut app = App::new(false, Controller::new_preview());
+        app.search_debounce = Some(("daft".into(), app.now - 1.0));
+        app.flush_search_debounce();
+        assert!(app.search_debounce.is_none());
+        assert_eq!(
+            app.state.view,
+            View::Home,
+            "the view must not move to Search"
+        );
+    }
+
+    /// Rename from the sidebar/Home card must reach the playlist view that owns
+    /// the editor (ui-spec §7.3); otherwise `state.renaming` is set with no
+    /// field to autofocus and the user has to click into the playlist manually.
+    #[test]
+    fn renaming_a_playlist_from_another_view_navigates_to_it() {
+        let mut app = App::new(false, Controller::new_preview());
+        app.dispatch_ui(Action::BeginRenamePlaylist {
+            id: "pl-1".into(),
+            name: "Mix".into(),
+        });
+        assert_eq!(app.state.view, View::Playlist("pl-1".into()));
+        assert_eq!(
+            app.state.renaming.as_ref().map(|(id, _)| id.as_str()),
+            Some("pl-1")
+        );
+
+        // From another playlist, it follows the rename target.
+        app.dispatch_ui(Action::BeginRenamePlaylist {
+            id: "pl-2".into(),
+            name: "Other".into(),
+        });
+        assert_eq!(app.state.view, View::Playlist("pl-2".into()));
+        assert_eq!(
+            app.state.renaming.as_ref().map(|(id, _)| id.as_str()),
+            Some("pl-2")
+        );
+    }
+
+    /// A backend-driven navigation must dismiss an open context menu; otherwise
+    /// it floats over the new page until something else closes it.
+    #[test]
+    fn backend_navigation_closes_an_open_menu() {
+        let mut app = App::new(false, Controller::new_preview());
+        crate::screens::menu::open(
+            &mut app.ui,
+            crate::ui::Id::from_str("test/menu"),
+            crate::ui::Rect::new(10.0, 10.0, 20.0, 20.0),
+            Vec::new(),
+        );
+        assert!(crate::screens::menu::is_open());
+
+        app.apply_controller_event(ControllerEvent::OpenPlaylist("pl-1".into()));
+
+        assert!(
+            !crate::screens::menu::is_open(),
+            "navigation must close the old view's menu"
+        );
+        assert_eq!(app.state.view, View::Playlist("pl-1".into()));
+    }
+
+    /// Submitting a search is a navigation: it must clear a stale page error
+    /// and cancel an abandoned page request, not just flip `view`.
+    #[test]
+    fn submitting_a_search_uses_the_shared_navigation_path() {
+        let mut app = App::new(false, Controller::new_preview());
+        app.state.view = View::Album("album-1".into());
+        app.state.page_error = Some("old page failure".into());
+
+        app.dispatch_ui(Action::Search("daft punk".into()));
+
+        assert_eq!(app.state.view, View::Search);
+        assert_eq!(
+            app.state.page_error, None,
+            "search navigation must clear a stale page error"
+        );
+        assert_eq!(app.state.search.shown_query, "daft punk");
+    }
+
+    /// A stalled page load followed by navigation must not carry the error to
+    /// the next view.
+    #[test]
+    fn navigation_clears_a_previous_page_error() {
+        let mut app = App::new(false, Controller::new_preview());
+        app.state.page_error = Some("old failure".into());
+        app.navigate(View::Home);
+        assert_eq!(app.state.page_error, None);
     }
 
     /// A long browsing session visits more distinct cover URLs than are worth
@@ -629,5 +935,37 @@ mod tests {
             app.ui.end_frame().created.is_empty(),
             "no texture may be uploaded for an unknown url"
         );
+    }
+
+    /// An offline session can produce far more failed cover URLs than decoded
+    /// ones. They must not accumulate for the whole session, and the cap must
+    /// not get in the way of a cover that does load afterwards.
+    #[test]
+    fn failed_cover_urls_stay_bounded_and_a_later_cover_still_loads() {
+        let mut app = App::new(false, Controller::new_preview());
+        for index in 0..(MAX_CACHED_COVER_ENTRIES * 3) {
+            let url = format!("https://img.example/failed/{index}");
+            assert_eq!(app.state.request_cover(&url), None);
+            app.apply_controller_event(ControllerEvent::CoverFailed(url));
+        }
+        assert!(
+            app.state.covers.len() <= MAX_CACHED_COVER_ENTRIES,
+            "failed urls must stay bounded, got {}",
+            app.state.covers.len()
+        );
+
+        let url = "https://img.example/decoded-after-failures";
+        assert_eq!(app.state.request_cover(url), None);
+        app.apply_controller_event(cover_event(url));
+        assert!(
+            app.state.cover_texture(url).is_some(),
+            "a cover fetched after many failures must still load"
+        );
+        assert!(
+            app.state.covers.len() <= MAX_CACHED_COVER_ENTRIES,
+            "the loaded cover must not lift the entry cap"
+        );
+        let paint = app.ui.end_frame();
+        assert_eq!(paint.created.len(), 1, "the fresh cover is uploaded");
     }
 }

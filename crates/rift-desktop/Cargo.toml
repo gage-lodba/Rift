@@ -40,15 +40,23 @@ preview = []
 
 [dependencies]
 anyhow = { workspace = true }
-arboard = "3"
-bytemuck = { version = "1", features = ["derive"] }
+# Clipboard backend for the text fields (`ui::clipboard`).
+#
+# `wayland-data-control` is what makes Ctrl+C/V work under a Wayland session: a
+# Wayland-native window is not an X11 client, so arboard's default X11 backend
+# sees only the XWayland clipboard, which on KDE does not receive selections
+# copied by Wayland apps (the browser a YouTube Music link is copied from, for
+# one). With the feature enabled arboard prefers the Wayland data-control
+# protocol and falls back to X11 by itself when WAYLAND_DISPLAY is unset or the
+# compositor does not implement the protocol (e.g. GNOME/Mutter), so this is
+# safe on every desktop. The `wl-clipboard-rs` dependency it pulls in is
+# Linux-gated inside arboard, so Windows/macOS builds are unchanged.
+arboard = { version = "3", features = ["wayland-data-control"] }
 fontdue = "0.9"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-pollster = "1.0"
 raw-window-handle = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rift-types = { path = "../rift-types" }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 vulkano = { version = "0.35.2", default-features = false, features = ["macros"] }
@@ -57,6 +65,16 @@ winit = "0.30"
 rift = { path = "../rift", optional = true }
 
 [dev-dependencies]
+
+# Linux-only, test-only: the clipboard tests copy a marker with a real Wayland
+# data-control client — the same protocol path a browser uses — to prove the
+# app's native clipboard can read a Wayland session's selection. That is exactly
+# what arboard's X11-only Linux build could not do (Ctrl+V in the import box
+# silently did nothing). The crate is the one arboard's `wayland-data-control`
+# feature already pulls in at the same version, so this adds no new package to
+# the graph; the test skips itself on sessions without Wayland or data-control.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+wl-clipboard-rs = "0.9.5"
 
 # Windows-only, host-gated build dependency for `build.rs`: it runs the Windows
 # SDK resource compiler (`rc.exe`) to embed `assets/icons/rift.rc` — the *file*
@@ -71,6 +89,16 @@ rift = { path = "../rift", optional = true }
 # builds embed the resource, and those are the builds CI/release gate.
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
+
+# A GUI-subsystem binary launched from Explorer has no console, so a startup
+# failure (most commonly no Vulkan ICD) would otherwise look like nothing
+# happened. `MessageBoxW` gives it a visible, ownership-free error dialog; it is
+# target-gated so Linux/macOS builds do not pull in the Windows API tables.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [lints]
 workspace = true

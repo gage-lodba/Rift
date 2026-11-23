@@ -6,9 +6,9 @@
 //! * `.tabs` Songs · Artists · Albums — active is an accent pill;
 //! * Songs: "Searching..." while busy, "No results." when empty, else the shared
 //!   track list (source-less: a row click starts the results at that row);
-//! * Artists/Albums: lazily loaded (`None` → "Searching..."), then a card grid
-//!   (artist cards are round + centred, subscribers as the subtitle; album cards
-//!   use `"{album_type} • {year}"`).
+//! * Artists/Albums: lazily loaded (`None` → "Searching...", `Some(empty)` →
+//!   "No results."), then a card grid (artist cards are round + centred,
+//!   subscribers as the subtitle; album cards use `"{album_type} • {year}"`).
 
 use crate::screens::{pages, track_list};
 use crate::state::{Action, SearchTab, State};
@@ -16,6 +16,16 @@ use crate::ui::{Rect, Ui};
 
 /// Height of the `Results for …` h2 plus its 14 px bottom margin.
 pub const SEARCH_HEAD_H: f32 = pages::H2_LINE + pages::H2_MARGIN_BOTTOM;
+
+/// Empty-state line for the lazily loaded Artists/Albums tabs: `None` means
+/// the sub-search is still in flight; `Some` (even an empty list) means it
+/// completed, so an empty result is not "Searching..." forever.
+fn lazy_tab_message<T>(items: Option<&[T]>) -> &'static str {
+    match items {
+        None => "Searching...",
+        Some(_) => "No results.",
+    }
+}
 
 fn tab_content_height(ui: &mut Ui, state: &State, width: f32) -> f32 {
     match state.search.tab {
@@ -106,24 +116,24 @@ pub fn view(ui: &mut Ui, state: &mut State, actions: &mut Vec<Action>, area: Rec
         }
         SearchTab::Artists => {
             let artists = state.search.artists.take();
-            match artists.as_ref() {
+            match artists.as_deref() {
                 Some(artists) if !artists.is_empty() => {
                     pages::artist_grid(ui, state, actions, area.x, y, area.w, artists);
                 }
-                _ => {
-                    pages::empty(ui, area.x, y, area.w, "Searching...");
+                other => {
+                    pages::empty(ui, area.x, y, area.w, lazy_tab_message(other));
                 }
             }
             state.search.artists = artists;
         }
         SearchTab::Albums => {
             let albums = state.search.albums.take();
-            match albums.as_ref() {
+            match albums.as_deref() {
                 Some(albums) if !albums.is_empty() => {
                     pages::album_grid(ui, state, actions, area.x, y, area.w, albums);
                 }
-                _ => {
-                    pages::empty(ui, area.x, y, area.w, "Searching...");
+                other => {
+                    pages::empty(ui, area.x, y, area.w, lazy_tab_message(other));
                 }
             }
             state.search.albums = albums;
@@ -199,6 +209,30 @@ mod tests {
             "Albums tab: {actions:?}"
         );
     }
+    #[test]
+    fn lazy_tabs_distinguish_loading_from_a_finished_empty_search() {
+        // `None` is the in-flight state; `Some([])` is a completed search with
+        // no matches and must not keep claiming "Searching...".
+        assert_eq!(lazy_tab_message::<Track>(None), "Searching...");
+        let empty: Vec<Track> = Vec::new();
+        assert_eq!(lazy_tab_message(Some(empty.as_slice())), "No results.");
+    }
+
+    #[test]
+    fn artists_and_albums_zero_results_use_the_empty_state_height() {
+        let mut ui = Ui::new();
+        let mut state = State::default();
+        let expected = 36.0 + 31.0 + 16.0 + 113.0;
+
+        state.search.tab = SearchTab::Artists;
+        state.search.artists = Some(Vec::new());
+        assert_eq!(height(&mut ui, &state, 766.0), expected);
+
+        state.search.tab = SearchTab::Albums;
+        state.search.albums = Some(Vec::new());
+        assert_eq!(height(&mut ui, &state, 766.0), expected);
+    }
+
     #[test]
     fn empty_search_height_is_head_tabs_and_empty_state() {
         let mut ui = Ui::new();

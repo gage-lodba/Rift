@@ -27,12 +27,12 @@ use rift_desktop::controller::Controller;
 use rift_desktop::gfx;
 use rift_desktop::state::ResizeEdge;
 use rift_desktop::ui::input::{InputState, Key, KeyInput, Modifiers};
-use rift_desktop::ui::{CursorShape, Rect};
+use rift_desktop::ui::{push_ime_text, CursorShape, Rect};
 use rift_desktop::{single_instance, window_state};
 use tracing::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
@@ -59,6 +59,39 @@ const RESIZE_BORDER: f32 = 5.0;
 const HIDE_WINDOW_UNTIL_FIRST_FRAME: bool = true;
 #[cfg(not(windows))]
 const HIDE_WINDOW_UNTIL_FIRST_FRAME: bool = false;
+
+/// Show a startup failure in a native Windows dialog.
+///
+/// The shipped binary is a GUI-subsystem executable: launched from Explorer it
+/// has no console, so an error such as "no Vulkan ICD available" would otherwise
+/// be visible only in a log nobody sees, and the application would appear to do
+/// nothing. The dialog is deliberately Windows-only; Linux/macOS terminals show
+/// the existing stderr/tracing output.
+#[cfg(windows)]
+fn show_startup_error(error: &anyhow::Error) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
+    };
+
+    let text = format!(
+        "Rift could not start.\n\n{error:#}\n\nRift needs a working Vulkan graphics driver. \
+         Update the GPU driver, or check that the GPU supports Vulkan."
+    );
+    let wide =
+        |value: &str| -> Vec<u16> { value.encode_utf16().chain(std::iter::once(0)).collect() };
+    let text = wide(&text);
+    let title = wide("Rift — startup error");
+    // SAFETY: both pointers reference live, NUL-terminated UTF-16 buffers for
+    // the duration of the synchronous MessageBoxW call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
 
 /// Milliseconds elapsed since `main` started, for the `startup:` diagnostics.
 ///
@@ -148,148 +181,110 @@ fn preview_env_requested() -> bool {
 }
 
 impl Args {
+    /// Parse the development-build command line.
+    ///
+    /// Development builds (and explicitly `preview`-featured ones) understand
+    /// the capture flags and the old `RIFT_PREVIEW` switch, and can process
+    /// several arguments in one invocation. The shipped release parser below has
+    /// no flags to accept, so it does not share this loop: keeping the loop
+    /// here only where arguments are actually accepted is also what keeps
+    /// clippy's `never_loop`/`while_let_on_iterator` out of the release build.
+    #[cfg(any(debug_assertions, feature = "preview"))]
     fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
-        #[cfg(any(debug_assertions, feature = "preview"))]
         let mut parsed = Args {
             preview: preview_env_requested(),
             size: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
             scale: 1.0,
             ..Args::default()
         };
-        #[cfg(not(any(debug_assertions, feature = "preview")))]
-        #[allow(unused_mut)] // no dev flags mutate it in a shipped release build
-        let mut parsed = {
-            if preview_env_requested() {
-                anyhow::bail!(
-                    "RIFT_PREVIEW is a development-only option and is not available in release builds"
-                );
-            }
-            Args::default()
-        };
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--preview" | "--demo" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
-                    {
-                        parsed.preview = true;
-                    }
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    {
-                        anyhow::bail!(
-                            "--preview is a development-only option and is not available in release builds"
-                        );
-                    }
-                }
-                "--live" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
-                    {
-                        parsed.preview = false;
-                    }
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    {
-                        anyhow::bail!(
-                            "--live is a development-only option and is not available in release builds"
-                        );
-                    }
-                }
+                "--preview" | "--demo" => parsed.preview = true,
+                "--live" => parsed.preview = false,
                 "--screenshot" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
-                    {
-                        let path = args
-                            .next()
-                            .context("--screenshot needs an output path argument")?;
-                        parsed.screenshot = Some(PathBuf::from(path));
-                    }
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    {
-                        anyhow::bail!(
-                            "--screenshot is a development-only option and is not available in release builds"
-                        );
-                    }
+                    let path = args
+                        .next()
+                        .context("--screenshot needs an output path argument")?;
+                    parsed.screenshot = Some(PathBuf::from(path));
                 }
                 "--view" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
-                    {
-                        parsed.view = Some(args.next().context("--view needs a screen name")?);
-                    }
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    {
-                        anyhow::bail!(
-                            "--view is a development-only option and is not available in release builds"
-                        );
-                    }
+                    parsed.view = Some(args.next().context("--view needs a screen name")?);
                 }
                 "--pointer" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
-                    {
-                        let value = args.next().context("--pointer needs an x,y argument")?;
-                        let (x, y) = value
-                            .split_once(',')
-                            .context("--pointer must look like 700,407")?;
-                        parsed.pointer = Some((
-                            x.trim().parse().context("invalid --pointer x")?,
-                            y.trim().parse().context("invalid --pointer y")?,
-                        ));
-                    }
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    {
-                        anyhow::bail!(
-                            "--pointer is a development-only option and is not available in release builds"
-                        );
-                    }
+                    let value = args.next().context("--pointer needs an x,y argument")?;
+                    let (x, y) = value
+                        .split_once(',')
+                        .context("--pointer must look like 700,407")?;
+                    parsed.pointer = Some((
+                        x.trim().parse().context("invalid --pointer x")?,
+                        y.trim().parse().context("invalid --pointer y")?,
+                    ));
                 }
                 "--scale" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
-                    {
-                        let value = args.next().context("--scale needs a factor like 1.5")?;
-                        parsed.scale = value.trim().parse().context("invalid --scale factor")?;
-                        if !(0.5..=4.0).contains(&parsed.scale) {
-                            anyhow::bail!("--scale must be between 0.5 and 4.0");
-                        }
-                    }
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    {
-                        anyhow::bail!(
-                            "--scale is a development-only option and is not available in release builds"
-                        );
+                    let value = args.next().context("--scale needs a factor like 1.5")?;
+                    parsed.scale = value.trim().parse().context("invalid --scale factor")?;
+                    if !(0.5..=4.0).contains(&parsed.scale) {
+                        anyhow::bail!("--scale must be between 0.5 and 4.0");
                     }
                 }
                 "--size" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
-                    {
-                        let value = args.next().context("--size needs a WxH argument")?;
-                        let (w, h) = value
-                            .split_once('x')
-                            .or_else(|| value.split_once('X'))
-                            .context("--size must look like 1160x740")?;
-                        parsed.size = (
-                            w.parse().context("invalid --size width")?,
-                            h.parse().context("invalid --size height")?,
-                        );
-                    }
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    {
-                        anyhow::bail!(
-                            "--size is a development-only option and is not available in release builds"
-                        );
-                    }
+                    let value = args.next().context("--size needs a WxH argument")?;
+                    let (w, h) = value
+                        .split_once('x')
+                        .or_else(|| value.split_once('X'))
+                        .context("--size must look like 1160x740")?;
+                    parsed.size = (
+                        w.parse().context("invalid --size width")?,
+                        h.parse().context("invalid --size height")?,
+                    );
                 }
                 "-h" | "--help" => {
-                    #[cfg(any(debug_assertions, feature = "preview"))]
                     println!(
                         "rift-music [--preview] [--screenshot <path>] [--view <name>] [--size WxH]\n\
                          \n\
                          Vanilla launch opens the Rift window. --screenshot renders one frame\n\
                          offscreen (preview data unless --live) to a PNG and exits."
                     );
-                    #[cfg(not(any(debug_assertions, feature = "preview")))]
-                    println!("rift-music\n\nVanilla launch opens the Rift window.");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown argument {other:?} (try --help)"),
             }
         }
         Ok(parsed)
+    }
+
+    /// Parse the shipped release command line.
+    ///
+    /// There are no developer flags in this build, and every one of them is
+    /// rejected with the same message the old per-arm release code produced;
+    /// only the help flag (`-h`/`--help`) and an empty command line succeed.
+    /// Because no argument can be accepted and then let parsing continue, the
+    /// first one decides everything and this is an `if let`, not a loop.
+    #[cfg(not(any(debug_assertions, feature = "preview")))]
+    fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
+        if preview_env_requested() {
+            anyhow::bail!(
+                "RIFT_PREVIEW is a development-only option and is not available in release builds"
+            );
+        }
+        if let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--preview" | "--demo" => anyhow::bail!(
+                    "--preview is a development-only option and is not available in release builds"
+                ),
+                "--live" | "--screenshot" | "--view" | "--pointer" | "--scale" | "--size" => {
+                    anyhow::bail!(
+                        "{arg} is a development-only option and is not available in release builds"
+                    )
+                }
+                "-h" | "--help" => {
+                    println!("rift-music\n\nVanilla launch opens the Rift window.");
+                    std::process::exit(0);
+                }
+                other => anyhow::bail!("unknown argument {other:?} (try --help)"),
+            }
+        }
+        Ok(Self::default())
     }
 }
 
@@ -378,6 +373,9 @@ struct NativeApp {
     window_state: window_state::WindowState,
     /// Whether `window_state` came from disk and should be restored on create.
     has_saved_window_state: bool,
+    /// Last IME candidate anchor sent to the window (physical px), so a steady
+    /// caret does not call `set_ime_cursor_area` every frame.
+    last_ime_area: Option<(i32, i32, u32, u32)>,
 }
 
 impl NativeApp {
@@ -400,6 +398,7 @@ impl NativeApp {
             mouse_physical: None,
             window_state,
             has_saved_window_state,
+            last_ime_area: None,
         }
     }
 
@@ -430,11 +429,24 @@ impl NativeApp {
         if let Some(icon) = icon {
             attributes = attributes.with_window_icon(Some(icon));
         }
+        // Launcher identity: the Wayland `app_id` / X11 `WM_CLASS` that names the
+        // installed `Rift.desktop` entry, and so the window's taskbar icon.
+        #[cfg(target_os = "linux")]
+        let attributes = with_linux_launcher_identity(attributes);
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
                 .context("could not create the Rift window")?,
         );
+        // Allow IME for the window so CJK input methods and soft keyboards can
+        // start a composition: winit only emits `WindowEvent::Ime` while IME is
+        // allowed, and it suppresses `KeyboardInput` during a preedit. The window
+        // is the right granularity here — focus decides which text field (if any)
+        // consumes the resulting `InputState::text` — and winit has no
+        // per-widget IME API. Keeping it enabled for the window's lifetime also
+        // avoids tearing down the platform IME context when focus moves between
+        // fields.
+        window.set_ime_allowed(true);
         if self.has_saved_window_state {
             // Position and maximized flag are applied after creation; the size is
             // already in the attributes above.
@@ -560,6 +572,7 @@ impl NativeApp {
         // and the UI cannot query the window).
         app.state.window_maximized = window.is_maximized();
         let paint = app.frame(self.input.clone());
+        sync_ime_cursor(window, app.ime_cursor_area(), &mut self.last_ime_area);
         match renderer.frame(&paint) {
             Ok(()) => {
                 if !self.first_frame_logged {
@@ -638,6 +651,8 @@ impl ApplicationHandler for NativeApp {
         if self.window.is_none() {
             if let Err(error) = self.create_window(event_loop) {
                 error!("startup failed: {error:#}");
+                #[cfg(windows)]
+                show_startup_error(&error);
                 event_loop.exit();
             }
         }
@@ -769,14 +784,32 @@ impl ApplicationHandler for NativeApp {
                     !alt_graph && (modifiers.ctrl || modifiers.alt || modifiers.super_key);
                 if pressed && !shortcut_modifier {
                     if let Some(text) = &event.text {
-                        for ch in text.chars() {
-                            if !ch.is_control() {
-                                self.input.text.push(ch);
-                            }
-                        }
+                        push_ime_text(&mut self.input, text);
                     }
                 }
             }
+            // IME commits (CJK composition results, soft-keyboard/dead-key
+            // commits) are text-producing events of their own: winit delivers a
+            // composition result only through `Ime::Commit` and suppresses
+            // `KeyboardInput` during the preedit, while a plain key press
+            // arrives only as `KeyEvent::text` (this is winit's documented
+            // "use both" contract; the only platform where winit still emits a
+            // `KeyboardInput` for an IME-processed key is Windows, and there it
+            // reports the key as `NamedKey::Process`, which `map_key` below
+            // already ignores and which carries no `text`). Appending both is
+            // therefore correct, and a per-frame "same text twice" dedupe would
+            // be a heuristic that can swallow legitimately repeated characters
+            // ("aa"). `push_ime_text` keeps the control-character filtering of
+            // the keyboard path.
+            //
+            // `Ime::Preedit` is intentionally not inserted: the UI has no
+            // composition preview field and `InputState` is frozen, so the
+            // committed string is what reaches `InputState::text`. `Enabled` /
+            // `Disabled` carry no text.
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                push_ime_text(&mut self.input, &text);
+            }
+            WindowEvent::Ime(Ime::Preedit(..) | Ime::Enabled | Ime::Disabled) => {}
             WindowEvent::Focused(focused) => {
                 if !focused {
                     apply_focus_lost(&mut self.input);
@@ -858,6 +891,33 @@ fn run_resize(window: &Window, edge: ResizeEdge) -> bool {
             warn!("window resize failed: {error}");
             false
         }
+    }
+}
+
+/// Position the OS IME candidate window at the focused text field's caret.
+///
+/// The framework reports a logical-pixel caret rectangle; winit wants physical
+/// pixels relative to the window. Calling this only when the rounded physical
+/// anchor actually changes keeps a steady caret from re-sending it 60 times a
+/// second. No focused text input means no call: the candidate window stays where
+/// it last was until focus moves back to a field.
+fn sync_ime_cursor(window: &Window, area: Option<Rect>, last: &mut Option<(i32, i32, u32, u32)>) {
+    let Some(area) = area else {
+        return;
+    };
+    let scale = window.scale_factor();
+    let position = PhysicalPosition::new(
+        (area.x * scale as f32).round() as i32,
+        (area.y * scale as f32).round() as i32,
+    );
+    let size = PhysicalSize::new(
+        ((area.w * scale as f32).round() as u32).max(1),
+        ((area.h * scale as f32).round() as u32).max(1),
+    );
+    let key = (position.x, position.y, size.width, size.height);
+    if *last != Some(key) {
+        window.set_ime_cursor_area(position, size);
+        *last = Some(key);
     }
 }
 
@@ -943,6 +1003,30 @@ fn window_icon() -> Option<winit::window::Icon> {
     let image = image::load_from_memory(ICON_PNG).ok()?.into_rgba8();
     let (width, height) = image.dimensions();
     winit::window::Icon::from_rgba(image.into_raw(), width, height).ok()
+}
+
+/// Give the window the identity of the installed Linux launcher entry.
+///
+/// Without this winit leaves the Wayland `app_id` unset and derives the X11
+/// `WM_CLASS` from `argv[0]`, so a compositor cannot associate the window with
+/// `Rift.desktop`: the taskbar entry would not group under the launcher, its
+/// icon would not be used, and the entry's `StartupWMClass` would never match.
+/// Both winit platform extensions write the same `ApplicationName`, whose
+/// `general` field is the Wayland `app_id` / X11 `WM_CLASS` class and whose
+/// `instance` field is the X11 `WM_CLASS` instance
+/// ([`rift_desktop::BINARY_NAME`]); calling both documents that the identity
+/// covers either backend.
+#[cfg(target_os = "linux")]
+fn with_linux_launcher_identity(
+    attributes: winit::window::WindowAttributes,
+) -> winit::window::WindowAttributes {
+    use winit::platform::{wayland::WindowAttributesExtWayland, x11::WindowAttributesExtX11};
+    let attributes = WindowAttributesExtWayland::with_name(
+        attributes,
+        rift_desktop::APP_ID,
+        rift_desktop::BINARY_NAME,
+    );
+    WindowAttributesExtX11::with_name(attributes, rift_desktop::APP_ID, rift_desktop::BINARY_NAME)
 }
 
 /// Native window handle for OS media integration (SMTC on Windows).

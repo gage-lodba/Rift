@@ -13,9 +13,9 @@ the remaining single-client risk is documented rather than solved.
 | Phase | Status | Evidence |
 |---|---|---|
 | 0 — spike | **done** | §2; recorded traffic/responses in `artifacts/native-stream/` |
-| 1 — resolver `rift_ytmusic::player` | **done** | 71 lib + 15 fixture tests; live resolve + ranged GET `206 audio/mp4`; client table + chain (§3.1) |
+| 1 — resolver `rift_ytmusic::player` | **done** | 81 lib + 15 fixture tests (2026-11-22); live resolve + ranged GET `206 audio/mp4`; client table + chain (§3.1) |
 | 2 — downloader + progress `rift` | **done** | native ranged downloader (range/resume/200-fallback/size/expiry), progress lifecycle, loopback tests |
-| 3 — UI bar | **done** | `rift-desktop`: 314 lib + 13 ui_flow tests after the Phase 5 removal; bar geometry/no-bar tests; `ui-spec.md` §7.1.3 updated |
+| 3 — UI bar | **done** | `rift-desktop`: 375 lib + 17 ui_flow tests (2026-11-23); bar geometry/no-bar tests; `ui-spec.md` §7.1.3 updated |
 | 4 — live verification + default flip | **done** | §4.1: native-vs-yt-dlp parity, playback smoke, download worker (progress snapshots, restart/offline replay), UI capture, forced-fallback trigger, controller e2e |
 | 5 — remove yt-dlp surface | **done** | §4.2: backend/desktop surface removed; `RIFT_STREAM_BACKEND`/`RIFT_YTDLP`/settings/installer gone; native-only probes + live e2e pass; full local gate green |
 
@@ -234,13 +234,30 @@ Other implementation notes:
 - Tolerant `serde_json::Value` parsing, in the style of `parse.rs`: never fail a
   whole response over an unknown field; only the fields the resolver consumes
   are interpreted.
-- Format preference: `140` → `141` → `139` → any `audio/mp4` → any
-  audio-only format; reject entries whose `url` is absent or that carry
+- Format preference: `140` → `141` → `139` → any other `audio/mp4`; only
+  `audio/mp4` is directly playable (rodio cannot decode WebM/Opus, and the
+  offline path publishes `.m4a`), so a WebM/Opus-only response is
+  `NoAudioFormat` with a debug log naming the rejected MIME. Reject entries whose
+  `url` is absent or that carry
   `signatureCipher` (that would need JS solving — such formats are rejected
   rather than downloaded, and the fetch surfaces the error).
 - `playabilityStatus.status != "OK"` is a distinct error (`Unavailable`) so the
   UI/toast can surface YouTube's reason; the reason string is capped before it
   becomes a user-facing message.
+- **HTTP/2 response header-list limit.** `player::build_http_client` and
+  `client::Client::new` (in `rift-ytmusic`) and the backend's shared client
+  (`crates/rift/src/backend.rs`) raise hyper's h2 response header-list receive
+  limit to 64 KiB (`MAX_H2_RESPONSE_HEADER_LIST_BYTES` — a local constant in each
+  crate) because the cold-start visitor/client-version scrape of
+  `music.youtube.com` intermittently gets a ~6.2 KiB
+  `content-security-policy-report-only` header back, pushing the decoded header
+  list from ~12 KiB to ~18 KiB. The 16 KiB default reset the stream
+  (`REQUEST_HEADER_FIELDS_TOO_LARGE`) as an opaque
+  `http2 error: stream error detected`, failing ~50% of cold-start playback
+  resolutions and ~60% of first metadata scrapes on 2026-10-30 (all platforms,
+  not Linux-specific). 64 KiB matches the value Google's edge advertises in its
+  SETTINGS; the largest response observed was ~19.9 KiB, and the player POST and
+  googlevideo audio downloads were unaffected.
 
 ### 3.2 Native downloader — `rift::stream` (crate-private module)
 
@@ -279,9 +296,18 @@ Implementation notes:
   same total length. Splicing a different rendition's remainder onto the existing
   prefix would pass every length check and publish corrupt audio, so that case
   fails and the caller's retry restarts from zero.
+- **No-progress deadline:** in addition to the per-read timeout, every chunk (and
+  empty body frame) updates a rolling 30 s window; once the window has expired it
+  requires at least 1 KiB of *bytes* **proportionally** over the elapsed period
+  (1 KiB per 30 s, so a drip cannot accumulate 1 KiB across several windows and
+  reset them). A transfer below that rate fails with an explicit “made no
+  progress” error. Bytes, not requests, so a genuine large download always
+  resets it. Pure `progress_window` helper, unit-tested with synthetic instants.
 - `fetch_to_path` writes to the caller's temp path (`.part`) so a crash cannot
-  publish a truncated offline copy; the existing rename/cleanup rules in
-  `commands/downloads.rs` stay authoritative.
+  publish a truncated offline copy; after the final verified write the file is
+  `sync_all`ed before returning, so the worker's rename cannot publish a
+  non-zero but unsynced (crash-truncated) `.m4a`. The existing rename/cleanup
+  rules in `commands/downloads.rs` stay authoritative.
 - `fetch_bytes` for playback keeps the current in-memory contract (the decoder
   needs the bytes); progress is not surfaced for playback.
 
@@ -290,6 +316,39 @@ Implementation notes:
 - `fetch::fetch_track` (playback) and `commands::downloads` (offline) call the
   native path directly: `rift_ytmusic::player::resolve` → `rift::stream`
   (`fetch_bytes` for playback, `fetch_to_path` for offline).
+- **Offline file names are injective and reversible** (`fetch::safe_stem`). A
+  byte in `[a-z0-9_-]` is kept literally and every other byte is written as `~`
+  plus two lowercase hex digits: `a/b` → `a~2fb`, `..` → `~2e~2e`. The mapping
+  is reversible (`fetch::stem_id`), ids that differ only by case stay distinct
+  after case folding (`AbC` → `~41b~43`, `abc` → `abc`), and the alphabet
+  contains no separator, dot or space, so an id from imported JSON cannot escape
+  `downloads/` or acquire a trailing dot/space that Windows would strip.
+  Windows device names (`con`, `nul`, `com1`, and the same names with an
+  extension) are neutralized by escaping their first byte (`con` → `~63on`).
+  Each in-flight claim writes its own `<stem>.<claim token>.m4a.part`; a
+  `remove` invalidates that token, so a worker that was already transferring
+  cannot publish (or clean up) the retry's part after the id is re-downloaded.
+  Stems are capped at **120 characters**: a longer id keeps up to a
+  103-character prefix plus `!` and 16 uppercase hex digits of FNV-1a over the
+  full id. That capped form is deliberately undecodable; `Downloads` records
+  `stem -> id` in `downloads/.names.json` (atomic temp+flush+rename) *before*
+  the `.part` rename, and `load` prunes entries whose file is gone. The same
+  index records a stem containing `_`: a pre-P5 fold could have produced that
+  name for a different id, so the entry marks the file as owned by this id.
+  Playback applies the same ownership test (`legacy_name_owned_by_other`) before
+  serving a legacy name, so an owned `_` file is never played as another id.
+- **Pre-P5 files stay readable in place.** The old `_`-folding is frozen as
+  `fetch::legacy_safe_stem`. `Downloads::load` stats the directory once, keeps
+  every non-empty `.m4a` stem, and `is_downloaded`/`fetch::fetch_track` fall back
+  to `legacy_safe_stem(id)` after the current name, so an old `<id>.m4a`
+  (uppercase preserved) or a folded `a_b.m4a` for `a/b` still plays offline after
+  an upgrade. Nothing is renamed or deleted at load (the scan still removes only
+  zero-byte `.m4a` and leftover `.part` files); an explicit remove deletes the
+  current name, the legacy name and the `.part`, except that an index-owned `_`
+  name belonging to another id is left intact. A folded legacy name without an
+  index entry is ambiguous by nature — it cannot say which of several ids it was
+  written for — so it is accepted for every id that folds to it, exactly as the
+  pre-fix lookup did; new files never create that situation.
 - There is **no fallback backend, no environment switch and no external
   process**. A native failure surfaces as the fetch/download error: playback
   toasts it, the download worker cleans the `.part` file and lets the existing
@@ -316,13 +375,17 @@ Contract (shared by backend and UI):
   Permille (not `f32`) keeps `DownloadState: Eq`, which the UI tests and event
   comparisons rely on.
 - `rift::downloads::Downloads` grows a progress map behind its existing lock
-  discipline; `set_progress(id, received, total)` clamps and records, and every
-  lifecycle transition (`begin`, `finish`, `fail`, `mark_failed`, `remove`)
-  clears the entry so a stale bar can never outlive a claim.
-- Emission: the download worker emits a `BackendEvent::Downloads` snapshot at
-  most every 100 ms per active track (and on the transition, as today). Whole
-  snapshots are already how the UI consumes this state; no new event variant is
-  needed.
+  discipline; `set_progress(id, received, total)` clamps and records (returning
+  the recorded permille, or `None` for an unclaimed/canceled/unknown-length
+  update), and every lifecycle transition (`begin`, `finish`, `fail`,
+  `mark_failed`, `remove`) clears the entry so a stale bar can never outlive a
+  claim.
+- Emission: the worker emits
+  `BackendEvent::DownloadProgress { id, permille }` at most every 100 ms per
+  active track; whole `Downloads` snapshots are emitted on claim/finish/fail/
+  remove only, so a progress tick no longer clones the status sets. The UI
+  inserts the fraction into `State::downloads.progress`; a fraction for an id no
+  longer in `downloading` is ignored so a late tick cannot recreate a bar.
 - "Downloading, no fraction" means the track is **claimed but queued** behind the
   one actively transferring (the worker claims a whole batch up front); the UI
   keeps the spinner for it. There is no second backend to report progress on.
@@ -348,9 +411,9 @@ Contract (shared by backend and UI):
 | Phase | Work | Gate |
 |---|---|---|
 | 0 | Spike: validate JS-less resolution, visitor reuse, ranged download | **Done** — §2 |
-| 1 | `rift_ytmusic::player`: resolver module, fixture + loopback tests | **Done** — 71 lib + 15 fixture tests; client table/chain covered; live resolve on 2 ids with ranged `206`, plus a 20-id coverage sample (§3.1) |
+| 1 | `rift_ytmusic::player`: resolver module, fixture + loopback tests | **Done** — 81 lib + 15 fixture tests (2026-11-22); client table/chain covered; live resolve on 2 ids with ranged `206`, plus a 20-id coverage sample (§3.1) |
 | 2 | `rift::stream`: native ranged downloader + `Downloads` progress plumbing + fallback wiring | **Done** — native ranged downloader (range/resume/200-fallback/size/expiry), progress lifecycle, loopback tests; the fallback wiring added here was removed again in Phase 5 |
-| 3 | UI: `DownloadState.progress`, row bar, list/state plumbing, tests | **Done** — 314 lib + 13 ui_flow `rift-desktop` tests after the Phase 5 removal; no-bar/bar geometry pinned; `ui-spec.md` updated |
+| 3 | UI: `DownloadState.progress`, row bar, list/state plumbing, tests | **Done** — 375 lib + 17 ui_flow `rift-desktop` tests (2026-11-23); no-bar/bar geometry pinned; `ui-spec.md` updated |
 | 4 | Live verification: mixed id sample, native-vs-yt-dlp comparison (bytes/duration/decodability), failure cases, flip `auto` to the default | **Done** — probe §4.1 passes 5/5; playback smoke, download worker (progress snapshots, restart/offline replay) and UI capture recorded; default flipped to `auto` (that switch and the comparison backend were removed in Phase 5) |
 | 5 | Remove yt-dlp from the product: fetch path, installer/detection commands, Settings section, `RIFT_YTDLP`/override surface, README requirement, docs | **Done** — §4.2 records the removal and its native-only verification; full local CI gate green |
 
@@ -454,6 +517,8 @@ forced failure produced >100 KB of decoded audio via the legacy path. The hook i
 compiled out of release builds, and the test is `#[ignore]`d in CI. Artifact:
 `artifacts/native-stream/fallback-live-test.txt`.
 
+*(Historical record: the fallback and this test were removed in Phase 5, and `crates/rift` has no ignored tests today; the only ignored live RPC test is in `rift-discord`.)*
+
 #### 4.1.5 Controller-level end-to-end (live)
 
 The last code-level gap between "backend works" and "the app does it" is the
@@ -465,9 +530,9 @@ through the real `Controller` + `App` state machine on a throwaway data dir
 
 1. `Action::PlayTrack` → `ControllerEvent::Track` + `PlaybackState::Playing`, and
    playback position ticks (`Progress.position > 0.5 s`).
-2. `Action::DownloadTracks` → at least one `Downloads` snapshot carrying the
-   in-flight `DownloadState.progress` entry before the completed state; offline
-   file on disk >100 KB.
+2. `Action::DownloadTracks` → at least one `ControllerEvent::DownloadProgress
+   { id, permille }` (the lightweight per-track event, clamped to `0..=1000`)
+   before the completed `Downloads` snapshot; offline file on disk >100 KB.
 3. Backend shutdown + fresh backend/controller on the same store → `bootstrap`
    rediscovers `downloads.downloaded`, and a second `Action::PlayTrack` reaches
    `Playing` again from the offline copy.
@@ -622,7 +687,7 @@ This was a deliberate, documented trade-off (see §0/§8), not an oversight.
 | Progress events flooding the UI | 100 ms throttle; permille granularity |
 | Arbitrary URL in a player response / redirect | fixed 2026-10-26: before any bytes are requested the signed URL must be `https` on `googlevideo.com`/`*.googlevideo.com`, with no embedded credentials; the audio client only follows redirects that satisfy the same rule (`rift::stream` regression tests, §8). |
 | Unbounded body from a server that ignores `Range` | the `200`-instead-of-`206` fallback is capped at 256 MiB for the in-memory playback sink and the transfer fails with a clear error instead of growing without bound; offline file sinks are bounded by the filesystem (§8). |
-| A slow-dripping server keeps a download claim alive | each read is read-timeout-bounded, but there is no total/no-progress deadline yet; backlog (§8) |
+| A slow-dripping server keeps a download claim alive | **fixed 2026-11-22:** a rolling 30 s window requires ≥1 KiB of received bytes at the proportional rate, so a sub-rate drip fails with “made no progress” instead of holding the claim/`Loading` state; the per-read timeout remains |
 
 ## 8. Open questions / later
 
@@ -659,27 +724,40 @@ items marked *fixed* are already in the tree with regression tests (§4.2).
   one process-wide `reqwest::Client` and clones it per call, so the
   resolve→re-resolve path keeps its connection pool instead of paying a new
   TCP+TLS handshake each time.
-- **No-progress deadline:** only a per-read timeout exists; a server sending one
-  byte every 29 s keeps a download claim/UI row alive indefinitely (playback has
-  no cancel). Suggested: bytes/`no-progress` budget per transfer.
-- **Remove while downloading:** `Downloads::remove` neither cancels nor clears
-  the in-flight claim; the worker can finish afterwards and re-publish the file.
-  The UI does not offer remove for an in-flight row today, but the backend
-  invariant is loose.
-- **Toast flood:** a fully failed fresh batch emits one `Error` per track
-  (kept-offline retries are coalesced). Suggested: coalesce per pass.
-- **Progress event cost:** every snapshot clones the whole `DownloadState`
-  (including large downloaded sets) at ≤10 Hz; a dedicated lightweight progress
-  event or change-gated emission would scale better with huge offline libraries.
-- **`safe_stem` edge cases:** case-insensitive filesystems can collide for ids
-  differing only by case, and Windows reserved names (`CON`, `NUL`, …) are not
-  neutralized; an imported playlist can carry such ids. Fixing needs offline-file
-  migration, so it is deferred.
-- **Last-resort non-m4a formats:** if 140/141/139/`audio/mp4` are all absent the
-  resolver may pick Opus/WebM, which the decoder may or may not accept; verify
-  the decoder path before relying on it (or return `NoAudioFormat` instead).
-- **Test gaps:** no unit test drives the download worker itself (rename, `.part`
-  cleanup, progress emission are only covered by the live probes); `identity.rs`
+- **No-progress deadline:** *fixed 2026-11-22.* A rolling 30 s / 1 KiB
+  rate-proportional byte window (pure `progress_window`, unit-tested) fails a
+  stalled transfer; see §3.2. The per-read timeout remains as a second line.
+- **Remove while downloading:** *fixed 2026-11-22.* `Downloads::remove`
+  tombstones the id, clears the claim/progress/failed marks and deletes both the
+  final `.m4a` and the `.part`; `begin` clears the tombstone for a retry, and the
+  worker re-checks before and after the rename so a canceled transfer publishes
+  nothing and emits no error. Store transitions and the publish seam are
+  unit-tested; only the live network transfer remains probe-only.
+- **Toast flood:** *fixed 2026-11-22.* A fully failed fresh batch now emits one
+  coalesced `Error` per pass (a single failure keeps its exact message); the
+  per-track `failed` marks offer the retries.
+- **Progress event cost:** *fixed 2026-11-22.* Progress is the lightweight
+  `BackendEvent::DownloadProgress { id, permille }` at most every 100 ms; whole
+  `DownloadState` snapshots are lifecycle transitions only, so a large
+  downloaded set is no longer cloned per tick.
+- **`safe_stem` edge cases:** *fixed 2026-11-22.* The `_`-folding was not
+  injective (`a/b` and `a_b` shared one file), case-insensitive filesystems
+  collided for case-only ids, and Windows device names (`CON`, `NUL`, …) were not
+  neutralized. Offline names are now an injective `~xx` escape over
+  `[a-z0-9_-]`, capped at 120 characters with an FNV-1a suffix and a
+  `downloads/.names.json` mapping for capped ids and for `_` names that a
+  pre-P5 fold could have produced; pre-P5 files are read in place through
+  `legacy_safe_stem` (§3.3). Residual risk: a pre-P5 folded file without an
+  index entry is inherently ambiguous, and a legacy name that differs only by
+  case from a new one can share a path on a case-insensitive filesystem —
+  publishing refuses to overwrite a non-empty file rather than destroy it, and
+  an index-owned `_` name is spared by another id's remove.
+- **Last-resort non-m4a formats:** *fixed 2026-11-22.* The resolver now accepts
+  only `audio/mp4`; a WebM/Opus-only response returns `NoAudioFormat` (the
+  download path never publishes a container rodio cannot decode).
+- **Test gaps:** the download worker's publish/cancel seam and the no-progress
+  helper are now unit-tested (`publish_part`, `progress_window`); the live
+  network transfer is still probe-only. `identity.rs`
   has no loopback test for the empty-`__Secure-YEC` → outgoing-header path; the
   player's body-size ceiling is not `cfg(test)`-overridable, so oversized-body
   responses are untested; `stream.rs` does not test a `200` in response to a

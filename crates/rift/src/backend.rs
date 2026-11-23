@@ -23,6 +23,7 @@
 //! returns, each with an error event).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rift_types::{Library, PlaybackState, QueueSnapshot, Track};
@@ -37,7 +38,7 @@ use crate::media::{self, MediaHandle};
 use crate::paths;
 use crate::player::{self, PlayerCore, PlayerShared};
 use crate::settings::{self, SettingsStore};
-use crate::util::{DurableWriter, LockExt, Persister};
+use crate::util::{DurableSaveFailure, DurableWriter, LockExt, Persister};
 
 /// Maximum number of library rows the startup metadata repair looks up over the
 /// network per launch. Rows beyond the cap, or rows whose lookup fails while
@@ -49,6 +50,40 @@ const REPAIR_LOOKUP_LIMIT: usize = 20;
 /// the offline / blocked-network signal; the rows simply stay incomplete and the
 /// next launch tries again.
 const REPAIR_MAX_CONSECUTIVE_ERRORS: u32 = 3;
+
+/// How often the backend polls [`DurableWriter`]'s failure slot.
+///
+/// A save is queued asynchronously, so its failure is recorded later on
+/// `rift-durable`; this timer is what turns that record into a user-visible
+/// notice. Two seconds keeps a discovery prompt enough but coalesces a burst of
+/// failed saves (a permission change mid-edit) into one poll. Tests shorten it so
+/// the end-to-end notification path can be observed without a two-second wait;
+/// the cooldown below is unchanged.
+#[cfg(not(test))]
+const SAVE_FAILURE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const SAVE_FAILURE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Minimum gap between save-failure notices.
+///
+/// The first observed failure is reported immediately; failures that keep
+/// arriving while the disk stays unwritable are folded into one notice per
+/// window (with the accumulated count) instead of one toast per save.
+const SAVE_FAILURE_NOTICE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// HTTP/2 response header-list ceiling for the backend's shared client.
+///
+/// hyper's h2 client defaults to a 16 KiB receive limit. `YouTube` intermittently
+/// answers its home page with an ~18 KiB header list (a ~6.2 KiB
+/// `content-security-policy-report-only` header on top of the ~12 KiB baseline),
+/// and a reset stream reaches the app as an opaque network error — the
+/// connectivity probe and the cold-start metadata repair cannot tell it apart
+/// from an actual outage. The innertube clients in `rift-ytmusic` raise the same
+/// limit for the same reason (see `MAX_H2_RESPONSE_HEADER_LIST_BYTES` there);
+/// 64 KiB matches the value Google's edge advertises in its own SETTINGS, and
+/// the bound is per response and transient. Audio downloads keep their own
+/// client in `stream` — googlevideo response headers are tiny.
+const MAX_H2_RESPONSE_HEADER_LIST_BYTES: u32 = 64 * 1024;
 
 /// Optional construction parameters.
 ///
@@ -156,6 +191,12 @@ impl From<paths::DataDirError> for BackendError {
 /// not.
 pub(crate) struct BackendInner {
     pub(crate) player: Arc<PlayerShared>,
+    /// Dedicated cover-art client: HTTPS-only thumbnail hosts, with every
+    /// redirect hop re-validated against the same allow-list. It shares the
+    /// JSON client's timeout policy but not its redirect policy, so cover URLs
+    /// cannot turn the backend into an SSRF probe while metadata/connectivity
+    /// behaviour stays unchanged. See `commands::images`.
+    pub(crate) http_image: reqwest::Client,
     pub(crate) library: Arc<Mutex<LibraryStore>>,
     pub(crate) downloads: Arc<Downloads>,
     pub(crate) settings: Arc<Mutex<SettingsStore>>,
@@ -336,7 +377,7 @@ impl RiftBackend {
     /// Returns [`BackendError`] when the data directory cannot be resolved or
     /// created ([`BackendError::DataDir`] / [`BackendError::CreateDataDir`]), or
     /// when a required component cannot be initialized
-    /// ([`BackendError::Init`]: the `YouTube` Music client, the HTTP client — in
+    /// ([`BackendError::Init`]: the `YouTube` Music client, the HTTP clients — in
     /// practice a `TLS` backend that cannot be loaded — or the backend runtime).
     /// A missing network or audio device is not an error: those degrade later
     /// with an `Error` event.
@@ -379,8 +420,29 @@ impl RiftBackend {
         // jobs and the media/Discord threads all publish through clones of it.
         let (events, event_rx) = EventSender::channel();
 
+        // The library and settings loaded before the bus existed, so a file that
+        // could not be read (and could not be moved aside) had nowhere to report
+        // it yet. The bus is the first point a toast can reach the app: emit one
+        // combined `Error` now rather than one per file, since the likely cause
+        // (an unreadable data directory) is shared. The store is already
+        // read-only in that case, so this tells the user why edits do not stick.
+        let startup_load_warnings: Vec<String> = [
+            library.lock_safe().load_warning().map(str::to_owned),
+            settings.lock_safe().load_warning().map(str::to_owned),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !startup_load_warnings.is_empty() {
+            events.send(BackendEvent::Error(startup_load_warnings.join(" ")));
+        }
+
         let (audio_events_tx, audio_events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let audio_tx = audio::spawn(audio_events_tx);
+        // Shared with the audio thread so a queued crossfade can be dropped
+        // after a superseding command or an acknowledgement timeout. Created
+        // before the thread and stored in `PlayerShared` below.
+        let crossfade_epoch = Arc::new(AtomicU64::new(0));
+        let audio_tx = audio::spawn(audio_events_tx, Arc::clone(&crossfade_epoch));
         debug!("startup: audio thread spawn +{:.1} ms", elapsed_ms());
         // Apply the persisted volume to the fresh audio thread.
         let _ = audio_tx.send(AudioCmd::Volume(volume));
@@ -411,16 +473,23 @@ impl RiftBackend {
         let player = Arc::new(PlayerShared {
             core: Mutex::new(core),
             audio: audio_tx,
+            crossfade_epoch,
             yt,
             // Every request this client makes is small and latency-bound
-            // (metadata/player JSON, update checks, image URLs), so it needs a
+            // (metadata/player JSON, update checks), so it needs a
             // ceiling: reqwest's default is *no* timeout, and a stalled socket
             // would otherwise wedge a command forever — including a download
             // worker holding a `Downloads::begin` claim that is then never
-            // released. Audio downloads use their own client in `stream`.
+            // released. Audio downloads use their own client in `stream`;
+            // cover art has the separate image client below.
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(30))
+                // `YouTube` home-page responses can exceed hyper's default h2
+                // header-list receive limit; a reset stream here would look
+                // like "offline" to the connectivity probe and the metadata
+                // repair. See `MAX_H2_RESPONSE_HEADER_LIST_BYTES`.
+                .http2_max_header_list_size(MAX_H2_RESPONSE_HEADER_LIST_BYTES)
                 .build()
                 .map_err(|e| {
                     BackendError::Init(format!(
@@ -432,6 +501,18 @@ impl RiftBackend {
             last_session: Mutex::new(None),
         });
         debug!("startup: http client (TLS) +{:.1} ms", elapsed_ms());
+
+        // Cover art gets its own client so the thumbnail allow-list and the
+        // per-hop redirect re-validation apply only to those URLs; the shared
+        // client above keeps its ordinary redirect policy for metadata and the
+        // connectivity probe. Same TLS stack and timeouts, so this is not the
+        // "second client" the old design forbade for API calls.
+        let http_image = crate::commands::images::build_image_client().map_err(|e| {
+            BackendError::Init(format!(
+                "could not build the image HTTP client (TLS backend unavailable): {e}"
+            ))
+        })?;
+        debug!("startup: image http client (TLS) +{:.1} ms", elapsed_ms());
 
         // The media thread needs to call back into the player when the OS sends a
         // media key. It holds only a `Weak` reference, filled in after the shared
@@ -452,6 +533,7 @@ impl RiftBackend {
 
         let inner = Arc::new(BackendInner {
             player,
+            http_image,
             library,
             downloads,
             settings,
@@ -501,6 +583,15 @@ impl RiftBackend {
         let repair_state = Arc::clone(&inner);
         runtime.spawn(async move {
             repair_incomplete_library_metadata(repair_state).await;
+        });
+
+        // A failed library/settings save is written asynchronously, so its error
+        // only existed in the log until the writer started recording it. Poll
+        // that record and tell the user (once per burst): otherwise the UI keeps
+        // believing the change persisted.
+        let save_failure_state = Arc::clone(&inner);
+        runtime.spawn(async move {
+            watch_durable_save_failures(save_failure_state).await;
         });
 
         info!("backend started (+{:.1} ms)", elapsed_ms());
@@ -578,6 +669,10 @@ impl RiftBackend {
             );
         }
         let _ = self.handle.inner.durable.flush();
+        // `Downloads::remove` queues `.names.json` off the UI thread; make the
+        // shutdown barrier cover it too, so a removed capped/`_` entry cannot
+        // survive a clean quit just because its write was still queued.
+        self.handle.inner.downloads.flush_names();
     }
 }
 
@@ -790,6 +885,79 @@ fn resolve_data_dir(config: &BackendConfig) -> Result<PathBuf, BackendError> {
     }
 }
 
+/// Debounces the durable writer's failure record into user-facing notices.
+///
+/// One notice per burst: the first observed failure is reported immediately,
+/// then further failures are folded into a single notice at most once per
+/// [`SAVE_FAILURE_NOTICE_COOLDOWN`]. `reported` advances only when a notice is
+/// sent, so failures that arrive during the cooldown are not lost — the next
+/// notice carries the accumulated count and the last reason.
+#[derive(Debug, Default)]
+struct SaveFailureNotifier {
+    /// Failure count covered by the notices sent so far.
+    reported: u64,
+    /// When the last notice was emitted (`None` until the first one).
+    last_notice: Option<std::time::Instant>,
+}
+
+impl SaveFailureNotifier {
+    /// Whether `failure` should produce a notice now.
+    fn due(&self, failure: &DurableSaveFailure, now: std::time::Instant) -> bool {
+        failure.count > self.reported
+            && self
+                .last_notice
+                .is_none_or(|at| now.saturating_duration_since(at) >= SAVE_FAILURE_NOTICE_COOLDOWN)
+    }
+
+    /// The notice text: a single failure keeps its specific reason; a burst
+    /// reports the count plus the last reason.
+    fn message(&self, failure: &DurableSaveFailure) -> String {
+        let newly_failed = failure.count.saturating_sub(self.reported);
+        if newly_failed == 1 {
+            format!(
+                "Couldn\u{2019}t save your {}: {}. That change may be lost.",
+                failure.what, failure.error
+            )
+        } else {
+            format!(
+                "Couldn\u{2019}t save your {} \u{2014} {newly_failed} changes failed. \
+                 Last error: {}",
+                failure.what, failure.error
+            )
+        }
+    }
+
+    /// Mark the failure count covered by the notice just emitted.
+    fn record_notice(&mut self, failure: &DurableSaveFailure, now: std::time::Instant) {
+        self.reported = failure.count;
+        self.last_notice = Some(now);
+    }
+}
+
+/// Poll the durable writer's failure slot and surface one error per burst.
+///
+/// This is a small timer task rather than work on the connectivity probe: the
+/// backend owns the writer, so it can report a lost save even when the app never
+/// polls connectivity, and it needs no network. It runs for the backend's whole
+/// lifetime; dropping the runtime cancels it.
+async fn watch_durable_save_failures(backend: Arc<BackendInner>) {
+    let mut interval = tokio::time::interval(SAVE_FAILURE_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut notifier = SaveFailureNotifier::default();
+    loop {
+        interval.tick().await;
+        let Some(failure) = backend.durable.last_failure() else {
+            continue;
+        };
+        let now = std::time::Instant::now();
+        if !notifier.due(&failure, now) {
+            continue;
+        }
+        backend.emit(BackendEvent::Error(notifier.message(&failure)));
+        notifier.record_notice(&failure, now);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +1006,135 @@ mod tests {
         assert_send_sync::<BackendConfig>();
     }
 
+    fn save_failure(
+        count: u64,
+        what: &'static str,
+        error: &str,
+    ) -> crate::util::DurableSaveFailure {
+        crate::util::DurableSaveFailure {
+            what,
+            error: error.to_owned(),
+            count,
+        }
+    }
+
+    /// A failed durable save must reach the user, but one toast per write would
+    /// flood: the first failure reports immediately with its exact reason, the
+    /// same failure is never repeated, and failures during the cooldown are
+    /// folded into the next notice (count + last reason). A backwards clock is
+    /// treated as "not yet", never as a panic.
+    #[test]
+    fn save_failures_are_reported_once_per_burst_with_count_and_last_reason() {
+        use std::time::{Duration, Instant};
+
+        let mut notifier = SaveFailureNotifier::default();
+        let start = Instant::now();
+        let first = save_failure(1, "library", "Permission denied (os error 13)");
+
+        assert!(
+            notifier.due(&first, start),
+            "the first observed failure reports immediately"
+        );
+        assert_eq!(
+            notifier.message(&first),
+            "Couldn\u{2019}t save your library: Permission denied (os error 13). \
+             That change may be lost.",
+            "a single failure keeps its specific reason"
+        );
+        notifier.record_notice(&first, start);
+
+        assert!(
+            !notifier.due(&first, start + Duration::from_secs(600)),
+            "the same recorded failure must not be reported twice"
+        );
+
+        // Two further saves fail inside the cooldown: held, then one notice.
+        let burst = save_failure(3, "settings", "No space left on device");
+        assert!(
+            !notifier.due(&burst, start + Duration::from_secs(5)),
+            "a burst inside the cooldown is held, not dropped"
+        );
+        let after_cooldown = start + SAVE_FAILURE_NOTICE_COOLDOWN;
+        assert!(
+            notifier.due(&burst, after_cooldown),
+            "the held burst reports when the cooldown expires"
+        );
+        let message = notifier.message(&burst);
+        assert!(
+            message.contains("2 changes failed"),
+            "the notice carries the accumulated count: {message}"
+        );
+        assert!(
+            message.contains("No space left on device"),
+            "the notice carries the last reason: {message}"
+        );
+        notifier.record_notice(&burst, after_cooldown);
+
+        let later = save_failure(4, "library", "permission denied");
+        assert!(
+            !notifier.due(&later, start + Duration::from_secs(29)),
+            "a backwards clock is treated as inside the cooldown, not a panic"
+        );
+    }
+
+    /// End-to-end notification path: a save that fails on the writer thread is
+    /// recorded and the watchdog turns it into an `Error` event on the bus, so
+    /// the user learns the change did not persist. The poll interval is shortened
+    /// under `cfg(test)`; the assertion is on the actual event, not just the
+    /// record, because the record alone is still invisible to the app.
+    #[test]
+    fn a_failed_durable_save_reaches_the_event_bus() {
+        use std::time::{Duration, Instant};
+
+        if skip_headless_windows_ci() {
+            return;
+        }
+        let _backend_guard = BACKEND_TEST_LOCK.lock_safe();
+        let dir = crate::util::testing::TempDir::new("backend-save-failure");
+        let (backend, mut events) =
+            RiftBackend::new(BackendConfig::new().with_data_dir(dir.path().to_path_buf()))
+                .expect("the backend must start without a window or a network");
+
+        // Force the writer's publish to fail: the target's parent is a regular
+        // file, so its temp-file creation fails exactly like an unwritable data
+        // directory would (no permissions tricks, works as root too).
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("write the blocker");
+        backend.handle.inner.durable.write(
+            blocker.join("library.json"),
+            "library",
+            b"payload".to_vec(),
+            |bytes: &Vec<u8>| Ok(bytes.clone()),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut notice = None;
+        while Instant::now() < deadline && notice.is_none() {
+            while let Some(event) = events.try_recv() {
+                if let BackendEvent::Error(message) = event {
+                    if message.contains("save") {
+                        notice = Some(message);
+                        break;
+                    }
+                }
+            }
+            if notice.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let notice = notice.expect("a failed save must reach the event bus");
+        assert!(
+            notice.contains("library"),
+            "the notice names the file that was not saved: {notice}"
+        );
+        assert!(
+            backend.handle.inner.durable.last_failure().is_some(),
+            "the writer's record is what the notice was built from"
+        );
+        drop(backend);
+    }
+
     /// The real startup/shutdown path, with no window and no network: this is the
     /// smoke test that would catch a startup panic (a missing data directory, a
     /// media thread that expected an HWND, an event pump that needs a window) and a
@@ -881,6 +1178,41 @@ mod tests {
         assert!(bootstrap.library.playlists.is_empty());
         assert!(!bootstrap.preview || crate::settings::preview_mode());
         assert_eq!(backend.library(), bootstrap.library);
+
+        // A queue/mode change that can move the pinned next track invalidates a
+        // crossfade command that may already be queued on the audio thread:
+        // `cycle_repeat` emits through the invalidating broadcast.
+        let epoch_before = backend
+            .handle
+            .inner
+            .player
+            .crossfade_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        backend.cycle_repeat();
+        let epoch_after = backend
+            .handle
+            .inner
+            .player
+            .crossfade_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            epoch_after > epoch_before,
+            "an invalidating queue broadcast must move the crossfade token (before {epoch_before}, after {epoch_after})"
+        );
+        // A metadata/append-style broadcast cannot move the pin and must leave a
+        // queued crossfade alone.
+        let quiet_before = epoch_after;
+        crate::player::emit_queue_quiet(&backend.handle.inner, &backend.handle.inner.player);
+        let quiet_after = backend
+            .handle
+            .inner
+            .player
+            .crossfade_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            quiet_after, quiet_before,
+            "a quiet queue broadcast must not invalidate a queued crossfade"
+        );
 
         // A sync command that touches the audio thread and the persisted settings
         // works even when no audio device exists (the send is best-effort).

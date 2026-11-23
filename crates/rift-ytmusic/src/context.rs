@@ -162,18 +162,52 @@ fn resolve_client_version(
 }
 
 async fn scrape(http: &reqwest::Client, user_agent: &str) -> Option<String> {
-    let body = http
+    let resp = http
         .get(home())
         .header(reqwest::header::USER_AGENT, user_agent)
         .send()
         .await
         .ok()?
         .error_for_status()
-        .ok()?
-        .text()
-        .await
         .ok()?;
+    let body = read_capped(resp).await?;
     extract_client_version(&body)
+}
+
+/// Largest home-page body the client-version scrape will buffer.
+///
+/// The same 2 MiB ceiling as the visitor scrape: the home page is a few hundred
+/// kilobytes, the request's 30 s timeout bounds *time* rather than *bytes*, and
+/// a broken or hostile server must not grow this buffer for as long as it keeps
+/// sending. Tests shrink the constant so the streaming bound can be exercised
+/// without moving megabytes through loopback.
+#[cfg(not(test))]
+const CLIENT_VERSION_MAX_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(test)]
+const CLIENT_VERSION_MAX_BYTES: usize = 4 * 1024;
+
+/// Read the home page with a hard size ceiling, returning `None` if it is
+/// larger than [`CLIENT_VERSION_MAX_BYTES`].
+///
+/// Streaming (rather than `Response::text()`) is what makes the ceiling real:
+/// `reqwest` has no body limit of its own, and a chunked response declares no
+/// length at all. A declared length over the cap is rejected before the first
+/// byte, and the streamed count is checked too because a server can omit or lie
+/// about `Content-Length`.
+async fn read_capped(mut resp: reqwest::Response) -> Option<String> {
+    if let Some(declared) = resp.content_length() {
+        if declared > CLIENT_VERSION_MAX_BYTES as u64 {
+            return None;
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if body.len() + chunk.len() > CLIENT_VERSION_MAX_BYTES {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// The `"INNERTUBE_CONTEXT_CLIENT_VERSION":"…"` literal in the home page.
@@ -281,6 +315,99 @@ mod tests {
             resolve_client_version(&cache, || Some("1.20251001.00.00".to_owned())),
             "1.20250901.00.00",
             "first writer wins"
+        );
+    }
+
+    /// Serve `body` once, with an optional declared `Content-Length`.
+    ///
+    /// With no declared length the body is close-delimited, so `reqwest` cannot
+    /// learn its size from the headers: the streamed byte count is the only
+    /// bound (the same shape as a chunked response).
+    fn serve_body(body: Vec<u8>, declared: Option<u64>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("bound address").port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while head.len() < 16 * 1024 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let length = declared.map_or_else(String::new, |n| format!("Content-Length: {n}\r\n"));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{length}\
+                 Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    fn test_http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build test client")
+    }
+
+    /// The client-version scrape is a `GET` of the home page, so it needs the
+    /// same kind of body ceiling the visitor scrape has. A declared length over
+    /// the cap is refused before any of the body is buffered.
+    #[tokio::test]
+    async fn an_oversized_declared_client_version_body_is_refused() {
+        let declared = u64::try_from(CLIENT_VERSION_MAX_BYTES).expect("cap fits u64") + 1;
+        let url = serve_body(Vec::new(), Some(declared));
+        let resp = test_http()
+            .get(url)
+            .send()
+            .await
+            .expect("loopback response");
+        assert!(
+            read_capped(resp).await.is_none(),
+            "a declared oversized home page must not be buffered"
+        );
+    }
+
+    /// A response that declares no length (chunked or close-delimited) is the
+    /// case where `Response::text()` used to grow without bound; the streamed
+    /// count must stop it instead.
+    #[tokio::test]
+    async fn an_oversized_streamed_client_version_body_is_refused() {
+        let body = vec![b'x'; CLIENT_VERSION_MAX_BYTES + 64];
+        let url = serve_body(body, None);
+        let resp = test_http()
+            .get(url)
+            .send()
+            .await
+            .expect("loopback response");
+        assert!(
+            read_capped(resp).await.is_none(),
+            "the streamed body count must enforce the cap"
+        );
+    }
+
+    /// A page under the cap is still read whole and parsed exactly as before.
+    #[tokio::test]
+    async fn a_normal_client_version_body_is_read_and_parsed() {
+        let html = r#"<script>window["ytcfg"].set({"INNERTUBE_CONTEXT_CLIENT_VERSION":"1.20250101.00.00"});</script>"#;
+        let url = serve_body(html.as_bytes().to_vec(), None);
+        let resp = test_http()
+            .get(url)
+            .send()
+            .await
+            .expect("loopback response");
+        let body = read_capped(resp).await.expect("a small page is read");
+        assert_eq!(
+            extract_client_version(&body).as_deref(),
+            Some("1.20250101.00.00")
         );
     }
 }

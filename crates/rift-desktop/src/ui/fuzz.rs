@@ -219,12 +219,23 @@ fn assert_paint_sane(paint: &PaintList, frame: u64) {
             }
         }
     }
-    for tex in paint.created.iter().chain(paint.updated.iter()) {
+    for tex in &paint.created {
         assert_eq!(
             tex.rgba.len(),
             tex.width as usize * tex.height as usize * 4,
             "frame {frame}: texture {} has wrong pixel count",
             tex.id
+        );
+    }
+    for update in &paint.updated {
+        let (id, width, height, rgba) = match update {
+            TextureUpdate::Whole(tex) => (tex.id, tex.width, tex.height, &tex.rgba),
+            TextureUpdate::Region(region) => (region.id, region.width, region.height, &region.rgba),
+        };
+        assert_eq!(
+            rgba.len(),
+            width as usize * height as usize * 4,
+            "frame {frame}: texture {id} has wrong pixel count"
         );
     }
 }

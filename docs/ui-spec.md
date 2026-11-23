@@ -481,6 +481,9 @@ aligned center.
   x ≈ 464.7 (measured 464.5, thumb solid 458..471).
   Drag: while dragging, show the dragged value in the left time label and keep
   the thumb at the pointer; on release emit `Seek(position_secs)`.
+  When the length is unknown (`duration <= 0`), the track is painted static with
+  no thumb or drag handling and the right label is empty; no `Seek` is emitted
+  (there is no meaningful time to seek to).
   (The old app seeds this bar from bootstrap progress and updates it from the
   4 Hz progress events; while `state == Loading` the old app momentarily shows
   the new track's zero position.)
@@ -580,6 +583,9 @@ actions, no wrap beyond max-width (wrap at 420 px). Toast text is plain text.
 ### 6.6 Update banner
 
 Bottom-right floating card: `right: 18px; bottom: 110px; max-width: 480px;`
+shrink-to-fit width = padding + measured version text + margins/gaps + both
+buttons + close (capped at 480, where the text is ellipsized), so the controls
+always follow the *measured* text and stay inside the card;
 flex, align center, `gap: 12px`, padding **10px 12px 10px 16px**, radius 10,
 bg `#1c1c20`, border 1 px `#232328`, text `#ececef`, font 13, shadow
 `0 8px 24px rgba(0,0,0,.4)`, z above player. Contents, in order:
@@ -796,7 +802,10 @@ States: `.playing` → row bg `#151518` and title accent + weight 600; `.unavail
 
 ### 7.4 Search (`View::Search`)
 
-Reached by submitting the search box; the query is captured in `search.query`.
+Reached by submitting the search box; the submitted (trimmed) query is captured in
+`search.shown_query`. `search.query` is the box's live edit buffer — the titlebar
+field is its only writer, and submitting never rewrites it (typed whitespace stays
+in the box until the user changes it).
 
 1. h2: `Results for “{query}”` (first child → no top margin; uses curly quotes
    U+201C/U+201D).
@@ -804,7 +813,8 @@ Reached by submitting the search box; the query is captured in `search.query`.
 3. Content by tab:
    * Songs: busy → `.empty` "Searching..."; empty → `.empty` "No results.";
      else the track list (single-track click plays just the song, no source).
-   * Artists: lazy-loaded on first open (results cached per query):
+   * Artists: lazy-loaded on first open and refreshed when a new query is
+     submitted while the tab is active (results cached per query):
      `None` → `.empty` "Searching..."; `Some([])` → `.empty` "No results.";
      else artist card grid.
    * Albums: same, album card grid.
@@ -897,7 +907,7 @@ settings screen has nothing to configure or probe for playback.
 | search busy | Search songs | `.empty` "Searching..." |
 | search empty | Search songs/artists/albums | `.empty` "No results." |
 | artist/album loading | Artist/ArtistSongs/Album | `.empty` "Loading artist..." / "Loading songs..." / "Loading album..." |
-| page load failed | any page | error toast (6 s) + the loading/empty state remains |
+| page load failed | any page | compact 157 px error state: the failure message + a secondary **Retry** button (`page-error/retry`); no permanent “Loading…” (a toast may also show) |
 | liked empty | Liked | `.empty` "No liked songs yet. Click the heart on any track." |
 | playlist empty | Playlist | `.empty` "Empty playlist. Use ♪+ on any track to add it." |
 | playlist missing | Playlist | `.empty` "Playlist not found." |
@@ -1067,7 +1077,7 @@ equivalent lives in `crates/rift-desktop/src/state.rs` (Lead + controller own it
 | `update_status` | `Option<UpdateStatus>` | launch check, "Check now" | settings status line |
 | `view` | `View` | nav actions, search submit, backend `OPEN_PLAYLIST` event, delete-playlist fallback | root layout, sidebar active states, queue-vs-settings, main content |
 | `search` | `{ query, results: Vec<Track>, busy }` | search box submit/debounce; search result/error (guarded by generation) | Search view |
-| `search_tab` | `Songs\|Artists\|Albums` | tab click; reset on new search | Search view |
+| `search_tab` | `Songs\|Artists\|Albums` | tab click; kept across new searches (the active tab is refetched with the new query) | Search view |
 | `artist_results` | `Option<Vec<ArtistSummary>>` | lazy fetch per query (generation-guarded) | Search artists tab |
 | `album_results` | `Option<Vec<AlbumSummary>>` | lazy fetch | Search albums tab |
 | `artist_page` | `Option<ArtistPage>` | `get_artist` on view enter (generation-guarded); cleared first | Artist view, ArtistSongs header |
@@ -1109,7 +1119,7 @@ downloads; keep the rules for behaviour parity but they can land after M5.
 | Menu `open`/`submenu expanded` per trigger | `UiMemory.active_menu: Option<MenuId>` + expanded action index |
 | QueuePanel `collapsed` | `State.queue_collapsed` (per-session) |
 | Settings update check on mount | cached `State.update_status`; run `check_update` once on entering Settings if it is not cached |
-| titlebar debounce token | State: `search_debounce: { text, deadline, generation }` driven by frame time |
+| titlebar debounce token | `App::search_debounce: Option<(trimmed_query, deadline)>`, driven by `InputState::time`; Enter/search bypasses it, clearing cancels it |
 
 ### 10.4 Effects / subscriptions the controller must provide
 
