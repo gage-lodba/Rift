@@ -523,10 +523,9 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after the epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "rift-discord-open-socket-{}-{unique}",
-            std::process::id()
-        ));
+        // Keep the path well below macOS's 104-byte `SUN_LEN`; the previous
+        // descriptive prefix plus the CI temp directory overflowed it.
+        let dir = std::env::temp_dir().join(format!("rd-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create the socket directory");
         let path = dir.join("ipc.sock");
         let _listener = UnixListener::bind(&path).expect("bind the test socket");
