@@ -152,6 +152,7 @@ mod tests {
     /// concurrent `cargo test` runs on the same desktop share one OS clipboard
     /// and can overwrite each other's marker, so run the clipboard tests from
     /// one invocation at a time when checking flakiness.
+    #[cfg(any(windows, target_os = "linux"))]
     static NATIVE_CLIPBOARD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Read the clipboard until it returns `want` (or the timeout), returning the
@@ -161,8 +162,9 @@ mod tests {
     /// `arboard`'s Wayland `set_text` returns after `set_selection` is queued,
     /// not after the compositor round-trip, so an immediately following read can
     /// still see the previous selection. Write-then-read assertions therefore
-    /// poll instead of assuming synchronous delivery; on X11/Windows/macOS the
-    /// first read already matches (one extra call, no sleep).
+    /// poll instead of assuming synchronous delivery; on X11/Windows the first
+    /// read already matches (one extra call, no sleep).
+    #[cfg(any(windows, target_os = "linux"))]
     fn poll_clipboard(
         mut read: impl FnMut() -> Option<String>,
         want: Option<&str>,
@@ -185,6 +187,7 @@ mod tests {
     /// clipboard has nothing to wait for — clearing is a Wayland roundtrip, and
     /// a clipboard manager (KDE's klipper) may re-own the selection with its
     /// last history entry immediately after the clear.
+    #[cfg(any(windows, target_os = "linux"))]
     fn restore_native(native: &mut NativeClipboard, previous: Option<String>) {
         let Some(text) = previous else {
             native.clear();
